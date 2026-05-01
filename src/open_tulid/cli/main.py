@@ -6,7 +6,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from open_tulid.cli.init import app as init_app
+from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import CONFIG_FILENAME, load_config
 from open_tulid.models import ValidationReport
@@ -17,13 +17,18 @@ app = typer.Typer(
     name="tulid",
     help="CLI tool for managing Obsidian vault projects.",
 )
-app.add_typer(init_app, name="init")
 
 console = Console()
 
 
 def _get_config() -> object:
     return load_config()
+
+
+@app.command()
+def init() -> None:
+    """Create ~/.open-tulid.toml configuration file."""
+    init_cmd()
 
 
 @app.command()
