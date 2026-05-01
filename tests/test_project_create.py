@@ -21,7 +21,7 @@ def tmp_vault(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config_file(tmp_vault: Path) -> Path:
-    cfg = tmp_vault / "open-tulid.toml"
+    cfg = tmp_vault / ".open-tulid.toml"
     cfg.write_text(
         f'[vault]\nroot = "{tmp_vault}"\nprojects = ["TestProject"]\n',
         encoding="utf-8",
@@ -136,7 +136,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_missing_vault_section(self, tmp_path: Path):
-        cfg = tmp_path / "open-tulid.toml"
+        cfg = tmp_path / ".open-tulid.toml"
         cfg.write_text('[other]\nfoo = "bar"\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -148,7 +148,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_missing_vault_root(self, tmp_path: Path):
-        cfg = tmp_path / "open-tulid.toml"
+        cfg = tmp_path / ".open-tulid.toml"
         cfg.write_text('[vault]\nprojects = ["Test"]\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -160,7 +160,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_vault_root_not_exists(self, tmp_path: Path):
-        cfg = tmp_path / "open-tulid.toml"
+        cfg = tmp_path / ".open-tulid.toml"
         cfg.write_text('[vault]\nroot = "/nonexistent/path"\nprojects = ["Test"]\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -172,7 +172,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_missing_projects(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -184,7 +184,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_empty_projects(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\nprojects = []\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -196,7 +196,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_project_name_with_slash(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\nprojects = ["foo/bar"]\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -208,7 +208,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_project_name_with_backslash(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\nprojects = ["foo\\\\bar"]\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -220,7 +220,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_project_name_with_dotdot(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\nprojects = [".."]\n', encoding="utf-8")
         original = os.getcwd()
         try:
@@ -232,7 +232,7 @@ class TestConfigLoading:
             os.chdir(original)
 
     def test_config_absolute_project_path(self, tmp_vault: Path):
-        cfg = tmp_vault / "open-tulid.toml"
+        cfg = tmp_vault / ".open-tulid.toml"
         cfg.write_text(f'[vault]\nroot = "{tmp_vault}"\nprojects = ["/etc"]\n', encoding="utf-8")
         original = os.getcwd()
         try:

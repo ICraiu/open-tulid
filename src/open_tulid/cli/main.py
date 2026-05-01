@@ -6,6 +6,8 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from open_tulid.cli.init import app as init_app
+from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import CONFIG_FILENAME, load_config
 from open_tulid.models import ValidationReport
 from open_tulid.vault.project import create_project, iter_configured_projects
@@ -15,6 +17,7 @@ app = typer.Typer(
     name="tulid",
     help="CLI tool for managing Obsidian vault projects.",
 )
+app.add_typer(init_app, name="init")
 
 console = Console()
 
@@ -37,6 +40,12 @@ def project(
 
 vault_app = typer.Typer()
 app.add_typer(vault_app, name="vault")
+
+
+@app.command()
+def uninstall() -> None:
+    """Uninstall open-tulid from the current environment."""
+    _do_uninstall()
 
 
 @vault_app.command()

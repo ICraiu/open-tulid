@@ -12,7 +12,7 @@ except ImportError:
 from open_tulid.models import Config
 
 
-CONFIG_FILENAME = "open-tulid.toml"
+CONFIG_FILENAME = ".open-tulid.toml"
 
 
 def _fail(message: str) -> None:
@@ -22,7 +22,11 @@ def _fail(message: str) -> None:
 
 def load_config(path: Path | None = None) -> Config:
     if path is None:
-        path = Path.cwd() / CONFIG_FILENAME
+        cwd_config = Path.cwd() / CONFIG_FILENAME
+        if cwd_config.is_file():
+            path = cwd_config
+        else:
+            path = Path.home() / CONFIG_FILENAME
 
     if not path.is_file():
         _fail(f"Config file not found: {path}")

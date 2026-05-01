@@ -15,7 +15,7 @@ runner = CliRunner()
 
 
 def _make_config(vault_root: Path, projects: list[str]) -> Path:
-    cfg = vault_root / "open-tulid.toml"
+    cfg = vault_root / ".open-tulid.toml"
     cfg.write_text(
         f'[vault]\nroot = "{vault_root}"\nprojects = {projects!r}\n',
         encoding="utf-8",
