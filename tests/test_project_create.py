@@ -125,7 +125,8 @@ class TestProjectCreation:
 
 
 class TestConfigLoading:
-    def test_config_missing(self, tmp_path: Path):
+    def test_config_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
         original = os.getcwd()
         try:
             os.chdir(tmp_path)
