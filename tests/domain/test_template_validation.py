@@ -159,3 +159,44 @@ class TestInvalidFieldTemplate:
         report = validate_template(tpl)
         assert report.is_valid is False
         assert any("not compatible" in e.message for e in report.errors)
+
+    def test_task_has_proof_validator_compatible_with_string(self):
+        tpl = Template(
+            name="T",
+            state=ArtifactState.CompletedTask,
+            sections=[
+                SectionTemplate(
+                    name="Status",
+                    fields=[
+                        FieldTemplate(
+                            name="Status",
+                            type=FieldType.STATUS,
+                            validators=[ValidatorType.TASK_HAS_PROOF_WHEN_DONE],
+                        )
+                    ],
+                )
+            ],
+        )
+        report = validate_template(tpl)
+        assert report.is_valid is True
+
+    def test_task_has_proof_validator_incompatible_with_file_list(self):
+        tpl = Template(
+            name="T",
+            state=ArtifactState.CompletedTask,
+            sections=[
+                SectionTemplate(
+                    name="Proof",
+                    fields=[
+                        FieldTemplate(
+                            name="Changed files",
+                            type=FieldType.FILE_LIST,
+                            validators=[ValidatorType.TASK_HAS_PROOF_WHEN_DONE],
+                        )
+                    ],
+                )
+            ],
+        )
+        report = validate_template(tpl)
+        assert report.is_valid is False
+        assert any("not compatible" in e.message for e in report.errors)

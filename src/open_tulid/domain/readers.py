@@ -41,16 +41,12 @@ def parse_artifact_content(
     section_names_seen: set[str] = set()
     current_section: Section | None = None
     found_first_section = False
-    preamble_found = False
 
     for line in lines:
         stripped = line.strip()
 
         if stripped.startswith("## "):
             section_name = stripped[3:].strip()
-
-            if not found_first_section:
-                preamble_found = True
 
             found_first_section = True
 
@@ -100,8 +96,8 @@ def parse_artifact_content(
 
             field_type = _infer_field_type(field_name, field_value, template)
             parsed_value: str | list[str] = field_value
-            if field_type == FieldType.FILE_LIST and "," in field_value:
-                parsed_value = [v.strip() for v in field_value.split(",")]
+            if field_type == FieldType.FILE_LIST:
+                parsed_value = [v.strip() for v in field_value.split(",") if v.strip()]
             current_section.fields.append(
                 Field(name=field_name, type=field_type, value=parsed_value)
             )
@@ -130,9 +126,6 @@ def _infer_field_type(field_name: str, field_value: str, template: Template) -> 
         for fld_tpl in sec_tpl.fields:
             if fld_tpl.name == field_name:
                 return fld_tpl.type
-
-    if "," in field_value:
-        return FieldType.FILE_LIST
 
     return FieldType.STRING
 

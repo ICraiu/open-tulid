@@ -7,6 +7,7 @@ from .schema import (
     COMPATIBLE_VALIDATORS,
     Field,
     FieldType,
+    FieldTemplate,
     MappingRule,
     MappingRuleType,
     Section,
@@ -71,6 +72,15 @@ def _find_field_in_sections(sections: list[Section], field_name: str) -> Field |
     return None
 
 
+def _find_fields_in_sections(sections: list[Section], field_name: str) -> list[Field]:
+    matches: list[Field] = []
+    for section in sections:
+        for f in section.fields:
+            if f.name == field_name:
+                matches.append(f)
+    return matches
+
+
 def _find_field_template(
     section_tpl: SectionTemplate, field_name: str
 ) -> FieldTemplate | None:
@@ -80,25 +90,40 @@ def _find_field_template(
     return None
 
 
-def _is_field_required(field_tpl: FieldTemplate, artifact: Artifact) -> bool:
-    if not field_tpl.required:
-        if field_tpl.required_when is not None:
-            source = _find_field_in_sections(artifact.sections, field_tpl.required_when.field_name)
-            if source is None:
-                return False
-            if str(source.value) == field_tpl.required_when.equals:
-                return True
-            return False
+def _is_field_required(
+    field_tpl: FieldTemplate,
+    artifact: Artifact,
+    report: ValidationReport,
+    location: str,
+) -> bool:
+    if field_tpl.required_when is None:
+        return field_tpl.required
+
+    matches = _find_fields_in_sections(artifact.sections, field_tpl.required_when.field_name)
+    if not matches:
+        report.add_error(
+            location,
+            f"Cannot evaluate required_when for '{field_tpl.name}': source field "
+            f"'{field_tpl.required_when.field_name}' is missing",
+        )
         return False
-    else:
-        if field_tpl.required_when is not None:
-            source = _find_field_in_sections(artifact.sections, field_tpl.required_when.field_name)
-            if source is None:
-                return False
-            if str(source.value) == field_tpl.required_when.equals:
+    if len(matches) > 1:
+        report.add_error(
+            location,
+            f"Cannot evaluate required_when for '{field_tpl.name}': source field "
+            f"'{field_tpl.required_when.field_name}' is ambiguous",
+        )
+        return False
+
+    return str(matches[0].value) == field_tpl.required_when.equals
+
+
+def _has_proof_validator(template: Template) -> bool:
+    for sec_tpl in template.sections:
+        for f in sec_tpl.fields:
+            if ValidatorType.TASK_HAS_PROOF_WHEN_DONE in f.validators:
                 return True
-            return False
-        return True
+    return False
 
 
 def _validate_field_value_type(field: Field, field_tpl: FieldTemplate | None) -> ValidationReport:
@@ -161,6 +186,10 @@ def _validate_field_validators(
 
         elif v == ValidatorType.FILE_LINK_EXISTS:
             if registry is None:
+                report.add_error(
+                    f"field.{field.name}",
+                    "File link validation requires an artifact registry",
+                )
                 continue
             paths: list[str] = []
             if isinstance(field.value, str):
@@ -176,6 +205,10 @@ def _validate_field_validators(
 
         elif v == ValidatorType.FILE_LINK_MATCHES_TEMPLATE:
             if registry is None:
+                report.add_error(
+                    f"field.{field.name}",
+                    "File link template validation requires an artifact registry",
+                )
                 continue
             paths: list[str] = []
             if isinstance(field.value, str):
@@ -221,12 +254,31 @@ def validate_artifact(
 
     artifact_section_map: dict[str, Section] = {}
     for sec in artifact.sections:
+        sec_loc = f"section.{sec.name or '<empty>'}"
+        if not sec.name or not sec.name.strip():
+            report.add_error(f"{sec_loc}.name", "Section name must be non-empty")
         if sec.name in artifact_section_map:
             report.add_error(
                 f"section.{sec.name}",
                 f"Duplicate section '{sec.name}' in artifact",
             )
         artifact_section_map[sec.name] = sec
+
+        seen_fields: set[str] = set()
+        for f in sec.fields:
+            if not f.name or not f.name.strip():
+                report.add_error(
+                    f"{sec_loc}.field",
+                    "Field name must be non-empty",
+                )
+            if f.name in seen_fields:
+                report.add_error(
+                    f"{sec_loc}.field.{f.name}",
+                    f"Duplicate field '{f.name}' in section '{sec.name}'",
+                )
+            seen_fields.add(f.name)
+            type_report = _validate_field_value_type(f, None)
+            report.errors.extend(type_report.errors)
 
     for sec_name, sec_tpl in template_section_map.items():
         sec_loc = f"section.{sec_name}"
@@ -243,26 +295,14 @@ def validate_artifact(
 
         artifact_sec = artifact_section_map[sec_name]
 
-        if not artifact_sec.name or not artifact_sec.name.strip():
-            report.add_error(f"{sec_loc}.name", "Section name must be non-empty")
-
-        seen_fields: set[str] = set()
-        for f in artifact_sec.fields:
-            if not f.name or not f.name.strip():
-                report.add_error(
-                    f"{sec_loc}.field",
-                    "Field name must be non-empty",
-                )
-            if f.name in seen_fields:
-                report.add_error(
-                    f"{sec_loc}.field.{f.name}",
-                    f"Duplicate field '{f.name}' in section '{sec_name}'",
-                )
-            seen_fields.add(f.name)
-
         for field_tpl in sec_tpl.fields:
             artifact_field = _find_field_in_sections([artifact_sec], field_tpl.name)
-            field_required = _is_field_required(field_tpl, artifact)
+            field_required = _is_field_required(
+                field_tpl,
+                artifact,
+                report,
+                f"{sec_loc}.field.{field_tpl.name}",
+            )
 
             if artifact_field is not None:
                 type_report = _validate_field_value_type(artifact_field, field_tpl)
@@ -277,23 +317,7 @@ def validate_artifact(
                     f"Required field '{field_tpl.name}' is missing",
                 )
 
-    proof_validator_present = ValidatorType.TASK_HAS_PROOF_WHEN_DONE in (
-        v for sec_tpl in artifact.template.sections for v in sec_tpl.fields
-    )
-    if not proof_validator_present:
-        for sec_tpl in artifact.template.sections:
-            for f in sec_tpl.fields:
-                if f.validators and ValidatorType.TASK_HAS_PROOF_WHEN_DONE in f.validators:
-                    proof_validator_present = True
-
-    has_proof_validator = False
-    for sec_tpl in artifact.template.sections:
-        for f in sec_tpl.fields:
-            if ValidatorType.TASK_HAS_PROOF_WHEN_DONE in f.validators:
-                has_proof_validator = True
-    if not has_proof_validator:
-        if artifact.template.name == "CompletedTask":
-            has_proof_validator = True
+    has_proof_validator = _has_proof_validator(artifact.template)
 
     if has_proof_validator:
         status_field = _find_field_in_sections(artifact.sections, "Status")
@@ -378,7 +402,12 @@ def validate_transition(transition: Transition) -> ValidationReport:
             "Transition must have at least one required input",
         )
 
-    if transition.output_template is not None:
+    if transition.output_template is None:
+        report.add_error(
+            "transition.output_template",
+            "Transition must have exactly one output_template",
+        )
+    else:
         if transition.output_template.state != transition.to_state:
             report.add_error(
                 "transition.output_template.state",
@@ -396,6 +425,16 @@ def validate_transition(transition: Transition) -> ValidationReport:
         report.add_error(
             "transition.required_inputs",
             f"No required input matches from_state {transition.from_state.value}",
+        )
+
+    if (
+        not transition.mapping_rules
+        and transition.output_template is not None
+        and _template_requires_output_content(transition.output_template)
+    ):
+        report.add_error(
+            "transition.mapping_rules",
+            "Transition mapping_rules cannot be empty when the output template has required content",
         )
 
     for i, mr in enumerate(transition.mapping_rules):
@@ -436,5 +475,36 @@ def validate_transition(transition: Transition) -> ValidationReport:
                     mr_loc,
                     "LINK_ARTIFACT mapping must have to_section and to_field",
                 )
+            if transition.output_template is not None:
+                target_field_tpl = None
+                for sec_tpl in transition.output_template.sections:
+                    if sec_tpl.name == mr.to_section:
+                        target_field_tpl = _find_field_template(sec_tpl, mr.to_field)
+                        break
+                if target_field_tpl is not None and target_field_tpl.type not in (
+                    FieldType.FILE,
+                    FieldType.FILE_LIST,
+                ):
+                    report.add_error(
+                        mr_loc,
+                        f"LINK_ARTIFACT mapping targets non-file field '{mr.to_field}' of type {target_field_tpl.type.value}",
+                    )
+
+        elif mr.kind == MappingRuleType.CREATE_SECTION:
+            if not mr.to_section:
+                report.add_error(
+                    mr_loc,
+                    "CREATE_SECTION mapping must have to_section",
+                )
 
     return report
+
+
+def _template_requires_output_content(template: Template) -> bool:
+    for sec_tpl in template.sections:
+        if sec_tpl.required:
+            return True
+        for field_tpl in sec_tpl.fields:
+            if field_tpl.required or field_tpl.required_when is not None:
+                return True
+    return False

@@ -146,6 +146,10 @@ class ArtifactReadResult:
     artifact: Artifact | None = None
     report: ValidationReport = field(default_factory=ValidationReport)
 
+    @property
+    def is_valid(self) -> bool:
+        return self.artifact is not None and self.report.is_valid
+
 
 @dataclass
 class ArtifactWriteResult:
@@ -153,10 +157,21 @@ class ArtifactWriteResult:
     content: str | None = None
     report: ValidationReport = field(default_factory=ValidationReport)
 
+    @property
+    def is_valid(self) -> bool:
+        return self.path is not None and self.content is not None and self.report.is_valid
+
 
 COMPATIBLE_VALIDATORS: dict[FieldType, set[ValidatorType]] = {
-    FieldType.STRING: {ValidatorType.NON_EMPTY_TEXT, ValidatorType.REQUIRED_FIELD_PRESENT},
-    FieldType.STATUS: {ValidatorType.NON_EMPTY_TEXT, ValidatorType.REQUIRED_FIELD_PRESENT},
+    FieldType.STRING: {
+        ValidatorType.NON_EMPTY_TEXT,
+        ValidatorType.REQUIRED_FIELD_PRESENT,
+    },
+    FieldType.STATUS: {
+        ValidatorType.NON_EMPTY_TEXT,
+        ValidatorType.REQUIRED_FIELD_PRESENT,
+        ValidatorType.TASK_HAS_PROOF_WHEN_DONE,
+    },
     FieldType.FILE: {
         ValidatorType.FILE_LINK_EXISTS,
         ValidatorType.FILE_LINK_MATCHES_TEMPLATE,

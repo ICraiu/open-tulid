@@ -149,7 +149,7 @@ class TestReadResult:
     def test_failure_result(self):
         result = ArtifactReadResult()
         assert result.artifact is None
-        assert result.report.is_valid is True
+        assert result.is_valid is False
 
     def test_failure_with_errors(self):
         result = ArtifactReadResult()
@@ -169,6 +169,7 @@ class TestWriteResult:
         result = ArtifactWriteResult()
         assert result.path is None
         assert result.content is None
+        assert result.is_valid is False
 
 
 class TestRequiredWhen:

@@ -114,6 +114,31 @@ Validation result: all good
         result = parse_artifact_content("/proof.md", content, ArtifactState.CompletedTask, tpl, reg)
         assert result.report.is_valid is True
 
+    def test_read_single_item_file_list_content(self):
+        content = """## Idea
+
+Idea: test task
+
+## Status
+
+Status: done
+
+## Proof
+
+Changed files: /a.md
+Evidence: tests pass
+Validation result: all good
+"""
+        tpl = build_completed_task_template()
+        reg = _make_registry()
+        reg.artifacts_by_path["/a.md"] = reg.artifacts_by_path["Agent/docs/Technical direction.md"]
+        result = parse_artifact_content("/proof.md", content, ArtifactState.CompletedTask, tpl, reg)
+        assert result.report.is_valid is True
+        assert result.artifact is not None
+        changed_files = result.artifact.sections[2].fields[0]
+        assert changed_files.type == FieldType.FILE_LIST
+        assert changed_files.value == ["/a.md"]
+
 
 class TestInvalidReaders:
     def test_empty_path(self):
@@ -218,3 +243,17 @@ Changed files: /missing.md
         reg = _make_registry()
         result = parse_artifact_content("/foo.md", IDEA_CONTENT, ArtifactState.DefinedTask, tpl, reg)
         assert result.report.is_valid is False
+
+    def test_unknown_field_preserved_in_read(self):
+        content = """## Idea
+
+Idea: Add vault validation
+ExtraField: some value, with comma
+"""
+        tpl = build_idea_task_template()
+        result = parse_artifact_content("/foo.md", content, ArtifactState.IdeaTask, tpl)
+        assert result.report.is_valid is True
+        assert result.artifact is not None
+        assert len(result.artifact.sections[0].fields) == 2
+        assert result.artifact.sections[0].fields[1].type == FieldType.STRING
+        assert result.artifact.sections[0].fields[1].value == "some value, with comma"

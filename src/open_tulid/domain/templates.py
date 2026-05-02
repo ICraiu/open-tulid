@@ -114,7 +114,7 @@ def build_completed_task_template() -> Template:
                         name="Status",
                         type=FieldType.STATUS,
                         required=True,
-                        validators=[ValidatorType.NON_EMPTY_TEXT],
+                        validators=[ValidatorType.NON_EMPTY_TEXT, ValidatorType.TASK_HAS_PROOF_WHEN_DONE],
                     )
                 ],
             ),

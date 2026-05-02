@@ -472,3 +472,142 @@ class TestInvalidArtifactValidation:
         report = validate_artifact(art)
         assert report.is_valid is False
         assert any("Validation result" in e.message for e in report.errors)
+
+    def test_non_completed_task_with_proof_validator(self):
+        from open_tulid.domain.schema import FieldTemplate, SectionTemplate
+
+        tpl = Template(
+            name="MyCompletedTask",
+            state=ArtifactState.CompletedTask,
+            sections=[
+                SectionTemplate(
+                    name="Status",
+                    required=True,
+                    fields=[
+                        FieldTemplate(
+                            name="Status",
+                            type=FieldType.STATUS,
+                            required=True,
+                            validators=[ValidatorType.NON_EMPTY_TEXT, ValidatorType.TASK_HAS_PROOF_WHEN_DONE],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.CompletedTask,
+            tpl,
+            [
+                Section(name="Status", fields=[Field(name="Status", type=FieldType.STATUS, value="done")]),
+            ],
+        )
+        report = validate_artifact(art)
+        assert report.is_valid is False
+        assert any("Proof section" in e.message for e in report.errors)
+
+    def test_conditional_field_source_missing(self):
+        from open_tulid.domain.schema import FieldTemplate, RequiredWhen, SectionTemplate
+
+        tpl = Template(
+            name="Test",
+            state=ArtifactState.IdeaTask,
+            sections=[
+                SectionTemplate(
+                    name="Main",
+                    required=True,
+                    fields=[
+                        FieldTemplate(
+                            name="Evidence",
+                            type=FieldType.STRING,
+                            required=False,
+                            required_when=RequiredWhen(field_name="Status", equals="done"),
+                            validators=[ValidatorType.NON_EMPTY_TEXT],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.IdeaTask,
+            tpl,
+            [
+                Section(name="Main", fields=[]),
+            ],
+        )
+        report = validate_artifact(art)
+        assert report.is_valid is False
+        assert any("required_when" in e.message and "missing" in e.message for e in report.errors)
+
+    def test_conditional_field_source_ambiguous(self):
+        from open_tulid.domain.schema import FieldTemplate, RequiredWhen, SectionTemplate
+
+        tpl = Template(
+            name="Test",
+            state=ArtifactState.IdeaTask,
+            sections=[
+                SectionTemplate(
+                    name="Main",
+                    required=True,
+                    fields=[
+                        FieldTemplate(
+                            name="Evidence",
+                            type=FieldType.STRING,
+                            required=False,
+                            required_when=RequiredWhen(field_name="Status", equals="done"),
+                        ),
+                    ],
+                ),
+                SectionTemplate(
+                    name="Other",
+                    required=True,
+                    fields=[FieldTemplate(name="Status", type=FieldType.STATUS, required=True)],
+                ),
+            ],
+        )
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.IdeaTask,
+            tpl,
+            [
+                Section(name="Main", fields=[Field(name="Status", type=FieldType.STATUS, value="done")]),
+                Section(name="Other", fields=[Field(name="Status", type=FieldType.STATUS, value="done")]),
+            ],
+        )
+        report = validate_artifact(art)
+        assert report.is_valid is False
+        assert any("ambiguous" in e.message for e in report.errors)
+
+    def test_link_validation_requires_registry(self):
+        tpl = build_defined_task_template()
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.DefinedTask,
+            tpl,
+            [
+                Section(name="Idea", fields=[Field(name="Idea", type=FieldType.STRING, value="test")]),
+                Section(name="Technical direction", fields=[Field(name="Direction", type=FieldType.FILE, value="/direction.md")]),
+            ],
+        )
+        report = validate_artifact(art)
+        assert report.is_valid is False
+        assert any("requires an artifact registry" in e.message for e in report.errors)
+
+    def test_unknown_section_with_duplicate_fields_fails(self):
+        tpl = build_idea_task_template()
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.IdeaTask,
+            tpl,
+            [
+                Section(name="Idea", fields=[Field(name="Idea", type=FieldType.STRING, value="test")]),
+                Section(name="Unknown", fields=[
+                    Field(name="Note", type=FieldType.STRING, value="a"),
+                    Field(name="Note", type=FieldType.STRING, value="b"),
+                ]),
+            ],
+        )
+        report = validate_artifact(art)
+        assert report.is_valid is False
+        assert any("Duplicate field" in e.message for e in report.errors)

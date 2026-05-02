@@ -72,6 +72,16 @@ def serialize_artifact_content(
 
         lines.append("")
 
+    for sec in artifact.sections:
+        if sec.name in template_section_order:
+            continue
+
+        lines.append(f"## {sec.name}")
+        lines.append("")
+        for f in sec.fields:
+            lines.append(_format_field(f))
+        lines.append("")
+
     content = "\n".join(lines)
     return ArtifactWriteResult(path=artifact.path, content=content, report=report)
 
@@ -100,6 +110,8 @@ def write_artifact_file(
 
     parent = os.path.dirname(target_path)
     if parent and not os.path.exists(parent):
+        write_result.path = None
+        write_result.content = None
         write_result.report.add_error(
             "path",
             f"Parent directory does not exist: {parent}",
@@ -110,6 +122,8 @@ def write_artifact_file(
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(write_result.content or "")
     except OSError as e:
+        write_result.path = None
+        write_result.content = None
         write_result.report.add_error("path", f"Cannot write file: {e}")
         return write_result
 
