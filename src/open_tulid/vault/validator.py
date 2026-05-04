@@ -4,6 +4,7 @@ from pathlib import Path
 
 from open_tulid.config import Config
 from open_tulid.models import Project, ValidationError, ValidationReport
+from open_tulid.vault.domain_integration import validate_project_domain_artifacts
 from open_tulid.vault.links import validate_kanban_file
 from open_tulid.vault.project import iter_configured_projects
 
@@ -49,6 +50,9 @@ def validate_project(project: Project) -> ValidationReport:
                 report.errors.extend(kanban_report.errors)
                 report.checked_kanban_files += kanban_report.checked_kanban_files
                 report.checked_task_links += kanban_report.checked_task_links
+
+    domain_report = validate_project_domain_artifacts(project)
+    report.errors.extend(domain_report.errors)
 
     return report
 

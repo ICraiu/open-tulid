@@ -257,3 +257,15 @@ ExtraField: some value, with comma
         assert len(result.artifact.sections[0].fields) == 2
         assert result.artifact.sections[0].fields[1].type == FieldType.STRING
         assert result.artifact.sections[0].fields[1].value == "some value, with comma"
+
+    def test_parse_deferred_links_skips_link_validation(self):
+        from open_tulid.domain.readers import parse_artifact_content_no_links
+
+        result = parse_artifact_content_no_links("/task.md", DEFINED_CONTENT, ArtifactState.DefinedTask, build_defined_task_template())
+        assert result.report.is_valid is True
+        assert result.artifact is not None
+
+    def test_parse_strict_links_fails_without_registry(self):
+        result = parse_artifact_content("/task.md", DEFINED_CONTENT, ArtifactState.DefinedTask, build_defined_task_template(), validate_links=True)
+        assert result.report.is_valid is False
+        assert any("requires an ArtifactRegistry" in e.message for e in result.report.errors)

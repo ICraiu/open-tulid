@@ -579,7 +579,7 @@ class TestInvalidArtifactValidation:
         assert report.is_valid is False
         assert any("ambiguous" in e.message for e in report.errors)
 
-    def test_link_validation_requires_registry(self):
+    def test_link_validation_fails_without_registry(self):
         tpl = build_defined_task_template()
         art = _make_artifact(
             "/foo.md",
@@ -592,9 +592,23 @@ class TestInvalidArtifactValidation:
         )
         report = validate_artifact(art)
         assert report.is_valid is False
-        assert any("requires an artifact registry" in e.message for e in report.errors)
+        assert any("requires an ArtifactRegistry" in e.message for e in report.errors)
 
-    def test_unknown_section_with_duplicate_fields_fails(self):
+    def test_link_validation_fails_when_not_in_registry(self):
+        tpl = build_defined_task_template()
+        art = _make_artifact(
+            "/foo.md",
+            ArtifactState.DefinedTask,
+            tpl,
+            [
+                Section(name="Idea", fields=[Field(name="Idea", type=FieldType.STRING, value="test")]),
+                Section(name="Technical direction", fields=[Field(name="Direction", type=FieldType.FILE, value="/direction.md")]),
+            ],
+        )
+        registry = ArtifactRegistry()
+        report = validate_artifact(art, registry)
+        assert report.is_valid is False
+        assert any("not found in registry" in e.message for e in report.errors)
         tpl = build_idea_task_template()
         art = _make_artifact(
             "/foo.md",

@@ -22,6 +22,7 @@ def parse_artifact_content(
     state: ArtifactState,
     template: Template,
     registry: ArtifactRegistry | None = None,
+    validate_links: bool = True,
 ) -> ArtifactReadResult:
     report = ValidationReport()
 
@@ -112,7 +113,7 @@ def parse_artifact_content(
         sections=sections,
     )
 
-    art_report = validate_artifact(artifact, registry)
+    art_report = validate_artifact(artifact, registry, validate_links=validate_links)
     report.errors.extend(art_report.errors)
 
     if report.is_valid:
@@ -135,10 +136,14 @@ def read_artifact_file(
     state: ArtifactState,
     template: Template,
     registry: ArtifactRegistry | None = None,
+    validate_links: bool = True,
+    domain_path: str | None = None,
 ) -> ArtifactReadResult:
     report = ValidationReport()
 
-    if not path or not path.strip():
+    effective_path = domain_path if domain_path else path
+
+    if not effective_path or not effective_path.strip():
         report.add_error("path", "Path must be non-empty")
         return ArtifactReadResult(report=report)
 
@@ -163,4 +168,13 @@ def read_artifact_file(
         report.add_error("path", f"Cannot read file: {e}")
         return ArtifactReadResult(report=report)
 
-    return parse_artifact_content(path, content, state, template, registry)
+    return parse_artifact_content(effective_path, content, state, template, registry, validate_links=validate_links)
+
+
+def parse_artifact_content_no_links(
+    path: str,
+    content: str,
+    state: ArtifactState,
+    template: Template,
+) -> ArtifactReadResult:
+    return parse_artifact_content(path, content, state, template, validate_links=False)

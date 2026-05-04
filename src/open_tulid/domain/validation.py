@@ -163,6 +163,7 @@ def _validate_field_validators(
     field_tpl: FieldTemplate | None,
     artifact: Artifact,
     registry: ArtifactRegistry | None,
+    validate_links: bool = True,
 ) -> ValidationReport:
     report = ValidationReport()
 
@@ -185,10 +186,12 @@ def _validate_field_validators(
                     )
 
         elif v == ValidatorType.FILE_LINK_EXISTS:
+            if not validate_links:
+                continue
             if registry is None:
                 report.add_error(
                     f"field.{field.name}",
-                    "File link validation requires an artifact registry",
+                    "FILE_LINK_EXISTS validation requires an ArtifactRegistry",
                 )
                 continue
             paths: list[str] = []
@@ -204,10 +207,12 @@ def _validate_field_validators(
                     )
 
         elif v == ValidatorType.FILE_LINK_MATCHES_TEMPLATE:
+            if not validate_links:
+                continue
             if registry is None:
                 report.add_error(
                     f"field.{field.name}",
-                    "File link template validation requires an artifact registry",
+                    "FILE_LINK_MATCHES_TEMPLATE validation requires an ArtifactRegistry",
                 )
                 continue
             paths: list[str] = []
@@ -223,7 +228,7 @@ def _validate_field_validators(
                         f"Linked artifact '{p}' not found in registry",
                     )
                 else:
-                    linked_report = validate_artifact(linked, registry)
+                    linked_report = validate_artifact(linked, registry, validate_links=validate_links)
                     if not linked_report.is_valid:
                         report.add_error(
                             f"field.{field.name}",
@@ -236,6 +241,7 @@ def _validate_field_validators(
 def validate_artifact(
     artifact: Artifact,
     registry: ArtifactRegistry | None = None,
+    validate_links: bool = True,
 ) -> ValidationReport:
     report = ValidationReport()
 
@@ -308,7 +314,7 @@ def validate_artifact(
                 type_report = _validate_field_value_type(artifact_field, field_tpl)
                 report.errors.extend(type_report.errors)
                 val_report = _validate_field_validators(
-                    artifact_field, field_tpl, artifact, registry
+                    artifact_field, field_tpl, artifact, registry, validate_links
                 )
                 report.errors.extend(val_report.errors)
             elif field_required:
