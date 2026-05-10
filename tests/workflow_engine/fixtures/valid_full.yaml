@@ -1,0 +1,97 @@
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+
+  - kind: state
+    id: CodeReview
+
+  - kind: task_type
+    id: CodingTask
+    requirements:
+      CodeReview:
+        artifacts:
+          - ImplementationSummary
+          - TestResult
+        validations:
+          - type: exists
+            args:
+              artifact: ImplementationSummary
+
+  - kind: artifact_type
+    id: ImplementationSummary
+    template: templates/implementation-summary.md
+
+  - kind: artifact_type
+    id: TestResult
+    template: templates/test-result.md
+
+  - kind: validation_type
+    id: exists
+    args:
+      artifact:
+        type: artifact_ref
+        required: true
+
+  - kind: validation_type
+    id: link_exists
+    args:
+      artifact:
+        type: artifact_ref
+        required: true
+
+  - kind: worker
+    id: qwen_local
+    type: local_llm
+
+  - kind: operation_type
+    id: validate_requirements
+    args:
+      state:
+        type: state_ref
+        required: true
+
+  - kind: operation_type
+    id: promote_artifacts
+    args:
+      artifacts:
+        type: artifact_ref
+        many: true
+
+  - kind: operation_type
+    id: move_task
+    args:
+      to:
+        type: state_ref
+        required: true
+
+  - kind: transition
+    id: ImplementTask
+    task_type: CodingTask
+    from: Todo
+    to: CodeReview
+    worker: qwen_local
+    requires:
+      artifacts:
+        - ImplementationSummary
+        - TestResult
+      validations:
+        - type: exists
+          args:
+            artifact: ImplementationSummary
+        - type: link_exists
+          args:
+            artifact: TestResult
+    transaction:
+      steps:
+        - op: validate_requirements
+          args:
+            state: CodeReview
+        - op: promote_artifacts
+          args:
+            artifacts:
+              - ImplementationSummary
+              - TestResult
+        - op: move_task
+          args:
+            to: CodeReview

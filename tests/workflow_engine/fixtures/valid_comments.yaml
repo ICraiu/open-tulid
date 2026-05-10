@@ -1,0 +1,9 @@
+# This is a comment at the top
+schema_version: 1  # inline comment
+statements:
+  # State declarations
+  - kind: state
+    id: Todo
+
+  - kind: state
+    id: Done

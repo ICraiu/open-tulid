@@ -1,0 +1,10 @@
+schema_version: 1
+statements:
+  - kind: task_type
+    id: T
+    requirements:
+      Todo:
+        validations:
+          - not-a-map
+  - kind: state
+    id: Todo

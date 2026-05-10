@@ -1,0 +1,22 @@
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: task_type
+    id: CodingTask
+  - kind: validation_type
+    id: exists
+    args:
+      artifact:
+        type: artifact_ref
+        required: true
+  - kind: transition
+    id: T
+    task_type: CodingTask
+    from: Todo
+    to: Todo
+    requires:
+      validations:
+        - type: exists
+          args:
+            artifact: MissingArtifact

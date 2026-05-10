@@ -1,0 +1,13 @@
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: CodeReview
+  - kind: task_type
+    id: CodingTask
+  - kind: transition
+    id: T
+    task_type: CodingTask
+    from: Todo
+    to: CodeReview

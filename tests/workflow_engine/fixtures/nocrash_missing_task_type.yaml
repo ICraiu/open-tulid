@@ -1,0 +1,8 @@
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: transition
+    id: T
+    from: Todo
+    to: Done
