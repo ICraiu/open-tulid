@@ -176,6 +176,13 @@ class TestJsonSchema:
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(parsed.value, schema)
 
+    def test_schema_rejects_non_string_requirement_key(self):
+        schema = generate_json_schema()
+        parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: task_type\n    id: T\n    requirements:\n      123:\n        artifacts: []\n")
+        assert parsed.value is not None
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(parsed.value, schema)
+
     def test_schema_rejects_arg_spec_many_not_boolean(self):
         schema = generate_json_schema()
         parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: operation_type\n    id: bad\n    args:\n      x:\n        type: string\n        many: nope\n")

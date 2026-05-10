@@ -773,8 +773,8 @@ statements:
         d = w_diags[0]
         assert d.path == "statements[2].worker", f"expected statements[2].worker, got {d.path}"
 
-    def test_unknown_artifact_in_requires_has_path(self):
-        """Unknown artifact in requires.artifacts reports requirement set path with line/column."""
+    def test_unknown_artifact_in_requires_has_exact_item_path(self):
+        """Unknown artifact in requires.artifacts reports the exact list item path."""
         vr = _build_and_validate("""schema_version: 1
 statements:
   - kind: state
@@ -794,12 +794,12 @@ statements:
                      if d.code == "workflow.reference.unknown_artifact"]
         assert len(art_diags) >= 1
         d = art_diags[0]
-        assert d.path is not None
+        assert d.path == "statements[2].requires.artifacts[0]"
         assert d.line is not None and d.line >= 1
         assert d.column is not None and d.column >= 1
 
-    def test_wrong_arg_type_in_validation_call_has_path(self):
-        """Wrong arg type in validation call reports the call's path with line/column."""
+    def test_wrong_arg_type_in_validation_call_has_exact_arg_path(self):
+        """Wrong arg type in validation call reports the exact arg path."""
         vr = _build_and_validate("""schema_version: 1
 statements:
   - kind: state
@@ -827,5 +827,92 @@ statements:
                  if d.code == "workflow.call.wrong_argument_type"]
         assert len(wrong) >= 1
         d = wrong[0]
-        assert d.path is not None
+        assert d.path == "statements[3].requires.validations[0].args.count"
+        assert d.line is not None and d.line >= 1
+
+    def test_unknown_validation_arg_has_exact_arg_path(self):
+        vr = _build_and_validate("""schema_version: 1
+statements:
+  - kind: state
+    id: S1
+  - kind: task_type
+    id: TT
+  - kind: validation_type
+    id: check
+    args:
+      count:
+        type: integer
+  - kind: transition
+    id: T
+    task_type: TT
+    from: S1
+    to: S1
+    requires:
+      validations:
+        - type: check
+          args:
+            extra: 1
+""")
+        diags = [d for d in vr.diagnostics if d.code == "workflow.call.unknown_argument"]
+        assert len(diags) >= 1
+        d = diags[0]
+        assert d.path == "statements[3].requires.validations[0].args.extra"
+        assert d.line is not None and d.line >= 1
+
+    def test_missing_validation_arg_has_synthetic_exact_arg_path(self):
+        vr = _build_and_validate("""schema_version: 1
+statements:
+  - kind: state
+    id: S1
+  - kind: task_type
+    id: TT
+  - kind: validation_type
+    id: check
+    args:
+      count:
+        type: integer
+        required: true
+  - kind: transition
+    id: T
+    task_type: TT
+    from: S1
+    to: S1
+    requires:
+      validations:
+        - type: check
+          args: {}
+""")
+        diags = [d for d in vr.diagnostics if d.code == "workflow.call.missing_required_argument"]
+        assert len(diags) >= 1
+        d = diags[0]
+        assert d.path == "statements[3].requires.validations[0].args.count"
+        assert d.line is not None and d.line >= 1
+
+    def test_operation_arg_reference_has_exact_arg_path(self):
+        vr = _build_and_validate("""schema_version: 1
+statements:
+  - kind: state
+    id: S1
+  - kind: task_type
+    id: TT
+  - kind: operation_type
+    id: move
+    args:
+      to:
+        type: state_ref
+  - kind: transition
+    id: T
+    task_type: TT
+    from: S1
+    to: S1
+    transaction:
+      steps:
+        - op: move
+          args:
+            to: Missing
+""")
+        diags = [d for d in vr.diagnostics if d.code == "workflow.reference.unknown_state"]
+        assert len(diags) >= 1
+        d = diags[0]
+        assert d.path == "statements[3].transaction.steps[0].args.to"
         assert d.line is not None and d.line >= 1

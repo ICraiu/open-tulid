@@ -62,6 +62,7 @@ def _build_statement_properties(kind: str, allowed: frozenset) -> dict:
     if "requirements" in allowed:
         props["requirements"] = {
             "type": "object",
+            "propertyNames": {"type": "string"},
             "additionalProperties": _requirement_set_schema(),
         }
 

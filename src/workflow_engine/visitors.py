@@ -27,6 +27,13 @@ def _span_info(span: SourceSpan | None) -> tuple[str | None, int | None, int | N
     return span.path, span.line, span.column
 
 
+def _child_span(parent: SourceSpan | None, child_path: str) -> SourceSpan | None:
+    """Create a field-level span when the exact key is absent from source."""
+    if parent is None:
+        return None
+    return SourceSpan(path=child_path, line=parent.line, column=parent.column)
+
+
 class ValidationVisitor:
     def __init__(self, table: SymbolTable) -> None:
         self.table = table
@@ -144,14 +151,18 @@ class ValidationVisitor:
     def visit_requirement_set(self, node: RequirementSet) -> None:
         span = node.span
 
-        for art_id in node.artifacts:
+        for index, art_id in enumerate(node.artifacts):
             if art_id not in self.table.artifact_types:
+                item_span = None
+                if index < len(node.artifact_spans):
+                    item_span = node.artifact_spans[index]
+                span_for_diag = item_span or span
                 self.diagnostics.append(Diagnostic(
                     code="workflow.reference.unknown_artifact",
                     message=f"requirement set references unknown artifact: {art_id!r}",
-                    path=span.path if span else None,
-                    line=span.line if span else None,
-                    column=span.column if span else None,
+                    path=span_for_diag.path if span_for_diag else None,
+                    line=span_for_diag.line if span_for_diag else None,
+                    column=span_for_diag.column if span_for_diag else None,
                 ))
 
         for val_call in node.validations:
@@ -185,32 +196,37 @@ class ValidationVisitor:
         call_kind: str,
     ) -> None:
         span = getattr(call_node, "span", None)
+        arg_spans = getattr(call_node, "arg_spans", {})
 
         for arg_name, arg_spec in declared_args.items():
             if arg_spec.required and arg_name not in supplied_args:
+                path = f"{span.path}.args.{arg_name}" if span and span.path else None
+                arg_span = _child_span(span, path) if path else span
                 self.diagnostics.append(Diagnostic(
                     code="workflow.call.missing_required_argument",
                     message=f"{call_kind} call missing required argument: {arg_name!r}",
-                    path=span.path if span else None,
-                    line=span.line if span else None,
-                    column=span.column if span else None,
+                    path=arg_span.path if arg_span else None,
+                    line=arg_span.line if arg_span else None,
+                    column=arg_span.column if arg_span else None,
                 ))
 
         for arg_name in supplied_args:
             if arg_name not in declared_args:
+                arg_span = arg_spans.get(arg_name, span)
                 self.diagnostics.append(Diagnostic(
                     code="workflow.call.unknown_argument",
                     message=f"{call_kind} call has unknown argument: {arg_name!r}",
-                    path=span.path if span else None,
-                    line=span.line if span else None,
-                    column=span.column if span else None,
+                    path=arg_span.path if arg_span else None,
+                    line=arg_span.line if arg_span else None,
+                    column=arg_span.column if arg_span else None,
                 ))
 
         for arg_name, arg_spec in declared_args.items():
             if arg_name not in supplied_args:
                 continue
             value = supplied_args[arg_name]
-            self._validate_arg_value(value, arg_spec, arg_name, call_kind, span)
+            arg_span = arg_spans.get(arg_name, span)
+            self._validate_arg_value(value, arg_spec, arg_name, call_kind, arg_span)
 
     def _validate_arg_value(
         self,

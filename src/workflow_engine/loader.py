@@ -706,6 +706,7 @@ def _build_requirement_set(
             ))
 
     artifacts: list[str] = []
+    artifact_spans: list[SourceSpan | None] = []
     arts_raw = raw.get("artifacts")
     if arts_raw is not None:
         if not isinstance(arts_raw, list):
@@ -726,6 +727,7 @@ def _build_requirement_set(
                 ))
                 return diagnostics, None
             artifacts.append(art)
+            artifact_spans.append(list_item_span(arts_raw, i, f"{req_path}.artifacts[{i}]"))
 
     validations: list[ValidationCall] = []
     vals_raw = raw.get("validations")
@@ -754,6 +756,7 @@ def _build_requirement_set(
         artifacts=tuple(artifacts),
         validations=tuple(validations),
         span=span,
+        artifact_spans=tuple(artifact_spans),
     )
 
 
@@ -803,6 +806,7 @@ def _build_validation_call(
         return diagnostics, None
 
     args = {}
+    arg_spans: dict[str, SourceSpan] = {}
     args_raw = raw.get("args")
     if args_raw is not None:
         if not isinstance(args_raw, dict):
@@ -814,9 +818,13 @@ def _build_validation_call(
             ))
             return diagnostics, None
         args = dict(args_raw)
+        for arg_name in args_raw:
+            span = key_span(args_raw, arg_name, f"{val_path}.args.{arg_name}")
+            if span:
+                arg_spans[arg_name] = span
 
     span = node_span(raw, val_path)
-    return diagnostics, ValidationCall(type=val_type, args=args, span=span)
+    return diagnostics, ValidationCall(type=val_type, args=args, span=span, arg_spans=arg_spans)
 
 
 def _build_transaction(
@@ -925,6 +933,7 @@ def _build_operation_call(
         return diagnostics, None
 
     args = {}
+    arg_spans: dict[str, SourceSpan] = {}
     args_raw = raw.get("args")
     if args_raw is not None:
         if not isinstance(args_raw, dict):
@@ -936,6 +945,10 @@ def _build_operation_call(
             ))
             return diagnostics, None
         args = dict(args_raw)
+        for arg_name in args_raw:
+            span = key_span(args_raw, arg_name, f"{step_path}.args.{arg_name}")
+            if span:
+                arg_spans[arg_name] = span
 
     span = node_span(raw, step_path)
-    return diagnostics, OperationCall(op=op, args=args, span=span)
+    return diagnostics, OperationCall(op=op, args=args, span=span, arg_spans=arg_spans)

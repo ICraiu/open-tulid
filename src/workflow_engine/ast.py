@@ -23,6 +23,7 @@ class ValidationCall:
     type: str
     args: Mapping[str, object] = dataclasses.field(default_factory=dict)
     span: SourceSpan | None = None
+    arg_spans: Mapping[str, SourceSpan] = dataclasses.field(default_factory=dict)
 
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_validation_call(self)
@@ -33,6 +34,7 @@ class RequirementSet:
     artifacts: tuple[str, ...] = ()
     validations: tuple[ValidationCall, ...] = ()
     span: SourceSpan | None = None
+    artifact_spans: tuple[SourceSpan | None, ...] = ()
 
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_requirement_set(self)
@@ -43,6 +45,7 @@ class OperationCall:
     op: str
     args: Mapping[str, object] = dataclasses.field(default_factory=dict)
     span: SourceSpan | None = None
+    arg_spans: Mapping[str, SourceSpan] = dataclasses.field(default_factory=dict)
 
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_operation_call(self)
