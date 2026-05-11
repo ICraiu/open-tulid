@@ -1,0 +1,204 @@
+I’d frame it this way:
+
+  DSL = declarative workflow definition
+  Domain = concrete implementation catalog + runtime semantics
+  Vault/CLI = one adapter/interface over the domain
+
+  The domain should not be “business objects for Obsidian tasks” anymore. It should become the concrete engine implementation
+  layer for the abstract DSL.
+
+  Operations vs Validations
+
+  Your examples make sense.
+
+  An operation changes something or prepares something:
+
+  - move_task
+  - copy_file
+  - copy_field
+  - set_field
+  - link_artifact
+  - git_add
+  - git_commit
+  - create_branch
+  - checkout_branch
+  - write_file
+  - append_event
+  - update_kanban_view
+
+  A validation observes/checks something and returns pass/fail:
+
+  - git_build
+  - git_status_clean
+  - file_exists
+  - template_sections_present
+  - artifact_has_required_text
+  - branch_exists
+  - tests_pass
+  - link_target_exists
+
+  Rule of thumb:
+
+  If it mutates state: operation.
+  If it only checks state: validation.
+
+  So yes: git_build is a validation if it runs a build and checks success. git_add is an operation because it mutates the git
+  index.
+
+  There is one subtlety: some validations have side effects in practice, like build caches or generated files. But
+  semantically, the workflow engine should treat them as validations. If a validation must produce a durable artifact, model
+  that explicitly as an operation plus validation.
+
+  Artifacts
+
+  Your correction is important: artifact should not mean only Markdown task files.
+
+  An artifact can be:
+
+  - file
+  - directory
+  - git branch
+  - git commit
+  - git diff
+  - test result
+  - build output
+  - kanban card/task
+  - template instance
+  - external URL maybe later
+
+  So artifact_type should probably become more expressive:
+
+  - kind: artifact_type
+    id: TaskFile
+    medium: markdown_file
+    template: TaskTemplate
+
+  - kind: artifact_type
+    id: FeatureBranch
+    medium: git_branch
+
+  - kind: artifact_type
+    id: BuildResult
+    medium: command_result
+
+  Or:
+
+  - kind: artifact_type
+    id: FeatureBranch
+    adapter: git
+    shape: branch
+
+  The exact names can wait, but the important point is: artifact_type needs a concrete handler/adapter.
+
+  Templates
+
+  If a template is “a file with an enumeration of sections,” then yes, it is not the whole artifact model. It is a schema/shape
+  for a subset of file artifacts.
+
+  So maybe:
+
+  artifact_type = what kind of thing this artifact is
+  template = structural schema for file-like artifacts
+  validation = check applied to an artifact or field
+
+  Example:
+
+  - kind: artifact_type
+    id: CompletedTask
+    medium: markdown_file
+    template: CompletedTaskTemplate
+
+  - kind: template
+    id: CompletedTaskTemplate
+    sections:
+      - id: Idea
+        required: true
+      - id: Status
+        required: true
+      - id: Proof
+        required: false
+
+  Then validate_template is probably badly named in the current domain. It sounds like it validates the template definition
+  itself. What you’re describing is more like:
+
+  validate_artifact_matches_template
+
+  or:
+
+  template_sections_present
+  required_sections_present
+  required_fields_present
+
+  Kanban
+
+  This also changes the model.
+
+  If kanban is just a view over tasks/transitions, then it should not be the source of truth. It becomes an adapter/view:
+
+  workflow state + tasks -> kanban projection
+  kanban interaction -> transition request
+
+  So the current CLI validating kanban links is legacy adapter behavior. Long-term, kanban should be generated from or
+  reconciled with workflow state, not define workflow state itself.
+
+  Where Concrete Implementations Live
+
+  I agree: these concrete implementations belong to domain, but I’d avoid calling the package domain if it becomes registries/
+  adapters/runtime. It may evolve into:
+
+  open_tulid/workflow/
+    definitions.py      # compiled DSL model
+    artifacts.py        # artifact abstraction
+    validations.py      # validation interfaces + registry
+    operations.py       # operation interfaces + registry
+    workers.py          # worker interfaces + registry
+    templates.py        # template schema/render/parse logic
+    runtime.py          # executes transition plans later
+    compiler.py         # DSL AST -> definitions
+
+  open_tulid/adapters/
+    obsidian/
+    git/
+    filesystem/
+
+  But you can migrate incrementally under current domain first.
+
+  Core Design Direction
+
+  I would define three registries:
+
+  ValidationRegistry
+  OperationRegistry
+  ArtifactHandlerRegistry
+
+  Possibly also:
+
+  WorkerRegistry
+  TemplateRegistry
+  StorageAdapterRegistry
+
+  Then DSL declarations are checked against registries at integration/runtime level:
+
+  DSL validation checks: references are declared correctly.
+  Domain compilation checks: declared types are supported by this installation.
+  Runtime checks: actual task/artifact state satisfies requirements.
+
+  That separation matters. workflow_engine should only know that git_build is a declared validation_type. The domain compiler/
+  runtime should know whether git_build is implemented.
+
+  Next Spec Slice I’d Write
+
+  Do not integrate CLI yet. First write a spec for:
+
+  DSL -> Domain Definition Compiler
+
+  Acceptance criteria:
+
+  - Converts DSL WorkflowDocument into WorkflowDefinition.
+  - Rejects DSL declarations whose concrete implementation is unsupported.
+  - Introduces registries for validation, operation, artifact handler, worker.
+  - Does not execute anything.
+  - Keeps workflow_engine standalone.
+  - Keeps current hardcoded domain templates/transitions as compatibility fixtures only.
+
+  That is the right next bridge.

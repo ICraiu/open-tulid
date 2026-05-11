@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+from .registry import (
+    ArtifactHandlerSpec,
+    OperationSpec,
+    RuntimeRegistries,
+    TemplateHandlerSpec,
+    ValidationSpec,
+    WorkerSpec,
+    build_registries,
+)
+
+
+class _Placeholder:
+    """Placeholder implementation object for built-in registry entries."""
+
+    def __repr__(self) -> str:
+        return "<placeholder>"
+
+
+_PLACEHOLDER = _Placeholder()
+
+VALIDATION_IDS = [
+    "project_build",
+    "git_status_clean",
+    "file_exists",
+    "artifact_in_vault",
+    "artifact_link_in_vault",
+    "artifact_matches_template",
+    "template_sections_present",
+    "template_required_fields_present",
+    "artifact_has_required_text",
+    "branch_exists",
+    "tests_pass",
+    "link_target_exists",
+]
+
+OPERATION_IDS = [
+    "move_task",
+    "copy_file",
+    "copy_field",
+    "set_field",
+    "link_artifact",
+    "git_add",
+    "git_commit",
+    "git_reset_hard",
+    "create_branch",
+    "checkout_branch",
+    "write_file",
+    "append_event",
+    "update_kanban_view",
+]
+
+WORKER_IDS = [
+    "local_llm",
+    "shell_command",
+    "human_approval",
+    "noop",
+]
+
+ARTIFACT_HANDLER_IDS = [
+    "markdown_file",
+    "plain_file",
+    "directory",
+    "git_branch",
+    "git_commit",
+    "git_diff",
+    "command_result",
+    "json_manifest",
+    "kanban_card",
+    "external_url",
+]
+
+TEMPLATE_HANDLER_IDS = [
+    "markdown_sections",
+    "json_schema",
+    "none",
+]
+
+
+def _build_validations() -> list[ValidationSpec]:
+    specs: list[ValidationSpec] = []
+    for vid in VALIDATION_IDS:
+        specs.append(ValidationSpec(id=vid, implementation=_PLACEHOLDER))
+    return specs
+
+
+def _build_operations() -> list[OperationSpec]:
+    specs: list[OperationSpec] = []
+    for oid in OPERATION_IDS:
+        kwargs: dict = {"id": oid, "implementation": _PLACEHOLDER}
+        if oid == "git_reset_hard":
+            kwargs["destructive"] = True
+            kwargs["requires_approval"] = True
+        specs.append(OperationSpec(**kwargs))
+    return specs
+
+
+def _build_workers() -> list[WorkerSpec]:
+    specs: list[WorkerSpec] = []
+    for wid in WORKER_IDS:
+        specs.append(WorkerSpec(id=wid, implementation=_PLACEHOLDER))
+    return specs
+
+
+def _build_artifact_handlers() -> list[ArtifactHandlerSpec]:
+    specs: list[ArtifactHandlerSpec] = []
+    for aid in ARTIFACT_HANDLER_IDS:
+        specs.append(ArtifactHandlerSpec(id=aid, implementation=_PLACEHOLDER))
+    return specs
+
+
+def _build_template_handlers() -> list[TemplateHandlerSpec]:
+    specs: list[TemplateHandlerSpec] = []
+    for tid in TEMPLATE_HANDLER_IDS:
+        specs.append(TemplateHandlerSpec(id=tid, implementation=_PLACEHOLDER))
+    return specs
+
+
+def get_builtin_registries() -> RuntimeRegistries:
+    registries, diags = build_registries(
+        validations=_build_validations(),
+        operations=_build_operations(),
+        workers=_build_workers(),
+        artifact_handlers=_build_artifact_handlers(),
+        template_handlers=_build_template_handlers(),
+    )
+    if registries is None:
+        raise RuntimeError(f"built-in registries failed to build: {diags}")
+    return registries
