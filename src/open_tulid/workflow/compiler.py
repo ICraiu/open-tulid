@@ -22,7 +22,7 @@ from workflow_engine.ast import (
 from workflow_engine.diagnostics import SourceSpan
 
 from .builtins import get_builtin_registries
-from .definitions import (
+from open_tulid.domain.schema import (
     ArgDefinition,
     ArtifactTypeDefinition,
     OperationCallDefinition,
@@ -57,8 +57,16 @@ def _span_to_diag_fields(span: SourceSpan | None) -> tuple[str | None, int | Non
     return span.path, span.line, span.column
 
 
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(k): _freeze_value(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
 def _freeze_mapping(mapping: Mapping[str, object]) -> Mapping[str, object]:
-    return MappingProxyType(dict(mapping))
+    return MappingProxyType({str(k): _freeze_value(v) for k, v in mapping.items()})
 
 
 def _arg_spec_to_def(spec: ArgSpec) -> ArgDefinition:

@@ -3,8 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from open_tulid.config import Config
-from open_tulid.models import CreatedProject, Project
+from open_tulid.models import Config, CreatedProject, Project
 
 
 REQUIRED_DIRS = ["kanban", "docs", "tasks"]

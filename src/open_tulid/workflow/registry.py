@@ -6,7 +6,7 @@ from types import MappingProxyType
 
 from workflow_engine import langdef
 
-from .definitions import ArgDefinition
+from open_tulid.domain.schema import ArgDefinition
 from .diagnostics import WorkflowCompileDiagnostic
 
 

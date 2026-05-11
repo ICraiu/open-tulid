@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
-from open_tulid.config import CONFIG_FILENAME, load_config
-from open_tulid.models import ValidationReport
-from open_tulid.vault.project import create_project, iter_configured_projects
+from open_tulid.config import load_config
+from open_tulid.models import Config, ValidationReport
+from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
+from open_tulid.workflow.runtime import load_workflow_definition
 
 app = typer.Typer(
     name="tulid",
@@ -21,13 +20,31 @@ app = typer.Typer(
 console = Console()
 
 
-def _get_config() -> object:
-    return load_config()
+def _load_cli_config() -> Config:
+    config = load_config()
+    if config.workflow_path is None:
+        return config
+
+    workflow = load_workflow_definition(config.workflow_path)
+    if workflow.valid:
+        return config
+
+    console.print(Panel("Workflow validation failed.", style="red"))
+    for diagnostic in workflow.diagnostics:
+        parts = []
+        if getattr(diagnostic, "path", None):
+            parts.append(str(diagnostic.path))
+        if getattr(diagnostic, "line", None) is not None:
+            parts.append(str(diagnostic.line))
+        prefix = ":".join(parts)
+        message = f"{diagnostic.code}: {diagnostic.message}"
+        console.print(f"{prefix}: {message}" if prefix else message)
+    raise typer.Exit(2)
 
 
 @app.command()
 def init() -> None:
-    """Create ~/.open-tulid.toml configuration file."""
+    """Create ~/.tuluid/open-tulid.toml configuration file."""
     init_cmd()
 
 
@@ -36,7 +53,7 @@ def project(
     name: str = typer.Argument(..., help="Name of the new project to create."),
 ) -> None:
     """Create a new project directory inside the configured vault."""
-    config = load_config()
+    config = _load_cli_config()
     result = create_project(config, name)
     for dir_path in result.created_dirs:
         console.print(f"Created {dir_path}")
@@ -56,7 +73,7 @@ def uninstall() -> None:
 @vault_app.command()
 def validate() -> None:
     """Validate all configured projects in the vault."""
-    config = load_config()
+    config = _load_cli_config()
     report = validate_vault(config)
     _print_report(report)
 

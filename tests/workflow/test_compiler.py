@@ -255,6 +255,24 @@ statements:
         result = compile_workflow(doc)
         assert isinstance(result, CompileResult)
 
+    def test_compiles_to_domain_workflow_definition(self):
+        from open_tulid.domain.schema import WorkflowDefinition
+
+        doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+""")
+        result = compile_workflow(doc)
+        assert isinstance(result.definition, WorkflowDefinition)
+
+    def test_workflow_definition_api_reexports_domain_model(self):
+        from open_tulid.domain.schema import WorkflowDefinition as DomainWorkflowDefinition
+        from open_tulid.workflow import WorkflowDefinition as WorkflowApiWorkflowDefinition
+
+        assert WorkflowApiWorkflowDefinition is DomainWorkflowDefinition
+
     def test_default_registries_used(self):
         doc = _build_document("""
 schema_version: 1
@@ -676,6 +694,42 @@ statements:
         vc = result.definition.transitions["t1"].requires.validations[0]
         with pytest.raises(TypeError):
             vc.args["hacked"] = object()
+
+    def test_validation_call_nested_args_immutable(self):
+        doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: task_type
+    id: TT
+  - kind: artifact_type
+    id: ImplementationSummary
+  - kind: validation_type
+    id: file_exists
+    args:
+      artifacts:
+        type: artifact_ref
+        many: true
+  - kind: transition
+    id: t1
+    task_type: TT
+    from: Todo
+    to: Todo
+    requires:
+      validations:
+        - type: file_exists
+          args:
+            artifacts:
+              - ImplementationSummary
+""")
+        result = compile_workflow(doc)
+        assert result.definition is not None
+        import pytest
+        vc = result.definition.transitions["t1"].requires.validations[0]
+        assert vc.args["artifacts"] == ("ImplementationSummary",)
+        with pytest.raises(TypeError):
+            vc.args["artifacts"][0] = "Other"
 
     def test_operation_call_args_immutable(self):
         doc = _build_document("""

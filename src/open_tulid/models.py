@@ -8,6 +8,8 @@ from pathlib import Path
 class Config:
     vault_root: Path
     projects: list[str]
+    config_dir: Path | None = None
+    workflow_path: Path | None = None
 
 
 @dataclass

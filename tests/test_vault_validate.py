@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from open_tulid.cli.main import app
+from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.config import load_config
 from open_tulid.models import Config
 from open_tulid.vault.validator import validate_vault
@@ -15,7 +16,9 @@ runner = CliRunner()
 
 
 def _make_config(vault_root: Path, projects: list[str]) -> Path:
-    cfg = vault_root / ".open-tulid.toml"
+    config_dir = vault_root / CONFIG_DIRNAME
+    config_dir.mkdir(exist_ok=True)
+    cfg = config_dir / CONFIG_FILENAME
     cfg.write_text(
         f'[vault]\nroot = "{vault_root}"\nprojects = {projects!r}\n',
         encoding="utf-8",

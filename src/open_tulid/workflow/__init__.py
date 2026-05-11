@@ -28,6 +28,7 @@ from .registry import (
     build_registries,
     validate_registries,
 )
+from .runtime import WorkflowLoadResult, clear_workflow_cache, load_workflow_definition
 
 __all__ = [
     "WorkflowCompileDiagnostic",
@@ -55,4 +56,7 @@ __all__ = [
     "TemplateHandlerSpec",
     "build_registries",
     "validate_registries",
+    "WorkflowLoadResult",
+    "load_workflow_definition",
+    "clear_workflow_cache",
 ]

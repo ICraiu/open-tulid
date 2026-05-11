@@ -24,7 +24,7 @@ tulid init
 
 ## Configuration
 
-The config file is `~/.open-tulid.toml`, created by `tulid init`.
+The config file is `~/.tuluid/open-tulid.toml`, created by `tulid init`.
 
 Example config:
 
@@ -32,6 +32,9 @@ Example config:
 [vault]
 root = "/path/to/obsidian/vault"
 projects = ["Agent", "Game"]
+
+[workflow]
+path = "workflow.yaml"
 ```
 
 ## Usage
@@ -85,4 +88,4 @@ python -m pytest tests/test_project_create.py -v
 tulid uninstall
 ```
 
-This removes the app but keeps `~/.open-tulid.toml`.
+This removes the app but keeps `~/.tuluid/`.

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from open_tulid.config import Config
-from open_tulid.models import Project, ValidationError, ValidationReport
+from open_tulid.models import Config, Project, ValidationError, ValidationReport
 from open_tulid.vault.domain_integration import validate_project_domain_artifacts
 from open_tulid.vault.links import validate_kanban_file
 from open_tulid.vault.project import iter_configured_projects

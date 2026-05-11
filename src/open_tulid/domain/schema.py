@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 
 class ArtifactState(str, Enum):
@@ -160,6 +160,147 @@ class ArtifactWriteResult:
     @property
     def is_valid(self) -> bool:
         return self.path is not None and self.content is not None and self.report.is_valid
+
+
+@dataclass(frozen=True)
+class Task:
+    id: str
+    title: str
+    path: str
+    current_state: str
+    task_type: str = "task"
+    dependencies: tuple[str, ...] = ()
+    artifact_links: tuple[str, ...] = ()
+    parent_id: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    body: str = ""
+
+
+@dataclass(frozen=True)
+class BoardPosition:
+    board: str
+    column: str
+    card_text: str
+    line: int
+
+
+@dataclass(frozen=True)
+class ProjectSnapshot:
+    project_id: str
+    tasks: Mapping[str, Task]
+    board_positions: Mapping[str, BoardPosition]
+    artifacts: tuple[Artifact, ...] = ()
+
+
+@dataclass(frozen=True)
+class DomainError:
+    code: str
+    message: str
+    location: str | None = None
+
+
+@dataclass(frozen=True)
+class MoveTask:
+    task_id: str
+    from_state: str
+    to_state: str
+
+
+@dataclass(frozen=True)
+class WriteTask:
+    task: Task
+
+
+@dataclass(frozen=True)
+class ArgDefinition:
+    type: str
+    required: bool = False
+    many: bool = False
+
+
+@dataclass(frozen=True)
+class WorkflowDefinition:
+    schema_version: int
+    states: Mapping[str, "StateDefinition"]
+    task_types: Mapping[str, "TaskTypeDefinition"]
+    artifact_types: Mapping[str, "ArtifactTypeDefinition"]
+    validation_types: Mapping[str, "ValidationTypeDefinition"]
+    operation_types: Mapping[str, "OperationTypeDefinition"]
+    workers: Mapping[str, "WorkerDefinition"]
+    transitions: Mapping[str, "TransitionDefinition"]
+
+
+@dataclass(frozen=True)
+class StateDefinition:
+    id: str
+
+
+@dataclass(frozen=True)
+class TaskTypeDefinition:
+    id: str
+    requirements_by_state: Mapping[str, "RequirementDefinition"]
+
+
+@dataclass(frozen=True)
+class ArtifactTypeDefinition:
+    id: str
+    template: str | None = None
+    handler: str | None = None
+
+
+@dataclass(frozen=True)
+class ValidationTypeDefinition:
+    id: str
+    args: Mapping[str, ArgDefinition]
+    implementation_id: str
+
+
+@dataclass(frozen=True)
+class OperationTypeDefinition:
+    id: str
+    args: Mapping[str, ArgDefinition]
+    implementation_id: str
+
+
+@dataclass(frozen=True)
+class WorkerDefinition:
+    id: str
+    type: str | None = None
+    implementation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TransitionDefinition:
+    id: str
+    task_type: str
+    from_state: str
+    to_state: str
+    worker: str | None
+    requires: "RequirementDefinition"
+    transaction: "TransactionDefinition" | None
+
+
+@dataclass(frozen=True)
+class RequirementDefinition:
+    artifacts: tuple[str, ...] = ()
+    validations: tuple["ValidationCallDefinition", ...] = ()
+
+
+@dataclass(frozen=True)
+class ValidationCallDefinition:
+    type: str
+    args: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class OperationCallDefinition:
+    op: str
+    args: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class TransactionDefinition:
+    steps: tuple["OperationCallDefinition", ...]
 
 
 COMPATIBLE_VALIDATORS: dict[FieldType, set[ValidatorType]] = {
