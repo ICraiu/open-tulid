@@ -23,6 +23,35 @@ def generate_json_schema() -> dict:
                     "oneOf": [_statement_schema(kind) for kind in sorted(langdef.SUPPORTED_KINDS)],
                 },
             },
+            "storage": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "obsidian": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "boards": {
+                                "type": "object",
+                                "additionalProperties": {"type": "string"},
+                            },
+                            "state_mappings": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["state", "board", "column"],
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "state": {"type": "string"},
+                                        "board": {"type": "string"},
+                                        "column": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
         },
     }
     return schema
@@ -67,10 +96,14 @@ def _build_statement_properties(kind: str, allowed: frozenset) -> dict:
         }
 
     # Add transition-specific fields
-    transition_fields = {"task_type", "from", "to", "worker", "requires", "transaction"}
+    transition_fields = {
+        "task_type", "from", "to", "worker", "default_for_scheduler", "requires", "transaction",
+    }
     for field_name in sorted(transition_fields & allowed):
         if field_name in ("task_type", "from", "to", "worker"):
             props[field_name] = {"type": "string"}
+        elif field_name == "default_for_scheduler":
+            props[field_name] = {"type": "boolean"}
         elif field_name == "requires":
             props[field_name] = _requirement_set_schema()
         elif field_name == "transaction":

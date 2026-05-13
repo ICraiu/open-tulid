@@ -65,9 +65,11 @@ class TaskManager:
         *,
         workflow: WorkflowDefinition,
         adapter: StorageAdapter,
+        job_store: object | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
+        self.job_store = job_store
 
     def handle(
         self,
@@ -171,6 +173,15 @@ class TaskManager:
             worker_id=transition.worker,
             workspace_path=str(workspace),
         )
+        if self.job_store is not None:
+            saved = self.job_store.create(job)
+            if not saved.accepted:
+                return CommandResult(
+                    accepted=False,
+                    errors=(saved.error or _error("job.write_failed", "Execution job was not recorded."),),
+                )
+            if saved.job is not None:
+                job = saved.job
         events = (
             *transition_result.events,
             _event(

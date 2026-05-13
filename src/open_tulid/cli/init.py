@@ -81,6 +81,14 @@ def init() -> None:
 def _default_workflow() -> str:
     return (
         "schema_version: 1\n"
+        "storage:\n"
+        "  obsidian:\n"
+        "    boards:\n"
+        "      Work: kanban/Work.md\n"
+        "    state_mappings:\n"
+        "      - state: Todo\n"
+        "        board: Work\n"
+        "        column: Todo\n"
         "statements:\n"
         "  - kind: state\n"
         "    id: Todo\n"

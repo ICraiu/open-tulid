@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from ruamel.yaml import YAML
 
-from open_tulid.domain.schema import BoardPosition, DomainError, ProjectSnapshot, Task
+from open_tulid.domain.schema import BoardPosition, DomainError, ProjectSnapshot, Task, WorkflowDefinition
 from open_tulid.vault.links import parse_task_row
 
 from .base import (
@@ -581,6 +581,34 @@ class ObsidianAdapter:
         else:
             new_content += "\n"
         return _TaskStateCacheUpdate(content=new_content)
+
+
+def config_from_workflow(
+    *,
+    project_id: str,
+    project_root: Path,
+    workflow: WorkflowDefinition,
+    tasks_dir: str | Path = "tasks",
+    events_dir: str | Path = "events",
+) -> ObsidianAdapterConfig:
+    storage = workflow.storage.obsidian if workflow.storage is not None else None
+    if storage is None:
+        raise ValueError("workflow.storage.obsidian is required for the Obsidian adapter")
+    return ObsidianAdapterConfig(
+        project_id=project_id,
+        project_root=project_root,
+        boards=dict(storage.boards),
+        state_mappings=tuple(
+            ObsidianStateMapping(
+                state=mapping.state,
+                board=mapping.board,
+                column=mapping.column,
+            )
+            for mapping in storage.state_mappings
+        ),
+        tasks_dir=tasks_dir,
+        events_dir=events_dir,
+    )
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

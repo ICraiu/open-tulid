@@ -19,7 +19,10 @@ STATEMENT_KEYS: Final = {
     "validation_type": frozenset({"kind", "id", "args"}),
     "worker": frozenset({"kind", "id", "type"}),
     "operation_type": frozenset({"kind", "id", "args"}),
-    "transition": frozenset({"kind", "id", "task_type", "from", "to", "worker", "requires", "transaction"}),
+    "transition": frozenset({
+        "kind", "id", "task_type", "from", "to", "worker", "default_for_scheduler",
+        "requires", "transaction",
+    }),
 }
 
 STATEMENT_REQUIRED_KEYS: Final = {

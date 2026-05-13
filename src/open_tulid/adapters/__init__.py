@@ -10,6 +10,7 @@ from .obsidian import (
     ObsidianAdapter,
     ObsidianAdapterConfig,
     ObsidianStateMapping,
+    config_from_workflow,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "ObsidianAdapter",
     "ObsidianAdapterConfig",
     "ObsidianStateMapping",
+    "config_from_workflow",
 ]

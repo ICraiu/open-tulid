@@ -10,6 +10,8 @@ from . import langdef
 from .ast import (
     ArgSpec,
     ArtifactTypeStatement,
+    ObsidianStateMapping,
+    ObsidianStorage,
     OperationCall,
     OperationTypeStatement,
     RequirementSet,
@@ -21,6 +23,7 @@ from .ast import (
     ValidationCall,
     ValidationTypeStatement,
     WorkerStatement,
+    WorkflowStorage,
     WorkflowDocument,
 )
 from .diagnostics import Diagnostic, SourceSpan
@@ -171,7 +174,7 @@ def build_ast(parsed: object | None, *, source_name: str = "<memory>") -> AstBui
 
     # Unknown top-level keys - use YAML key path, not source_name
     for key in parsed:
-        if key not in ("schema_version", "statements"):
+        if key not in ("schema_version", "statements", "storage"):
             span = key_span(parsed, key, str(key))
             diagnostics.append(_diag_from_span(
                 "workflow.shape.unknown_key",
@@ -244,9 +247,18 @@ def build_ast(parsed: object | None, *, source_name: str = "<memory>") -> AstBui
     if diagnostics:
         return ABR(document=None, diagnostics=tuple(diagnostics))
 
+    storage: WorkflowStorage | None = None
+    if "storage" in parsed:
+        storage_diags, storage = _build_storage(parsed["storage"])
+        diagnostics.extend(storage_diags)
+
+    if diagnostics:
+        return ABR(document=None, diagnostics=tuple(diagnostics))
+
     document = WorkflowDocument(
         schema_version=int(sv),
         statements=tuple(statements),
+        storage=storage,
         span=doc_span,
     )
     return ABR(document=document, diagnostics=())
@@ -330,7 +342,7 @@ def _build_statement(
 
     # Build field_spans for semantic validation
     field_spans: dict[str, SourceSpan] = {}
-    for field_name in ("task_type", "from", "to", "worker"):
+    for field_name in ("task_type", "from", "to", "worker", "default_for_scheduler"):
         if field_name in raw:
             fs = key_span(raw, field_name, f"{item_path}.{field_name}")
             if fs:
@@ -645,6 +657,16 @@ def _build_transition(
         ))
         return diagnostics, None
 
+    default_for_scheduler = raw.get("default_for_scheduler", False)
+    if not isinstance(default_for_scheduler, bool):
+        default_span = key_span(raw, "default_for_scheduler", f"{item_path}.default_for_scheduler")
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "default_for_scheduler must be a boolean",
+            default_span,
+        ))
+        return diagnostics, None
+
     requires = RequirementSet()
     requires_raw = raw.get("requires")
     if requires_raw is not None:
@@ -672,10 +694,134 @@ def _build_transition(
         from_state=from_state,
         to_state=to_state,
         worker=worker,
+        default_for_scheduler=default_for_scheduler,
         requires=requires,
         transaction=transaction,
         span=item_span,
         field_spans=dict(field_spans),
+    )
+
+
+def _build_storage(raw: object) -> tuple[list[Diagnostic], WorkflowStorage | None]:
+    diagnostics: list[Diagnostic] = []
+    if raw is None:
+        return diagnostics, None
+    if not isinstance(raw, dict):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "storage must be a mapping",
+            node_span(raw, "storage"),
+        ))
+        return diagnostics, None
+
+    for key in raw:
+        if key != "obsidian":
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.unknown_key",
+                f"unknown storage key: {key!r}",
+                key_span(raw, key, f"storage.{key}"),
+            ))
+
+    obsidian: ObsidianStorage | None = None
+    if "obsidian" in raw:
+        obsidian_diags, obsidian = _build_obsidian_storage(raw["obsidian"])
+        diagnostics.extend(obsidian_diags)
+
+    if diagnostics:
+        return diagnostics, None
+    return diagnostics, WorkflowStorage(
+        obsidian=obsidian,
+        span=node_span(raw, "storage"),
+    )
+
+
+def _build_obsidian_storage(raw: object) -> tuple[list[Diagnostic], ObsidianStorage | None]:
+    diagnostics: list[Diagnostic] = []
+    if not isinstance(raw, dict):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "storage.obsidian must be a mapping",
+            node_span(raw, "storage.obsidian"),
+        ))
+        return diagnostics, None
+
+    for key in raw:
+        if key not in {"boards", "state_mappings"}:
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.unknown_key",
+                f"unknown storage.obsidian key: {key!r}",
+                key_span(raw, key, f"storage.obsidian.{key}"),
+            ))
+
+    boards_raw = raw.get("boards", {})
+    if not isinstance(boards_raw, dict):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "storage.obsidian.boards must be a mapping",
+            key_span(raw, "boards", "storage.obsidian.boards"),
+        ))
+        return diagnostics, None
+    boards: dict[str, str] = {}
+    for name, path in boards_raw.items():
+        if not isinstance(name, str) or not isinstance(path, str) or not name.strip() or not path.strip():
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "storage.obsidian.boards entries must map non-empty string board names to non-empty string paths",
+                key_span(boards_raw, name, f"storage.obsidian.boards.{name}"),
+            ))
+            continue
+        boards[name.strip()] = path.strip()
+
+    mappings_raw = raw.get("state_mappings", ())
+    if not isinstance(mappings_raw, list):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "storage.obsidian.state_mappings must be a list",
+            key_span(raw, "state_mappings", "storage.obsidian.state_mappings"),
+        ))
+        return diagnostics, None
+
+    mappings: list[ObsidianStateMapping] = []
+    for index, item in enumerate(mappings_raw):
+        item_path = f"storage.obsidian.state_mappings[{index}]"
+        item_span = list_item_span(mappings_raw, index, item_path)
+        if not isinstance(item, dict):
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "storage.obsidian.state_mappings entries must be mappings",
+                item_span,
+            ))
+            continue
+        for key in item:
+            if key not in {"state", "board", "column"}:
+                diagnostics.append(_diag_from_span(
+                    "workflow.shape.unknown_key",
+                    f"unknown state mapping key: {key!r}",
+                    key_span(item, key, f"{item_path}.{key}"),
+                ))
+        state = item.get("state")
+        board = item.get("board")
+        column = item.get("column")
+        if not all(isinstance(value, str) and value.strip() for value in (state, board, column)):
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.missing_required_field",
+                "state mappings require non-empty string state, board, and column",
+                item_span,
+            ))
+            continue
+        mappings.append(ObsidianStateMapping(
+            state=state.strip(),
+            board=board.strip(),
+            column=column.strip(),
+            span=item_span,
+        ))
+
+    if diagnostics:
+        return diagnostics, None
+    return diagnostics, ObsidianStorage(
+        boards=boards,
+        state_mappings=tuple(mappings),
+        span=node_span(raw, "storage.obsidian"),
     )
 
 

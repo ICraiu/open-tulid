@@ -20,6 +20,83 @@ def _build_document(yaml_source: str) -> workflow_engine.WorkflowDocument:
     return ast_result.document
 
 
+def test_compiles_storage_obsidian_mapping_into_domain_definition():
+    doc = _build_document("""
+schema_version: 1
+storage:
+  obsidian:
+    boards:
+      Work: kanban/Work.md
+    state_mappings:
+      - state: Todo
+        board: Work
+        column: Todo
+statements:
+  - kind: state
+    id: Todo
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.storage is not None
+    obsidian = result.definition.storage.obsidian
+    assert obsidian is not None
+    assert dict(obsidian.boards) == {"Work": "kanban/Work.md"}
+    assert obsidian.state_mappings[0].state == "Todo"
+
+
+def test_rejects_obsidian_mapping_to_unknown_state():
+    doc = _build_document("""
+schema_version: 1
+storage:
+  obsidian:
+    boards:
+      Work: kanban/Work.md
+    state_mappings:
+      - state: Missing
+        board: Work
+        column: Todo
+statements:
+  - kind: state
+    id: Todo
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is False
+    assert result.diagnostics[0].code == "workflow.compile.unknown_state_ref"
+
+
+def test_compiles_scheduler_default_transition_flag():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: Review
+  - kind: task_type
+    id: task
+  - kind: worker
+    id: codex
+  - kind: transition
+    id: Implement
+    task_type: task
+    from: Todo
+    to: Review
+    worker: codex
+    default_for_scheduler: true
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.transitions["Implement"].default_for_scheduler is True
+
+
 class TestCompilePositive:
     def test_compile_valid_minimal(self):
         result = workflow_engine.load_yaml(str(FIXTURES / "valid_minimal.yaml"))

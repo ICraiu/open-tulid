@@ -8,6 +8,8 @@ from .ast import (
     ArgSpec,
     ArtifactTypeStatement,
     AstVisitor,
+    ObsidianStateMapping,
+    ObsidianStorage,
     OperationCall,
     OperationTypeStatement,
     RequirementSet,
@@ -19,6 +21,7 @@ from .ast import (
     ValidationCall,
     ValidationTypeStatement,
     WorkerStatement,
+    WorkflowStorage,
     WorkflowDocument,
 )
 from .diagnostics import Diagnostic, SourceSpan
@@ -80,6 +83,9 @@ __all__ = [
     "Diagnostic",
     "SourceSpan",
     "WorkflowDocument",
+    "WorkflowStorage",
+    "ObsidianStorage",
+    "ObsidianStateMapping",
     "Statement",
     "StateStatement",
     "TaskTypeStatement",

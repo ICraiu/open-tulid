@@ -27,8 +27,11 @@ from open_tulid.domain.schema import (
     ArtifactTypeDefinition,
     OperationCallDefinition,
     OperationTypeDefinition,
+    ObsidianStateMappingDefinition,
+    ObsidianStorageDefinition,
     RequirementDefinition,
     StateDefinition,
+    StorageDefinition,
     TaskTypeDefinition,
     TransactionDefinition,
     TransitionDefinition,
@@ -98,6 +101,25 @@ def _transaction_to_def(txn: TransactionPlan) -> TransactionDefinition:
             args=_freeze_mapping(step.args),
         ))
     return TransactionDefinition(steps=tuple(steps))
+
+
+def _storage_to_def(document: WorkflowDocument) -> StorageDefinition | None:
+    if document.storage is None:
+        return None
+    obsidian = None
+    if document.storage.obsidian is not None:
+        obsidian = ObsidianStorageDefinition(
+            boards=_freeze_mapping(document.storage.obsidian.boards),
+            state_mappings=tuple(
+                ObsidianStateMappingDefinition(
+                    state=mapping.state,
+                    board=mapping.board,
+                    column=mapping.column,
+                )
+                for mapping in document.storage.obsidian.state_mappings
+            ),
+        )
+    return StorageDefinition(obsidian=obsidian)
 
 
 def _validate_requirement_refs_with_spans(
@@ -228,6 +250,55 @@ def _validate_cross_references_with_ast(
                     ))
 
 
+def _validate_storage_refs(
+    document: WorkflowDocument,
+    states: dict[str, StateDefinition],
+    diagnostics: list[WorkflowCompileDiagnostic],
+) -> None:
+    if document.storage is None or document.storage.obsidian is None:
+        return
+    boards = document.storage.obsidian.boards
+    seen_states: set[str] = set()
+    seen_board_columns: set[tuple[str, str]] = set()
+    for mapping in document.storage.obsidian.state_mappings:
+        path, line, column = _span_to_diag_fields(mapping.span)
+        if mapping.state not in states:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.unknown_state_ref",
+                message=f"storage.obsidian maps unknown state {mapping.state!r}",
+                path=path,
+                line=line,
+                column=column,
+            ))
+        if mapping.board not in boards:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.unknown_board_ref",
+                message=f"storage.obsidian maps state {mapping.state!r} to unknown board {mapping.board!r}",
+                path=path,
+                line=line,
+                column=column,
+            ))
+        if mapping.state in seen_states:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.duplicate_state_mapping",
+                message=f"storage.obsidian maps state {mapping.state!r} more than once",
+                path=path,
+                line=line,
+                column=column,
+            ))
+        board_column = (mapping.board, mapping.column)
+        if board_column in seen_board_columns:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.duplicate_board_column_mapping",
+                message=f"storage.obsidian maps board column {mapping.board!r}/{mapping.column!r} more than once",
+                path=path,
+                line=line,
+                column=column,
+            ))
+        seen_states.add(mapping.state)
+        seen_board_columns.add(board_column)
+
+
 def compile_workflow(
     document: WorkflowDocument,
     registries: RuntimeRegistries | None = None,
@@ -354,6 +425,7 @@ def compile_workflow(
                 worker=stmt.worker,
                 requires=req_def,
                 transaction=txn_def,
+                default_for_scheduler=stmt.default_for_scheduler,
             )
             transition_stmts[stmt.id] = stmt
 
@@ -363,6 +435,7 @@ def compile_workflow(
         transitions, task_type_stmts, transition_stmts,
         diagnostics,
     )
+    _validate_storage_refs(document, states, diagnostics)
 
     if diagnostics:
         return CompileResult(definition=None, diagnostics=tuple(diagnostics))
@@ -376,5 +449,6 @@ def compile_workflow(
         operation_types=_freeze_mapping(operation_types),
         workers=_freeze_mapping(workers),
         transitions=_freeze_mapping(transitions),
+        storage=_storage_to_def(document),
     )
     return CompileResult(definition=definition, diagnostics=())

@@ -61,9 +61,31 @@ class TransactionPlan:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class ObsidianStateMapping:
+    state: str
+    board: str
+    column: str
+    span: SourceSpan | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ObsidianStorage:
+    boards: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    state_mappings: tuple[ObsidianStateMapping, ...] = ()
+    span: SourceSpan | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class WorkflowStorage:
+    obsidian: ObsidianStorage | None = None
+    span: SourceSpan | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class WorkflowDocument:
     schema_version: int
     statements: tuple["Statement", ...]
+    storage: WorkflowStorage | None = None
     span: SourceSpan | None = None
 
     def accept(self, visitor: AstVisitor) -> object:
@@ -131,6 +153,7 @@ class TransitionStatement(Statement):
     from_state: str
     to_state: str
     worker: str | None = None
+    default_for_scheduler: bool = False
     requires: RequirementSet = dataclasses.field(default_factory=RequirementSet)
     transaction: TransactionPlan | None = None
     field_spans: Mapping[str, SourceSpan] = dataclasses.field(default_factory=dict)

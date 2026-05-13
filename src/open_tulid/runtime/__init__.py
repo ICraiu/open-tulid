@@ -13,6 +13,8 @@ from .events import (
     utc_now,
 )
 from .operation_log import OperationEventLogger
+from .jobs import ACTIVE_JOB_STATUSES, FileExecutionJobStore, JobStoreResult
+from .scheduler import ScheduleResult, Scheduler
 from .transactions import EffectApplier, EffectResult, FileTransactionRuntime, TransactionApplyResult
 from .task_manager import (
     CommandResult,
@@ -41,6 +43,11 @@ __all__ = [
     "FileTransactionRuntime",
     "TransactionApplyResult",
     "OperationEventLogger",
+    "ACTIVE_JOB_STATUSES",
+    "FileExecutionJobStore",
+    "JobStoreResult",
+    "ScheduleResult",
+    "Scheduler",
     "CommandResult",
     "CreateExecutionJob",
     "RecordExecutionResult",

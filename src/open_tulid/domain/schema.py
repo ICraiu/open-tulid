@@ -174,6 +174,25 @@ class WorkflowDefinition:
     operation_types: Mapping[str, "OperationTypeDefinition"]
     workers: Mapping[str, "WorkerDefinition"]
     transitions: Mapping[str, "TransitionDefinition"]
+    storage: "StorageDefinition | None" = None
+
+
+@dataclass(frozen=True)
+class StorageDefinition:
+    obsidian: "ObsidianStorageDefinition | None" = None
+
+
+@dataclass(frozen=True)
+class ObsidianStorageDefinition:
+    boards: Mapping[str, str]
+    state_mappings: tuple["ObsidianStateMappingDefinition", ...]
+
+
+@dataclass(frozen=True)
+class ObsidianStateMappingDefinition:
+    state: str
+    board: str
+    column: str
 
 
 @dataclass(frozen=True)
@@ -223,6 +242,7 @@ class TransitionDefinition:
     worker: str | None
     requires: "RequirementDefinition"
     transaction: "TransactionDefinition" | None
+    default_for_scheduler: bool = False
 
 
 @dataclass(frozen=True)

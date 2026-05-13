@@ -11,8 +11,17 @@ from open_tulid.adapters import (
     ObsidianAdapter,
     ObsidianAdapterConfig,
     ObsidianStateMapping,
+    config_from_workflow,
 )
-from open_tulid.domain import ProjectSnapshot, Task
+from open_tulid.domain import (
+    ObsidianStateMappingDefinition,
+    ObsidianStorageDefinition,
+    ProjectSnapshot,
+    StateDefinition,
+    StorageDefinition,
+    Task,
+    WorkflowDefinition,
+)
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -36,6 +45,38 @@ def _make_project(tmp_path: Path) -> Path:
     (project / "tasks").mkdir(parents=True)
     (project / "events").mkdir(parents=True)
     return project
+
+
+def _workflow_with_obsidian_storage() -> WorkflowDefinition:
+    return WorkflowDefinition(
+        schema_version=1,
+        states={"Todo": StateDefinition(id="Todo")},
+        task_types={},
+        artifact_types={},
+        validation_types={},
+        operation_types={},
+        workers={},
+        transitions={},
+        storage=StorageDefinition(obsidian=ObsidianStorageDefinition(
+            boards={"Work": "kanban/Work.md"},
+            state_mappings=(
+                ObsidianStateMappingDefinition(state="Todo", board="Work", column="Todo"),
+            ),
+        )),
+    )
+
+
+def test_builds_obsidian_adapter_config_from_compiled_workflow(tmp_path: Path):
+    project = _make_project(tmp_path)
+
+    config = config_from_workflow(
+        project_id="Agent",
+        project_root=project,
+        workflow=_workflow_with_obsidian_storage(),
+    )
+
+    assert config.boards == {"Work": "kanban/Work.md"}
+    assert config.state_mappings == (ObsidianStateMapping(state="Todo", board="Work", column="Todo"),)
 
 
 def _write_task(project: Path, note: str, task_id: str = TASK_ID, state: str | None = None) -> None:
