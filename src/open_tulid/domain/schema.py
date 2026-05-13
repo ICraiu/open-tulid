@@ -170,7 +170,6 @@ class TaskTypeDefinition:
 class ArtifactTypeDefinition:
     id: str
     template: str | None = None
-    handler: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,4 +225,3 @@ class OperationCallDefinition:
 @dataclass(frozen=True)
 class TransactionDefinition:
     steps: tuple["OperationCallDefinition", ...]
-

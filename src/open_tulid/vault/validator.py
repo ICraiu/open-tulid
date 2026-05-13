@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from open_tulid.domain import WorkflowDefinition
 from open_tulid.models import Config, Project, ValidationError, ValidationReport
 from open_tulid.vault.links import validate_kanban_file
 from open_tulid.vault.project import iter_configured_projects
@@ -10,7 +11,17 @@ from open_tulid.vault.project import iter_configured_projects
 REQUIRED_DIRS = ["kanban", "docs", "tasks"]
 
 
-def validate_project(project: Project) -> ValidationReport:
+def validate_project(
+    project: Project,
+    workflow_definition: WorkflowDefinition | None = None,
+) -> ValidationReport:
+    """Validate adapter-owned project structure.
+
+    The compiled workflow definition is threaded through this boundary so
+    future artifact/task validation can be driven by DSL semantics instead of
+    hardcoded domain policy.
+    """
+    _ = workflow_definition
     report = ValidationReport()
     report.checked_projects += 1
 
@@ -52,7 +63,10 @@ def validate_project(project: Project) -> ValidationReport:
     return report
 
 
-def validate_vault(config: Config) -> ValidationReport:
+def validate_vault(
+    config: Config,
+    workflow_definition: WorkflowDefinition | None = None,
+) -> ValidationReport:
     report = ValidationReport()
     projects = iter_configured_projects(config)
 
@@ -67,7 +81,7 @@ def validate_vault(config: Config) -> ValidationReport:
             report.checked_projects += 1
             continue
 
-        project_report = validate_project(project)
+        project_report = validate_project(project, workflow_definition)
         report.errors.extend(project_report.errors)
         report.checked_projects += project_report.checked_projects
         report.checked_kanban_files += project_report.checked_kanban_files

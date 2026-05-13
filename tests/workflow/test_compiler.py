@@ -435,8 +435,8 @@ statements:
         assert result.valid is True
 
 
-class TestArtifactHandler:
-    def test_artifact_handler_is_none(self):
+class TestArtifactTypeTemplates:
+    def test_artifact_template_reference_compiles(self):
         doc = _build_document("""
 schema_version: 1
 statements:
@@ -451,7 +451,6 @@ statements:
         assert result.definition is not None
         art = result.definition.artifact_types["Summary"]
         assert art.template == "templates/summary.md"
-        assert art.handler is None
 
     def test_artifact_template_string_compiles(self):
         doc = _build_document("""
@@ -483,7 +482,6 @@ statements:
         assert result.definition is not None
         art = result.definition.artifact_types["RawData"]
         assert art.template is None
-        assert art.handler is None
 
 
 class TestDeepImmutability:

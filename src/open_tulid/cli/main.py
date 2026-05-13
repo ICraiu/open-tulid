@@ -7,6 +7,7 @@ from rich.panel import Panel
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import load_config
+from open_tulid.domain import WorkflowDefinition
 from open_tulid.models import Config, ValidationReport
 from open_tulid.runtime import JsonlEventStore, TransactionJournalStore
 from open_tulid.vault.project import create_project
@@ -21,14 +22,14 @@ app = typer.Typer(
 console = Console()
 
 
-def _load_cli_config() -> Config:
+def _load_cli_context() -> tuple[Config, WorkflowDefinition | None]:
     config = load_config()
     if config.workflow_path is None:
-        return config
+        return config, None
 
     workflow = load_workflow_definition(config.workflow_path)
     if workflow.valid:
-        return config
+        return config, workflow.definition
 
     console.print(Panel("Workflow validation failed.", style="red"))
     for diagnostic in workflow.diagnostics:
@@ -41,6 +42,11 @@ def _load_cli_config() -> Config:
         message = f"{diagnostic.code}: {diagnostic.message}"
         console.print(f"{prefix}: {message}" if prefix else message)
     raise typer.Exit(2)
+
+
+def _load_cli_config() -> Config:
+    config, _workflow_definition = _load_cli_context()
+    return config
 
 
 @app.command()
@@ -77,8 +83,8 @@ def uninstall() -> None:
 @vault_app.command()
 def validate() -> None:
     """Validate all configured projects in the vault."""
-    config = _load_cli_config()
-    report = validate_vault(config)
+    config, workflow_definition = _load_cli_context()
+    report = validate_vault(config, workflow_definition)
     _print_report(report)
 
     if report.passed:

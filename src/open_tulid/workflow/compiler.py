@@ -281,7 +281,6 @@ def compile_workflow(
             artifact_types[stmt.id] = ArtifactTypeDefinition(
                 id=stmt.id,
                 template=stmt.template,
-                handler=None,
             )
 
         elif isinstance(stmt, ValidationTypeStatement):
