@@ -44,8 +44,23 @@ tulid --help
 tulid init
 tulid vault validate
 tulid project <name>
+tulid agents build-images
 tulid uninstall
 ```
+
+## Agent Images
+
+Open Tulid includes Dockerfiles for local coding-agent images.
+
+```bash
+tulid agents build-images
+tulid agents build-images --agent codex
+tulid agents build-images --agent opencode --tag-prefix registry.local/open-tulid/agent
+```
+
+Docker must be installed and usable by the current user. See
+`docs/app-installation-spec.md` for the planned installation checks and Docker
+installation flow.
 
 ## Building
 

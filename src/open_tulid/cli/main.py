@@ -7,6 +7,7 @@ from rich.panel import Panel
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import load_config
+from open_tulid.containers import build_agent_images, list_agent_image_specs
 from open_tulid.domain import WorkflowDefinition
 from open_tulid.models import Config, ValidationReport
 from open_tulid.runtime import JsonlEventStore, TransactionJournalStore
@@ -73,11 +74,61 @@ app.add_typer(vault_app, name="vault")
 events_app = typer.Typer()
 app.add_typer(events_app, name="events")
 
+agents_app = typer.Typer()
+app.add_typer(agents_app, name="agents")
+
 
 @app.command()
 def uninstall() -> None:
     """Uninstall open-tulid from the current environment."""
     _do_uninstall()
+
+
+@agents_app.command("build-images")
+def build_agent_images_cmd(
+    agent: list[str] | None = typer.Option(
+        None,
+        "--agent",
+        help="Agent image to build. May be provided more than once. Defaults to all agents.",
+    ),
+    tag_prefix: str = typer.Option(
+        "open-tulid/agent",
+        "--tag-prefix",
+        help="Image tag prefix used for default tags.",
+    ),
+    docker: str = typer.Option(
+        "docker",
+        "--docker",
+        help="Docker executable to invoke.",
+    ),
+) -> None:
+    """Build local Docker images for coding agents."""
+    known_agents = {spec.id for spec in list_agent_image_specs(tag_prefix=tag_prefix)}
+    selected_agents = tuple(agent or sorted(known_agents))
+    unknown = sorted(set(selected_agents) - known_agents)
+    if unknown:
+        console.print(Panel(
+            f"Unknown agent image(s): {', '.join(unknown)}",
+            style="red",
+        ))
+        raise typer.Exit(2)
+
+    results = build_agent_images(
+        selected_agents,
+        tag_prefix=tag_prefix,
+        docker_executable=docker,
+    )
+    failed = [result for result in results if not result.succeeded]
+    for result in results:
+        if result.succeeded:
+            console.print(f"Built {result.agent_id}: {result.tag}")
+        else:
+            console.print(Panel(
+                f"Failed to build {result.agent_id}: {result.tag}\n{result.stderr.strip()}",
+                style="red",
+            ))
+    if failed:
+        raise typer.Exit(1)
 
 
 @vault_app.command()
