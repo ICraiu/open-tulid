@@ -9,7 +9,7 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from open_tulid.models import Config
+from open_tulid.models import Config, ProjectConfig
 
 
 CONFIG_DIRNAME = ".tuluid"
@@ -79,12 +79,7 @@ def load_config(path: Path | None = None) -> Config:
         _validate_project_name(name)
         validated_projects.append(name)
 
-    # Resolve and verify each project path stays within vault root
-    abs_vault = vault_root.resolve()
-    for name in validated_projects:
-        candidate = (abs_vault / name).resolve()
-        if not str(candidate).startswith(str(abs_vault) + os.sep) and candidate != abs_vault:
-            _fail(f"Project name escapes vault root: {name}")
+    project_configs = _load_project_configs(data, vault_root, config_dir, validated_projects)
 
     workflow_path = _load_workflow_path(data, config_dir)
 
@@ -93,6 +88,7 @@ def load_config(path: Path | None = None) -> Config:
         projects=validated_projects,
         config_dir=config_dir,
         workflow_path=workflow_path,
+        project_configs=project_configs,
     )
 
 
@@ -105,6 +101,83 @@ def _validate_project_name(name: str) -> None:
         _fail(f"Project name contains '..': {name}")
     if Path(name).is_absolute():
         _fail(f"Project name is an absolute path: {name}")
+
+
+def _load_project_configs(
+    data: dict,
+    vault_root: Path,
+    config_dir: Path,
+    project_names: list[str],
+) -> dict[str, ProjectConfig]:
+    raw_projects = data.get("projects", {})
+    if raw_projects is None:
+        raw_projects = {}
+    if not isinstance(raw_projects, dict):
+        _fail("[projects] must be a table when present")
+
+    unknown = sorted(set(raw_projects) - set(project_names))
+    if unknown:
+        _fail(f"[projects] contains entries not listed in vault.projects: {', '.join(unknown)}")
+
+    configs: dict[str, ProjectConfig] = {}
+    abs_vault = vault_root.resolve()
+    for name in project_names:
+        raw = raw_projects.get(name, {})
+        if not isinstance(raw, dict):
+            _fail(f"[projects.{name}] must be a table")
+        tracker_path = _project_string(raw, "tracker_path", default=name, table=f"projects.{name}")
+        _validate_tracker_path(tracker_path)
+        candidate = (abs_vault / tracker_path).resolve()
+        if not str(candidate).startswith(str(abs_vault) + os.sep) and candidate != abs_vault:
+            _fail(f"Project tracker_path escapes vault root: {tracker_path}")
+
+        repo_root = _project_optional_path(raw, "repo_root", config_dir, table=f"projects.{name}")
+        main_branch = _project_string(raw, "main_branch", default="main", table=f"projects.{name}")
+        if not main_branch.strip():
+            _fail(f"projects.{name}.main_branch must not be empty")
+
+        configs[name] = ProjectConfig(
+            name=name,
+            tracker_path=tracker_path,
+            repo_root=repo_root,
+            main_branch=main_branch,
+        )
+    return configs
+
+
+def _project_string(raw: dict, key: str, *, default: str, table: str) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str):
+        _fail(f"{table}.{key} must be a string")
+    if not value.strip():
+        _fail(f"{table}.{key} must not be empty")
+    return value.strip()
+
+
+def _project_optional_path(raw: dict, key: str, config_dir: Path, *, table: str) -> Path | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _fail(f"{table}.{key} must be a string")
+    if not value.strip():
+        _fail(f"{table}.{key} must not be empty")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    if not path.is_dir():
+        _fail(f"{table}.{key} does not point to an existing directory: {path}")
+    return path
+
+
+def _validate_tracker_path(path: str) -> None:
+    path_obj = Path(path)
+    if path_obj.is_absolute():
+        _fail(f"Project tracker_path is an absolute path: {path}")
+    if any(part in {"", ".", ".."} for part in path_obj.parts):
+        _fail(f"Project tracker_path contains unsafe path segments: {path}")
+    if "\\" in path:
+        _fail(f"Project tracker_path contains '\\': {path}")
 
 
 def _load_workflow_path(data: dict, config_dir: Path) -> Path | None:

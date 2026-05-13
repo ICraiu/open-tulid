@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from open_tulid.models import Config
-from open_tulid.vault.project import create_project
+from open_tulid.vault.project import create_project, iter_configured_projects
 
 runner = CliRunner()
 
@@ -43,9 +43,11 @@ class TestProjectCreation:
         assert (tmp_vault / "Engine" / "kanban").is_dir()
         assert (tmp_vault / "Engine" / "docs").is_dir()
         assert (tmp_vault / "Engine" / "tasks").is_dir()
+        assert (tmp_vault / "Engine" / "events").is_dir()
         assert "Engine/kanban" in result.created_dirs
         assert "Engine/docs" in result.created_dirs
         assert "Engine/tasks" in result.created_dirs
+        assert "Engine/events" in result.created_dirs
 
     def test_project_fails_when_exists(self, tmp_vault: Path, valid_config: Config):
         create_project(valid_config, "Engine")
@@ -88,6 +90,7 @@ class TestProjectCreation:
             assert (tmp_vault / "Engine" / "kanban").is_dir()
             assert (tmp_vault / "Engine" / "docs").is_dir()
             assert (tmp_vault / "Engine" / "tasks").is_dir()
+            assert (tmp_vault / "Engine" / "events").is_dir()
         finally:
             os.chdir(original)
 
@@ -194,6 +197,94 @@ class TestConfigLoading:
             config = load_config()
             assert config.config_dir == config_dir
             assert config.workflow_path == workflow
+        finally:
+            os.chdir(original)
+
+    def test_config_loads_per_project_coding_settings(self, tmp_vault: Path):
+        repo_root = tmp_vault / "repos" / "open-tulid"
+        repo_root.mkdir(parents=True)
+        (tmp_vault / "Tracker").mkdir()
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[projects.Agent]\n'
+            'tracker_path = "Tracker"\n'
+            f'repo_root = "{repo_root}"\n'
+            'main_branch = "trunk"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            config = load_config()
+            project = config.project_configs["Agent"]
+            assert project.tracker_path == "Tracker"
+            assert project.repo_root == repo_root
+            assert project.main_branch == "trunk"
+            configured = iter_configured_projects(config)[0]
+            assert configured.name == "Agent"
+            assert configured.path == tmp_vault / "Tracker"
+            assert configured.repo_root == repo_root
+            assert configured.main_branch == "trunk"
+        finally:
+            os.chdir(original)
+
+    def test_config_defaults_project_coding_settings(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            config = load_config()
+            project = config.project_configs["Agent"]
+            assert project.tracker_path == "Agent"
+            assert project.repo_root is None
+            assert project.main_branch == "main"
+        finally:
+            os.chdir(original)
+
+    def test_config_rejects_missing_repo_root_directory(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[projects.Agent]\n'
+            f'repo_root = "{tmp_vault / "missing"}"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+            assert exc_info.value.code == 2
+        finally:
+            os.chdir(original)
+
+    def test_config_rejects_tracker_path_escape(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[projects.Agent]\n'
+            'tracker_path = "../Agent"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+            assert exc_info.value.code == 2
         finally:
             os.chdir(original)
 

@@ -4,18 +4,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+@dataclass(frozen=True)
+class ProjectConfig:
+    name: str
+    tracker_path: str
+    repo_root: Path | None = None
+    main_branch: str = "main"
+
+
 @dataclass
 class Config:
     vault_root: Path
     projects: list[str]
     config_dir: Path | None = None
     workflow_path: Path | None = None
+    project_configs: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
 @dataclass
 class Project:
     name: str
     path: Path
+    tracker_path: str | None = None
+    repo_root: Path | None = None
+    main_branch: str = "main"
 
 
 @dataclass

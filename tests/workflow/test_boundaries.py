@@ -162,3 +162,20 @@ class TestCompilerBoundaries:
                 module = getattr(node, "module", "") or ""
                 assert not module.startswith("open_tulid.vault"), \
                     f"registry imports from {module}"
+
+
+class TestRuntimeBoundaries:
+    def test_runtime_package_does_not_import_workflow_layer(self):
+        offenders: list[str] = []
+        for path in (SRC / "open_tulid" / "runtime").glob("*.py"):
+            tree = pyast.parse(path.read_text(encoding="utf-8"))
+            for node in pyast.walk(tree):
+                if isinstance(node, pyast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith("open_tulid.workflow"):
+                            offenders.append(f"{path}:{alias.name}")
+                if isinstance(node, pyast.ImportFrom) and node.module:
+                    if node.module.startswith("open_tulid.workflow"):
+                        offenders.append(f"{path}:{node.module}")
+
+        assert offenders == []

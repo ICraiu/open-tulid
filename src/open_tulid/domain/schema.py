@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 class ArtifactState(str, Enum):
@@ -197,6 +197,70 @@ class DomainError:
     code: str
     message: str
     location: str | None = None
+
+
+class EventType(str, Enum):
+    TaskValidated = "TaskValidated"
+    ValidationFailed = "ValidationFailed"
+    TransitionRequested = "TransitionRequested"
+    TransitionAccepted = "TransitionAccepted"
+    TransitionRejected = "TransitionRejected"
+    TaskMoved = "TaskMoved"
+    ArtifactWritten = "ArtifactWritten"
+    ExecutionJobCreated = "ExecutionJobCreated"
+    ExecutionStarted = "ExecutionStarted"
+    ExecutionCompletionSubmitted = "ExecutionCompletionSubmitted"
+    ExecutionCompletionRejected = "ExecutionCompletionRejected"
+    ExecutionFinished = "ExecutionFinished"
+    ExecutionFailed = "ExecutionFailed"
+    ReviewRequested = "ReviewRequested"
+    TaskDerived = "TaskDerived"
+    TransactionFailed = "TransactionFailed"
+    OperationStarted = "OperationStarted"
+    OperationFinished = "OperationFinished"
+    OperationFailed = "OperationFailed"
+
+
+class JournalStatus(str, Enum):
+    PREPARED = "prepared"
+    COMMITTED = "committed"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class EventActor:
+    type: str
+    id: str
+
+
+@dataclass(frozen=True)
+class EventEnvelope:
+    event_id: str
+    schema_version: int
+    timestamp: str
+    project_id: str
+    actor: EventActor
+    event_type: EventType | str
+    correlation_id: str
+    task_id: str | None = None
+    job_id: str | None = None
+    transition_id: str | None = None
+    submission_id: str | None = None
+    data: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TransactionJournalRecord:
+    journal_id: str
+    project_id: str
+    started_at: str
+    effects: tuple[Mapping[str, Any], ...]
+    events: tuple[EventEnvelope, ...]
+    status: JournalStatus | Literal["prepared", "committed", "failed"]
+    task_id: str | None = None
+    transition_id: str | None = None
+    completed_at: str | None = None
+    error: DomainError | None = None
 
 
 @dataclass(frozen=True)

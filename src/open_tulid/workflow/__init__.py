@@ -18,6 +18,13 @@ from .definitions import (
     WorkerDefinition,
 )
 from .diagnostics import WorkflowCompileDiagnostic
+from .implementations import (
+    OPERATION_IMPLEMENTATIONS,
+    VALIDATION_IMPLEMENTATIONS,
+    OperationResult,
+    ValidationResult,
+    WorkflowExecutionContext,
+)
 from .registry import (
     ArtifactHandlerSpec,
     OperationSpec,
@@ -59,4 +66,9 @@ __all__ = [
     "WorkflowLoadResult",
     "load_workflow_definition",
     "clear_workflow_cache",
+    "WorkflowExecutionContext",
+    "ValidationResult",
+    "OperationResult",
+    "VALIDATION_IMPLEMENTATIONS",
+    "OPERATION_IMPLEMENTATIONS",
 ]

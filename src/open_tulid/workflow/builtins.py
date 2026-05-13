@@ -9,16 +9,7 @@ from .registry import (
     WorkerSpec,
     build_registries,
 )
-
-
-class _Placeholder:
-    """Placeholder implementation object for built-in registry entries."""
-
-    def __repr__(self) -> str:
-        return "<placeholder>"
-
-
-_PLACEHOLDER = _Placeholder()
+from .implementations import OPERATION_IMPLEMENTATIONS, VALIDATION_IMPLEMENTATIONS
 
 VALIDATION_IDS = [
     "project_build",
@@ -81,14 +72,14 @@ TEMPLATE_HANDLER_IDS = [
 def _build_validations() -> list[ValidationSpec]:
     specs: list[ValidationSpec] = []
     for vid in VALIDATION_IDS:
-        specs.append(ValidationSpec(id=vid, implementation=_PLACEHOLDER))
+        specs.append(ValidationSpec(id=vid, implementation=VALIDATION_IMPLEMENTATIONS[vid]))
     return specs
 
 
 def _build_operations() -> list[OperationSpec]:
     specs: list[OperationSpec] = []
     for oid in OPERATION_IDS:
-        kwargs: dict = {"id": oid, "implementation": _PLACEHOLDER}
+        kwargs: dict = {"id": oid, "implementation": OPERATION_IMPLEMENTATIONS[oid]}
         if oid == "git_reset_hard":
             kwargs["destructive"] = True
             kwargs["requires_approval"] = True
@@ -99,21 +90,21 @@ def _build_operations() -> list[OperationSpec]:
 def _build_workers() -> list[WorkerSpec]:
     specs: list[WorkerSpec] = []
     for wid in WORKER_IDS:
-        specs.append(WorkerSpec(id=wid, implementation=_PLACEHOLDER))
+        specs.append(WorkerSpec(id=wid, implementation=wid))
     return specs
 
 
 def _build_artifact_handlers() -> list[ArtifactHandlerSpec]:
     specs: list[ArtifactHandlerSpec] = []
     for aid in ARTIFACT_HANDLER_IDS:
-        specs.append(ArtifactHandlerSpec(id=aid, implementation=_PLACEHOLDER))
+        specs.append(ArtifactHandlerSpec(id=aid, implementation=aid))
     return specs
 
 
 def _build_template_handlers() -> list[TemplateHandlerSpec]:
     specs: list[TemplateHandlerSpec] = []
     for tid in TEMPLATE_HANDLER_IDS:
-        specs.append(TemplateHandlerSpec(id=tid, implementation=_PLACEHOLDER))
+        specs.append(TemplateHandlerSpec(id=tid, implementation=tid))
     return specs
 
 

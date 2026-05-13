@@ -6,7 +6,7 @@ from pathlib import Path
 from open_tulid.models import Config, CreatedProject, Project
 
 
-REQUIRED_DIRS = ["kanban", "docs", "tasks"]
+REQUIRED_DIRS = ["kanban", "docs", "tasks", "events"]
 
 
 def _fail(message: str) -> None:
@@ -54,10 +54,17 @@ def create_project(config: Config, name: str) -> CreatedProject:
 
 def iter_configured_projects(config: Config) -> list[Project]:
     projects: list[Project] = []
-    abs_vault = config.vault_root.resolve()
 
     for name in config.projects:
-        project_path = config.vault_root / name
-        projects.append(Project(name=name, path=project_path))
+        project_config = config.project_configs.get(name)
+        tracker_path = project_config.tracker_path if project_config is not None else name
+        project_path = config.vault_root / tracker_path
+        projects.append(Project(
+            name=name,
+            path=project_path,
+            tracker_path=tracker_path,
+            repo_root=project_config.repo_root if project_config is not None else None,
+            main_branch=project_config.main_branch if project_config is not None else "main",
+        ))
 
     return projects
