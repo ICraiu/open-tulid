@@ -26,10 +26,8 @@ from .implementations import (
     WorkflowExecutionContext,
 )
 from .registry import (
-    ArtifactHandlerSpec,
     OperationSpec,
     RuntimeRegistries,
-    TemplateHandlerSpec,
     ValidationSpec,
     WorkerSpec,
     build_registries,
@@ -59,8 +57,6 @@ __all__ = [
     "ValidationSpec",
     "OperationSpec",
     "WorkerSpec",
-    "ArtifactHandlerSpec",
-    "TemplateHandlerSpec",
     "build_registries",
     "validate_registries",
     "WorkflowLoadResult",

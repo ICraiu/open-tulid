@@ -336,8 +336,6 @@ statements:
             validations={"v1": VS(id="v1", implementation=None)},
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         doc = _build_document("""
 schema_version: 1
@@ -929,21 +927,3 @@ statements:
         result = compile_workflow(doc)
         codes = {d.code for d in result.diagnostics}
         assert "workflow.compile.unsupported_worker" in codes
-
-    def test_unsupported_artifact_handler_code_documented(self):
-        from open_tulid.workflow.compiler import _validate_artifact_handler
-        from open_tulid.workflow import get_builtin_registries, RuntimeRegistries
-        from open_tulid.workflow.diagnostics import WorkflowCompileDiagnostic
-        diags: list[WorkflowCompileDiagnostic] = []
-        _validate_artifact_handler("nonexistent_handler", get_builtin_registries(), diags, None)
-        assert len(diags) == 1
-        assert diags[0].code == "workflow.compile.unsupported_artifact_handler"
-
-    def test_unsupported_template_code_documented(self):
-        from open_tulid.workflow.compiler import _validate_template_handler
-        from open_tulid.workflow import get_builtin_registries
-        from open_tulid.workflow.diagnostics import WorkflowCompileDiagnostic
-        diags: list[WorkflowCompileDiagnostic] = []
-        _validate_template_handler("nonexistent_template", get_builtin_registries(), diags, None)
-        assert len(diags) == 1
-        assert diags[0].code == "workflow.compile.unsupported_template"

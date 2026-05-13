@@ -100,59 +100,6 @@ def _transaction_to_def(txn: TransactionPlan) -> TransactionDefinition:
     return TransactionDefinition(steps=tuple(steps))
 
 
-def _validate_artifact_handler(
-    handler_id: str | None,
-    registries: RuntimeRegistries,
-    diagnostics: list[WorkflowCompileDiagnostic],
-    span: SourceSpan | None,
-) -> None:
-    """Validate an artifact handler ID against the registry.
-
-    The current DSL does not expose a handler field on artifact_type, so
-    handler_id is always None when called from compile_workflow(). This
-    helper exists so the diagnostic code workflow.compile.unsupported_artifact_handler
-    becomes reachable when the DSL adds a handler field.
-    """
-    if handler_id is None:
-        return
-    if handler_id not in registries.artifact_handlers:
-        path, line, column = _span_to_diag_fields(span)
-        diagnostics.append(WorkflowCompileDiagnostic(
-            code="workflow.compile.unsupported_artifact_handler",
-            message=f"artifact handler {handler_id!r} is not registered",
-            path=path,
-            line=line,
-            column=column,
-        ))
-
-
-def _validate_template_handler(
-    template_handler_id: str | None,
-    registries: RuntimeRegistries,
-    diagnostics: list[WorkflowCompileDiagnostic],
-    span: SourceSpan | None,
-) -> None:
-    """Validate a template handler ID against the registry.
-
-    The current artifact_type.template field is a plain reference string
-    (e.g. "templates/summary.md"), NOT a template handler ID. This helper
-    is NOT called for artifact_type.template values. It exists so the
-    diagnostic code workflow.compile.unsupported_template becomes reachable
-    when a future DSL field explicitly identifies a template handler.
-    """
-    if template_handler_id is None:
-        return
-    if template_handler_id not in registries.template_handlers:
-        path, line, column = _span_to_diag_fields(span)
-        diagnostics.append(WorkflowCompileDiagnostic(
-            code="workflow.compile.unsupported_template",
-            message=f"template handler {template_handler_id!r} is not registered",
-            path=path,
-            line=line,
-            column=column,
-        ))
-
-
 def _validate_requirement_refs_with_spans(
     req_set: RequirementSet,
     artifact_types: dict[str, ArtifactTypeDefinition],
@@ -295,11 +242,7 @@ def compile_workflow(
     - TaskType requirements reference declared states, artifact_types,
       and validation_types.
 
-    Known limitations (AST does not yet support these):
-    - ArtifactType.handler: artifact types cannot specify a handler; the
-      artifact_handlers registry exists but is not connected to artifact types.
-    - Template validation: artifact templates are not validated against
-      the template_handlers registry.
+    Artifact templates are compiled as opaque references owned by the DSL.
     """
     if registries is None:
         registries = get_builtin_registries()
@@ -339,9 +282,6 @@ def compile_workflow(
                 id=stmt.id,
                 template=stmt.template,
                 handler=None,
-            )
-            _validate_artifact_handler(
-                None, registries, diagnostics, stmt.span,
             )
 
         elif isinstance(stmt, ValidationTypeStatement):

@@ -34,24 +34,10 @@ class WorkerSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class ArtifactHandlerSpec:
-    id: str
-    implementation: object
-
-
-@dataclasses.dataclass(frozen=True)
-class TemplateHandlerSpec:
-    id: str
-    implementation: object
-
-
-@dataclasses.dataclass(frozen=True)
 class RuntimeRegistries:
     validations: Mapping[str, ValidationSpec]
     operations: Mapping[str, OperationSpec]
     workers: Mapping[str, WorkerSpec]
-    artifact_handlers: Mapping[str, ArtifactHandlerSpec]
-    template_handlers: Mapping[str, TemplateHandlerSpec]
 
 
 def _freeze_mapping(mapping: Mapping[str, object]) -> Mapping[str, object]:
@@ -197,8 +183,6 @@ def build_registries(
     validations: Iterable[ValidationSpec] = (),
     operations: Iterable[OperationSpec] = (),
     workers: Iterable[WorkerSpec] = (),
-    artifact_handlers: Iterable[ArtifactHandlerSpec] = (),
-    template_handlers: Iterable[TemplateHandlerSpec] = (),
 ) -> tuple[RuntimeRegistries | None, tuple[WorkflowCompileDiagnostic, ...]]:
     diagnostics: list[WorkflowCompileDiagnostic] = []
 
@@ -212,12 +196,6 @@ def build_registries(
     worker_map: dict[str, WorkerSpec] = {}
     _build_registry_map(workers, "worker", worker_map, diagnostics)
 
-    artifact_map: dict[str, ArtifactHandlerSpec] = {}
-    _build_registry_map(artifact_handlers, "artifact handler", artifact_map, diagnostics)
-
-    template_map: dict[str, TemplateHandlerSpec] = {}
-    _build_registry_map(template_handlers, "template handler", template_map, diagnostics)
-
     # Phase 2: implementation + arg-type checks (shared with validate_registries)
     for spec_id, spec in val_map.items():
         _validate_validation_spec(diagnostics, spec_id, spec)
@@ -228,12 +206,6 @@ def build_registries(
     for spec_id, spec in worker_map.items():
         _validate_simple_spec(diagnostics, spec_id, spec.implementation, "worker")
 
-    for spec_id, spec in artifact_map.items():
-        _validate_simple_spec(diagnostics, spec_id, spec.implementation, "artifact handler")
-
-    for spec_id, spec in template_map.items():
-        _validate_simple_spec(diagnostics, spec_id, spec.implementation, "template handler")
-
     if diagnostics:
         return None, tuple(diagnostics)
 
@@ -241,8 +213,6 @@ def build_registries(
         validations=_freeze_mapping(val_map),
         operations=_freeze_mapping(op_map),
         workers=_freeze_mapping(worker_map),
-        artifact_handlers=_freeze_mapping(artifact_map),
-        template_handlers=_freeze_mapping(template_map),
     ), ()
 
 
@@ -266,17 +236,5 @@ def validate_registries(registries: RuntimeRegistries) -> tuple[WorkflowCompileD
         if _check_key_id_mismatch(diagnostics, key, spec.id, "worker"):
             continue
         _validate_simple_spec(diagnostics, key, spec.implementation, "worker")
-
-    _check_duplicate_logical_ids(diagnostics, registries.artifact_handlers, "artifact handler")
-    for key, spec in registries.artifact_handlers.items():
-        if _check_key_id_mismatch(diagnostics, key, spec.id, "artifact handler"):
-            continue
-        _validate_simple_spec(diagnostics, key, spec.implementation, "artifact handler")
-
-    _check_duplicate_logical_ids(diagnostics, registries.template_handlers, "template handler")
-    for key, spec in registries.template_handlers.items():
-        if _check_key_id_mismatch(diagnostics, key, spec.id, "template handler"):
-            continue
-        _validate_simple_spec(diagnostics, key, spec.implementation, "template handler")
 
     return tuple(diagnostics)

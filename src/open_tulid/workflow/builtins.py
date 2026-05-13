@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from .registry import (
-    ArtifactHandlerSpec,
     OperationSpec,
     RuntimeRegistries,
-    TemplateHandlerSpec,
     ValidationSpec,
     WorkerSpec,
     build_registries,
@@ -49,26 +47,6 @@ WORKER_IDS = [
     "noop",
 ]
 
-ARTIFACT_HANDLER_IDS = [
-    "markdown_file",
-    "plain_file",
-    "directory",
-    "git_branch",
-    "git_commit",
-    "git_diff",
-    "command_result",
-    "json_manifest",
-    "kanban_card",
-    "external_url",
-]
-
-TEMPLATE_HANDLER_IDS = [
-    "markdown_sections",
-    "json_schema",
-    "none",
-]
-
-
 def _build_validations() -> list[ValidationSpec]:
     specs: list[ValidationSpec] = []
     for vid in VALIDATION_IDS:
@@ -94,27 +72,11 @@ def _build_workers() -> list[WorkerSpec]:
     return specs
 
 
-def _build_artifact_handlers() -> list[ArtifactHandlerSpec]:
-    specs: list[ArtifactHandlerSpec] = []
-    for aid in ARTIFACT_HANDLER_IDS:
-        specs.append(ArtifactHandlerSpec(id=aid, implementation=aid))
-    return specs
-
-
-def _build_template_handlers() -> list[TemplateHandlerSpec]:
-    specs: list[TemplateHandlerSpec] = []
-    for tid in TEMPLATE_HANDLER_IDS:
-        specs.append(TemplateHandlerSpec(id=tid, implementation=tid))
-    return specs
-
-
 def get_builtin_registries() -> RuntimeRegistries:
     registries, diags = build_registries(
         validations=_build_validations(),
         operations=_build_operations(),
         workers=_build_workers(),
-        artifact_handlers=_build_artifact_handlers(),
-        template_handlers=_build_template_handlers(),
     )
     if registries is None:
         raise RuntimeError(f"built-in registries failed to build: {diags}")

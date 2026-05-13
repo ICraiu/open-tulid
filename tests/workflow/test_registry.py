@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from open_tulid.workflow import (
     ArgDefinition,
-    ArtifactHandlerSpec,
     OperationSpec,
     RuntimeRegistries,
-    TemplateHandlerSpec,
     ValidationSpec,
     WorkerSpec,
     build_registries,
@@ -73,33 +71,6 @@ class TestGetBuiltinRegistries:
         }
         missing = required - set(regs.workers.keys())
         assert not missing, f"missing workers: {missing}"
-
-    def test_required_artifact_handlers_present(self):
-        regs = get_builtin_registries()
-        required = {
-            "markdown_file",
-            "plain_file",
-            "directory",
-            "git_branch",
-            "git_commit",
-            "git_diff",
-            "command_result",
-            "json_manifest",
-            "kanban_card",
-            "external_url",
-        }
-        missing = required - set(regs.artifact_handlers.keys())
-        assert not missing, f"missing artifact handlers: {missing}"
-
-    def test_required_template_handlers_present(self):
-        regs = get_builtin_registries()
-        required = {
-            "markdown_sections",
-            "json_schema",
-            "none",
-        }
-        missing = required - set(regs.template_handlers.keys())
-        assert not missing, f"missing template handlers: {missing}"
 
     def test_git_reset_hard_is_destructive(self):
         regs = get_builtin_registries()
@@ -247,16 +218,12 @@ class TestBuildRegistries:
             validations=[ValidationSpec(id="v1", implementation=object())],
             operations=[OperationSpec(id="op1", implementation=object())],
             workers=[WorkerSpec(id="w1", implementation=object())],
-            artifact_handlers=[ArtifactHandlerSpec(id="ah1", implementation=object())],
-            template_handlers=[TemplateHandlerSpec(id="th1", implementation=object())],
         )
         assert regs is not None
         assert diags == ()
         assert "v1" in regs.validations
         assert "op1" in regs.operations
         assert "w1" in regs.workers
-        assert "ah1" in regs.artifact_handlers
-        assert "th1" in regs.template_handlers
 
 
 class TestValidateRegistries:
@@ -270,8 +237,6 @@ class TestValidateRegistries:
             validations={"v1": ValidationSpec(id="v1", implementation=object())},
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert diags == ()
@@ -281,8 +246,6 @@ class TestValidateRegistries:
             validations={"v1": ValidationSpec(id="v1", implementation=None)},
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_missing_implementation" for d in diags)
@@ -298,8 +261,6 @@ class TestValidateRegistries:
             },
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_invalid_argument_type" for d in diags)
@@ -315,8 +276,6 @@ class TestValidateRegistries:
                 )
             },
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_missing_implementation" for d in diags)
@@ -329,8 +288,6 @@ class TestValidateRegistries:
             },
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -343,8 +300,6 @@ class TestValidateRegistries:
                 "b": OperationSpec(id="same", implementation=object()),
             },
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -357,36 +312,6 @@ class TestValidateRegistries:
                 "a": WorkerSpec(id="same", implementation=object()),
                 "b": WorkerSpec(id="same", implementation=object()),
             },
-            artifact_handlers={},
-            template_handlers={},
-        )
-        diags = validate_registries(regs)
-        assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
-
-    def test_duplicate_artifact_handler_ids_detected(self):
-        regs = RuntimeRegistries(
-            validations={},
-            operations={},
-            workers={},
-            artifact_handlers={
-                "a": ArtifactHandlerSpec(id="same", implementation=object()),
-                "b": ArtifactHandlerSpec(id="same", implementation=object()),
-            },
-            template_handlers={},
-        )
-        diags = validate_registries(regs)
-        assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
-
-    def test_duplicate_template_handler_ids_detected(self):
-        regs = RuntimeRegistries(
-            validations={},
-            operations={},
-            workers={},
-            artifact_handlers={},
-            template_handlers={
-                "a": TemplateHandlerSpec(id="same", implementation=object()),
-                "b": TemplateHandlerSpec(id="same", implementation=object()),
-            },
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -398,8 +323,6 @@ class TestValidateRegistries:
             },
             operations={},
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -411,8 +334,6 @@ class TestValidateRegistries:
                 "map_key": OperationSpec(id="different", implementation=object()),
             },
             workers={},
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -424,8 +345,6 @@ class TestValidateRegistries:
             workers={
                 "map_key": WorkerSpec(id="different", implementation=object()),
             },
-            artifact_handlers={},
-            template_handlers={},
         )
         diags = validate_registries(regs)
         assert any(d.code == "workflow.compile.registry_duplicate_id" for d in diags)
@@ -458,24 +377,6 @@ class TestRegistryImmutability:
         import pytest
         with pytest.raises(TypeError):
             regs.workers["hacked"] = WorkerSpec(id="hacked", implementation=object())
-
-    def test_build_registries_artifact_handlers_map_immutable(self):
-        regs, diags = build_registries(
-            artifact_handlers=[ArtifactHandlerSpec(id="ah1", implementation=object())],
-        )
-        assert regs is not None
-        import pytest
-        with pytest.raises(TypeError):
-            regs.artifact_handlers["hacked"] = ArtifactHandlerSpec(id="hacked", implementation=object())
-
-    def test_build_registries_template_handlers_map_immutable(self):
-        regs, diags = build_registries(
-            template_handlers=[TemplateHandlerSpec(id="th1", implementation=object())],
-        )
-        assert regs is not None
-        import pytest
-        with pytest.raises(TypeError):
-            regs.template_handlers["hacked"] = TemplateHandlerSpec(id="hacked", implementation=object())
 
     def test_builtin_registries_maps_immutable(self):
         regs = get_builtin_registries()
