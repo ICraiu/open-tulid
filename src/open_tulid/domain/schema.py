@@ -82,6 +82,14 @@ class EventType(str, Enum):
     OperationFailed = "OperationFailed"
 
 
+class ExecutionJobStatus(str, Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class JournalStatus(str, Enum):
     PREPARED = "prepared"
     COMMITTED = "committed"
@@ -134,6 +142,19 @@ class MoveTask:
 @dataclass(frozen=True)
 class WriteTask:
     task: Task
+
+
+@dataclass(frozen=True)
+class ExecutionJob:
+    job_id: str
+    project_id: str
+    task_id: str
+    transition_id: str
+    worker_id: str
+    workspace_path: str
+    status: ExecutionJobStatus | str = ExecutionJobStatus.CREATED
+    attempts: int = 0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

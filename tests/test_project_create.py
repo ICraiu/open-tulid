@@ -160,6 +160,7 @@ class TestInitCommand:
         assert config_path.is_file()
         assert workflow_path.is_file()
         assert "[workflow]" in config_path.read_text(encoding="utf-8")
+        assert "[runtime]" in config_path.read_text(encoding="utf-8")
         assert "schema_version: 1" in workflow_path.read_text(encoding="utf-8")
 
     def test_init_refuses_existing_workflow_without_config(
@@ -247,6 +248,57 @@ class TestConfigLoading:
             assert project.tracker_path == "Agent"
             assert project.repo_root is None
             assert project.main_branch == "main"
+        finally:
+            os.chdir(original)
+
+    def test_config_loads_runtime_settings(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        workspaces = tmp_vault / "workspaces"
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[runtime]\n'
+            'docker_executable = "podman"\n'
+            'container_workspace = "/workspace/custom"\n'
+            'image_tag_prefix = "registry.local/tulid/agent"\n'
+            'default_timeout_seconds = 45\n'
+            'shared_workspace_root = "../workspaces"\n'
+            '\n[runtime.worker_images]\n'
+            'codex = "registry.local/codex:dev"\n'
+            '\n[runtime.env]\n'
+            'OPEN_TULID_ENV = "test"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            config = load_config()
+            assert config.runtime.docker_executable == "podman"
+            assert config.runtime.container_workspace == "/workspace/custom"
+            assert config.runtime.image_tag_prefix == "registry.local/tulid/agent"
+            assert config.runtime.default_timeout_seconds == 45
+            assert config.runtime.shared_workspace_root == workspaces
+            assert config.runtime.worker_images == {"codex": "registry.local/codex:dev"}
+            assert config.runtime.env == {"OPEN_TULID_ENV": "test"}
+        finally:
+            os.chdir(original)
+
+    def test_config_rejects_relative_container_workspace(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[runtime]\n'
+            'container_workspace = "workspace/project"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            with pytest.raises(SystemExit):
+                load_config()
         finally:
             os.chdir(original)
 

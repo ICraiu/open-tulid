@@ -68,6 +68,8 @@ class TestGetBuiltinRegistries:
             "shell_command",
             "human_approval",
             "noop",
+            "codex",
+            "opencode",
         }
         missing = required - set(regs.workers.keys())
         assert not missing, f"missing workers: {missing}"

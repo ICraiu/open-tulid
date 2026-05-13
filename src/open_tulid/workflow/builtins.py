@@ -8,6 +8,7 @@ from .registry import (
     build_registries,
 )
 from .implementations import OPERATION_IMPLEMENTATIONS, VALIDATION_IMPLEMENTATIONS
+from open_tulid.containers.workers import run_codex_worker, run_opencode_worker
 
 VALIDATION_IDS = [
     "project_build",
@@ -45,7 +46,18 @@ WORKER_IDS = [
     "shell_command",
     "human_approval",
     "noop",
+    "codex",
+    "opencode",
 ]
+
+WORKER_IMPLEMENTATIONS = {
+    "local_llm": "local_llm",
+    "shell_command": "shell_command",
+    "human_approval": "human_approval",
+    "noop": "noop",
+    "codex": run_codex_worker,
+    "opencode": run_opencode_worker,
+}
 
 def _build_validations() -> list[ValidationSpec]:
     specs: list[ValidationSpec] = []
@@ -68,7 +80,7 @@ def _build_operations() -> list[OperationSpec]:
 def _build_workers() -> list[WorkerSpec]:
     specs: list[WorkerSpec] = []
     for wid in WORKER_IDS:
-        specs.append(WorkerSpec(id=wid, implementation=wid))
+        specs.append(WorkerSpec(id=wid, implementation=WORKER_IMPLEMENTATIONS[wid]))
     return specs
 
 

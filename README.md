@@ -44,7 +44,9 @@ tulid --help
 tulid init
 tulid vault validate
 tulid project <name>
+tulid agents doctor
 tulid agents build-images
+tulid install docker
 tulid uninstall
 ```
 
@@ -61,6 +63,10 @@ tulid agents build-images --agent opencode --tag-prefix registry.local/open-tuli
 Docker must be installed and usable by the current user. See
 `docs/app-installation-spec.md` for the planned installation checks and Docker
 installation flow.
+
+Use `tulid agents doctor` to check Docker availability. Use
+`tulid install docker` to print the guarded host-specific Docker install plan;
+it defaults to a dry run.
 
 ## Building
 

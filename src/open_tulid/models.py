@@ -12,6 +12,17 @@ class ProjectConfig:
     main_branch: str = "main"
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    docker_executable: str = "docker"
+    shared_workspace_root: Path | None = None
+    container_workspace: str = "/workspace/project"
+    image_tag_prefix: str = "open-tulid/agent"
+    default_timeout_seconds: int = 3600
+    worker_images: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
 @dataclass
 class Config:
     vault_root: Path
@@ -19,6 +30,7 @@ class Config:
     config_dir: Path | None = None
     workflow_path: Path | None = None
     project_configs: dict[str, ProjectConfig] = field(default_factory=dict)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
 
 @dataclass

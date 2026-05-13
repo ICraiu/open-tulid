@@ -9,7 +9,7 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from open_tulid.models import Config, ProjectConfig
+from open_tulid.models import Config, ProjectConfig, RuntimeConfig
 
 
 CONFIG_DIRNAME = ".tuluid"
@@ -82,6 +82,7 @@ def load_config(path: Path | None = None) -> Config:
     project_configs = _load_project_configs(data, vault_root, config_dir, validated_projects)
 
     workflow_path = _load_workflow_path(data, config_dir)
+    runtime = _load_runtime_config(data, config_dir)
 
     return Config(
         vault_root=vault_root,
@@ -89,6 +90,7 @@ def load_config(path: Path | None = None) -> Config:
         config_dir=config_dir,
         workflow_path=workflow_path,
         project_configs=project_configs,
+        runtime=runtime,
     )
 
 
@@ -195,3 +197,85 @@ def _load_workflow_path(data: dict, config_dir: Path) -> Path | None:
     if not workflow_path.is_absolute():
         workflow_path = config_dir / workflow_path
     return workflow_path
+
+
+def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
+    raw = data.get("runtime", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        _fail("[runtime] must be a table when present")
+
+    docker_executable = _runtime_string(
+        raw, "docker_executable", default="docker", table="runtime",
+    )
+    container_workspace = _runtime_string(
+        raw, "container_workspace", default="/workspace/project", table="runtime",
+    )
+    if not container_workspace.startswith("/"):
+        _fail("runtime.container_workspace must be an absolute container path")
+
+    image_tag_prefix = _runtime_string(
+        raw, "image_tag_prefix", default="open-tulid/agent", table="runtime",
+    )
+
+    timeout = raw.get("default_timeout_seconds", 3600)
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        _fail("runtime.default_timeout_seconds must be an integer")
+    if timeout <= 0:
+        _fail("runtime.default_timeout_seconds must be positive")
+
+    shared_root = _runtime_optional_path(raw, "shared_workspace_root", config_dir, table="runtime")
+
+    worker_images = _runtime_string_map(raw.get("worker_images", {}), "runtime.worker_images")
+    env = _runtime_string_map(raw.get("env", {}), "runtime.env")
+
+    return RuntimeConfig(
+        docker_executable=docker_executable,
+        shared_workspace_root=shared_root,
+        container_workspace=container_workspace,
+        image_tag_prefix=image_tag_prefix,
+        default_timeout_seconds=timeout,
+        worker_images=worker_images,
+        env=env,
+    )
+
+
+def _runtime_string(raw: dict, key: str, *, default: str, table: str) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str):
+        _fail(f"{table}.{key} must be a string")
+    if not value.strip():
+        _fail(f"{table}.{key} must not be empty")
+    return value.strip()
+
+
+def _runtime_optional_path(raw: dict, key: str, config_dir: Path, *, table: str) -> Path | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _fail(f"{table}.{key} must be a string")
+    if not value.strip():
+        _fail(f"{table}.{key} must not be empty")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    return path.resolve()
+
+
+def _runtime_string_map(value: object, table: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _fail(f"{table} must be a table")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            _fail(f"{table} keys must be strings")
+        if not isinstance(item, str):
+            _fail(f"{table}.{key} must be a string")
+        if not key.strip() or not item.strip():
+            _fail(f"{table} entries must not be empty")
+        result[key.strip()] = item.strip()
+    return result

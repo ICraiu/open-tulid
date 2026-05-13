@@ -7,13 +7,20 @@ import pytest
 from typer.testing import CliRunner
 
 from open_tulid.containers import (
+    AgentRunRequest,
+    DockerAvailability,
     ImageBuildResult,
     build_agent_image,
     build_agent_images,
+    check_docker,
+    docker_install_plan,
     get_agent_image_spec,
     list_agent_image_specs,
+    run_agent_container,
 )
 from open_tulid.cli import main as cli_main
+from open_tulid.models import RuntimeConfig
+from open_tulid.containers.runtime import image_for_agent, request_for_worker
 
 
 AGENT_DOCKERFILES = Path("src/open_tulid/containers/agents")
@@ -164,3 +171,132 @@ def test_agents_build_images_cli_rejects_unknown_agent():
 
     assert result.exit_code == 2
     assert "Unknown agent image" in result.output
+
+
+def test_check_docker_reports_missing_cli():
+    result = check_docker(which=lambda _cmd: None)
+
+    assert result.available is False
+    assert result.failure_reason == "docker_cli_missing"
+
+
+def test_check_docker_reports_permission_denied():
+    def fake_runner(args, *, check, capture_output, text):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="permission denied while trying to connect to Docker daemon",
+        )
+
+    result = check_docker(runner=fake_runner, which=lambda _cmd: "/usr/bin/docker")
+
+    assert result.available is False
+    assert result.failure_reason == "docker_daemon_permission_denied"
+
+
+def test_docker_install_plan_for_debian_like_host(tmp_path: Path):
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nID_LIKE=debian\n', encoding="utf-8")
+
+    plan = docker_install_plan(os_release)
+
+    assert plan.supported is True
+    assert any("docker-ce" in command for command in plan.commands)
+
+
+def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
+    calls: list[tuple[str, ...]] = []
+
+    def fake_runner(args, *, check, capture_output, text, timeout):
+        calls.append(tuple(args))
+        assert timeout == 30
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="done", stderr="")
+
+    request = AgentRunRequest(
+        agent_id="codex",
+        image="open-tulid/agent-codex:latest",
+        workspace=tmp_path,
+        args=("run", "task"),
+        env={"TOKEN": "x"},
+        timeout_seconds=30,
+    )
+
+    result = run_agent_container(request, docker_executable="podman", runner=fake_runner)
+
+    assert result.succeeded is True
+    assert result.stdout == "done"
+    assert calls == [(
+        "podman",
+        "run",
+        "--rm",
+        "-v",
+        f"{tmp_path.resolve()}:/workspace/project:rw",
+        "-w",
+        "/workspace/project",
+        "-e",
+        "TOKEN=x",
+        "open-tulid/agent-codex:latest",
+        "run",
+        "task",
+    )]
+
+
+def test_request_for_worker_uses_runtime_worker_image_override(tmp_path: Path):
+    runtime = RuntimeConfig(
+        worker_images={"codex": "registry.local/codex:dev"},
+        env={"GLOBAL": "1"},
+    )
+
+    request = request_for_worker(
+        worker_id="codex",
+        workspace=tmp_path,
+        runtime=runtime,
+        args=("hello",),
+        env={"LOCAL": "2"},
+    )
+
+    assert request.image == "registry.local/codex:dev"
+    assert request.env == {"GLOBAL": "1", "LOCAL": "2"}
+    assert request.args == ("hello",)
+
+
+def test_image_for_agent_defaults_to_tag_prefix():
+    runtime = RuntimeConfig(image_tag_prefix="local/agent")
+
+    assert image_for_agent("opencode", runtime) == "local/agent-opencode:latest"
+
+
+def test_agents_doctor_cli_reports_available_docker(monkeypatch):
+    monkeypatch.setattr(
+        cli_main,
+        "check_docker",
+        lambda docker: DockerAvailability(
+            available=True,
+            docker_executable=docker,
+            cli_found=True,
+            daemon_reachable=True,
+            user_can_access_daemon=True,
+        ),
+    )
+
+    result = runner.invoke(cli_main.app, ["agents", "doctor"])
+
+    assert result.exit_code == 0
+    assert "Docker is available" in result.output
+
+
+def test_install_docker_cli_defaults_to_dry_run(monkeypatch):
+    class Plan:
+        supported = True
+        platform_id = "ubuntu"
+        notes = ("note",)
+        commands = (("sudo", "apt-get", "update"),)
+
+    monkeypatch.setattr(cli_main, "docker_install_plan", lambda: Plan())
+
+    result = runner.invoke(cli_main.app, ["install", "docker"])
+
+    assert result.exit_code == 0
+    assert "sudo apt-get update" in result.output
+    assert "Dry run only" in result.output

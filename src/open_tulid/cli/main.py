@@ -7,7 +7,12 @@ from rich.panel import Panel
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import load_config
-from open_tulid.containers import build_agent_images, list_agent_image_specs
+from open_tulid.containers import (
+    build_agent_images,
+    check_docker,
+    docker_install_plan,
+    list_agent_image_specs,
+)
 from open_tulid.domain import WorkflowDefinition
 from open_tulid.models import Config, ValidationReport
 from open_tulid.runtime import JsonlEventStore, TransactionJournalStore
@@ -77,6 +82,9 @@ app.add_typer(events_app, name="events")
 agents_app = typer.Typer()
 app.add_typer(agents_app, name="agents")
 
+install_app = typer.Typer()
+app.add_typer(install_app, name="install")
+
 
 @app.command()
 def uninstall() -> None:
@@ -129,6 +137,62 @@ def build_agent_images_cmd(
             ))
     if failed:
         raise typer.Exit(1)
+
+
+@agents_app.command("doctor")
+def agents_doctor(
+    docker: str = typer.Option(
+        "docker",
+        "--docker",
+        help="Docker executable to check.",
+    ),
+) -> None:
+    """Check whether the local Docker agent runtime is usable."""
+    result = check_docker(docker)
+    if result.available:
+        console.print(Panel("Docker is available for agent execution.", style="green"))
+        return
+    reason = result.failure_reason or "docker_unavailable"
+    console.print(Panel(f"Docker is not available: {reason}\n{result.error}", style="red"))
+    raise typer.Exit(1)
+
+
+@install_app.command("docker")
+def install_docker(
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--execute",
+        help="Show the install plan by default. Use --execute only after reviewing it.",
+    ),
+) -> None:
+    """Show or execute the Docker installation plan for this host."""
+    plan = docker_install_plan()
+    if not plan.supported:
+        console.print(Panel(
+            "\n".join(("Docker installation is not automated for this host.", *plan.notes)),
+            style="red",
+        ))
+        raise typer.Exit(2)
+
+    console.print(f"Platform: {plan.platform_id}")
+    for note in plan.notes:
+        console.print(f"- {note}")
+    for command in plan.commands:
+        console.print(" ".join(command))
+
+    if dry_run:
+        console.print(Panel("Dry run only. Re-run with --execute to run these commands.", style="yellow"))
+        return
+
+    import subprocess
+    for command in plan.commands:
+        completed = subprocess.run(command, check=False)
+        if completed.returncode != 0:
+            console.print(Panel(
+                f"Command failed with exit code {completed.returncode}: {' '.join(command)}",
+                style="red",
+            ))
+            raise typer.Exit(completed.returncode)
 
 
 @vault_app.command()

@@ -14,6 +14,14 @@ from .events import (
 )
 from .operation_log import OperationEventLogger
 from .transactions import EffectApplier, EffectResult, FileTransactionRuntime, TransactionApplyResult
+from .task_manager import (
+    CommandResult,
+    CreateExecutionJob,
+    RecordExecutionResult,
+    RequestTransition,
+    TaskManager,
+    ValidateProject,
+)
 
 __all__ = [
     "EventReadRecord",
@@ -33,4 +41,10 @@ __all__ = [
     "FileTransactionRuntime",
     "TransactionApplyResult",
     "OperationEventLogger",
+    "CommandResult",
+    "CreateExecutionJob",
+    "RecordExecutionResult",
+    "RequestTransition",
+    "TaskManager",
+    "ValidateProject",
 ]

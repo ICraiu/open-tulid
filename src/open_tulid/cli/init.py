@@ -50,6 +50,19 @@ def init() -> None:
         "\n"
         "[workflow]\n"
         "path = \"workflow.yaml\"\n"
+        "\n"
+        "[runtime]\n"
+        "docker_executable = \"docker\"\n"
+        "shared_workspace_root = \"workspaces\"\n"
+        "container_workspace = \"/workspace/project\"\n"
+        "image_tag_prefix = \"open-tulid/agent\"\n"
+        "default_timeout_seconds = 3600\n"
+        "\n"
+        "[runtime.worker_images]\n"
+        "# codex = \"open-tulid/agent-codex:latest\"\n"
+        "# opencode = \"open-tulid/agent-opencode:latest\"\n"
+        "\n"
+        "[runtime.env]\n"
     )
     config_path.write_text(content, encoding="utf-8")
     workflow_result = load_workflow_definition(workflow_path)

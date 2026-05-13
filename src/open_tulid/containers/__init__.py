@@ -6,12 +6,31 @@ from .images import (
     get_agent_image_spec,
     list_agent_image_specs,
 )
+from .docker import DockerAvailability, DockerInstallPlan, check_docker, docker_install_plan
+from .runtime import (
+    AgentRunRequest,
+    AgentRunResult,
+    ContainerMount,
+    image_for_agent,
+    request_for_worker,
+    run_agent_container,
+)
 
 __all__ = [
     "AgentImageSpec",
     "ImageBuildResult",
+    "DockerAvailability",
+    "DockerInstallPlan",
+    "AgentRunRequest",
+    "AgentRunResult",
+    "ContainerMount",
     "build_agent_image",
     "build_agent_images",
+    "check_docker",
+    "docker_install_plan",
     "get_agent_image_spec",
+    "image_for_agent",
     "list_agent_image_specs",
+    "request_for_worker",
+    "run_agent_container",
 ]
