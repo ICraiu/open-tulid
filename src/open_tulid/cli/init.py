@@ -60,6 +60,7 @@ def init() -> None:
         "completion_host = \"0.0.0.0\"\n"
         "completion_port = 0\n"
         "completion_container_host = \"host.docker.internal\"\n"
+        "container_volume_relabel = false\n"
         "\n"
         "[runtime.worker_images]\n"
         "# codex = \"open-tulid/agent-codex:latest\"\n"

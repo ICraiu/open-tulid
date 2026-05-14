@@ -241,6 +241,9 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
     completion_container_host = _runtime_string(
         raw, "completion_container_host", default="host.docker.internal", table="runtime",
     )
+    container_volume_relabel = raw.get("container_volume_relabel", False)
+    if not isinstance(container_volume_relabel, bool):
+        _fail("runtime.container_volume_relabel must be a boolean")
 
     return RuntimeConfig(
         docker_executable=docker_executable,
@@ -254,6 +257,7 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         completion_host=completion_host,
         completion_port=completion_port,
         completion_container_host=completion_container_host,
+        container_volume_relabel=container_volume_relabel,
     )
 
 

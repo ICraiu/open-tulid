@@ -267,6 +267,7 @@ class TestConfigLoading:
             'completion_host = "127.0.0.1"\n'
             'completion_port = 8765\n'
             'completion_container_host = "host.test"\n'
+            'container_volume_relabel = true\n'
             '\n[runtime.worker_images]\n'
             'codex = "registry.local/codex:dev"\n'
             '\n[runtime.worker_args]\n'
@@ -289,6 +290,7 @@ class TestConfigLoading:
             assert config.runtime.completion_host == "127.0.0.1"
             assert config.runtime.completion_port == 8765
             assert config.runtime.completion_container_host == "host.test"
+            assert config.runtime.container_volume_relabel is True
             assert config.runtime.env == {"OPEN_TULID_ENV": "test"}
         finally:
             os.chdir(original)

@@ -39,6 +39,7 @@ class AgentRunRequest:
     workdir: str = "/workspace/project"
     timeout_seconds: int | None = None
     remove: bool = True
+    volume_relabel: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ def request_for_worker(
         extra_hosts=_runtime_extra_hosts(runtime),
         workdir=runtime.container_workspace,
         timeout_seconds=runtime.default_timeout_seconds,
+        volume_relabel=runtime.container_volume_relabel,
     )
 
 
@@ -95,6 +97,8 @@ def run_agent_container(
         command.append("--rm")
     for mount in mounts:
         mode = "ro" if mount.readonly else "rw"
+        if request.volume_relabel:
+            mode = f"{mode},z"
         command.extend(["-v", f"{mount.host_path.resolve()}:{mount.container_path}:{mode}"])
     for host in request.extra_hosts:
         command.extend(["--add-host", host])

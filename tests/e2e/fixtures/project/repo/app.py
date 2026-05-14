@@ -1,0 +1,2 @@
+def healthz():
+    raise NotImplementedError

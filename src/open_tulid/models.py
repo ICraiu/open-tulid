@@ -25,6 +25,7 @@ class RuntimeConfig:
     completion_host: str = "0.0.0.0"
     completion_port: int = 0
     completion_container_host: str = "host.docker.internal"
+    container_volume_relabel: bool = False
 
 
 @dataclass

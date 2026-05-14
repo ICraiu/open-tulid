@@ -1,0 +1,43 @@
+schema_version: 1
+storage:
+  obsidian:
+    boards:
+      Work: kanban/Work.md
+    state_mappings:
+      - state: Todo
+        board: Work
+        column: Todo
+      - state: CodeReview
+        board: Work
+        column: Code review
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: CodeReview
+  - kind: task_type
+    id: CodingTask
+  - kind: artifact_type
+    id: ImplementationSummary
+    template: implementation-summary.md
+  - kind: artifact_type
+    id: TestResult
+    template: test-result.md
+  - kind: validation_type
+    id: tests_pass
+  - kind: worker
+    id: codex
+    type: codex
+  - kind: transition
+    id: ImplementTask
+    task_type: CodingTask
+    from: Todo
+    to: CodeReview
+    worker: codex
+    default_for_scheduler: true
+    requires:
+      artifacts:
+        - ImplementationSummary
+        - TestResult
+      validations:
+        - type: tests_pass
