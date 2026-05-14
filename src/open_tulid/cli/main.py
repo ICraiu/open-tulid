@@ -10,12 +10,22 @@ from open_tulid.config import load_config
 from open_tulid.containers import (
     build_agent_images,
     check_docker,
+    default_shared_workspace_root,
     docker_install_plan,
     list_agent_image_specs,
 )
+from open_tulid.adapters.obsidian import ObsidianAdapter, config_from_workflow
 from open_tulid.domain import WorkflowDefinition
-from open_tulid.models import Config, ValidationReport
-from open_tulid.runtime import JsonlEventStore, TransactionJournalStore
+from open_tulid.models import Config, ProjectConfig, ValidationReport
+from open_tulid.runtime import (
+    CompletionService,
+    CompletionSubmission,
+    FileExecutionJobStore,
+    JobExecutor,
+    JsonlEventStore,
+    Scheduler,
+    TransactionJournalStore,
+)
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
 from open_tulid.workflow.runtime import load_workflow_definition
@@ -78,6 +88,9 @@ app.add_typer(vault_app, name="vault")
 
 events_app = typer.Typer()
 app.add_typer(events_app, name="events")
+
+jobs_app = typer.Typer()
+app.add_typer(jobs_app, name="jobs")
 
 agents_app = typer.Typer()
 app.add_typer(agents_app, name="agents")
@@ -282,6 +295,183 @@ def event_status(
             console.print(f"{status} {journal.journal_id}{suffix}")
 
 
+@jobs_app.command("schedule")
+def schedule_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """Schedule the next runnable task and create one execution job."""
+    ctx = _runtime_project_context(project)
+    scheduler = Scheduler(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        workspace_root=ctx["workspace_root"],
+    )
+    result = scheduler.schedule_one(project)
+    if not result.accepted:
+        _print_domain_errors(result.errors)
+        raise typer.Exit(1)
+    for skipped in result.skipped:
+        console.print(f"[yellow]Skipped[/yellow] {skipped.code}: {skipped.message}")
+    if not result.scheduled or result.job is None:
+        console.print("No runnable task.")
+        return
+    console.print(
+        f"Scheduled job={result.job.job_id} task={result.job.task_id} "
+        f"transition={result.job.transition_id} worker={result.job.worker_id}"
+    )
+
+
+@jobs_app.command("list")
+def list_jobs(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """List persisted execution jobs for a project."""
+    ctx = _runtime_project_context(project)
+    listed = ctx["job_store"].list()
+    if not listed.accepted:
+        _print_domain_errors((listed.error,))
+        raise typer.Exit(1)
+    if not listed.jobs:
+        console.print("No jobs.")
+        return
+    for job in listed.jobs:
+        console.print(
+            f"{job.job_id} status={_status(job.status)} task={job.task_id} "
+            f"transition={job.transition_id} worker={job.worker_id}"
+        )
+
+
+@jobs_app.command("show")
+def show_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+) -> None:
+    """Show one execution job."""
+    ctx = _runtime_project_context(project)
+    loaded = ctx["job_store"].get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        _print_domain_errors((loaded.error,))
+        raise typer.Exit(1)
+    job = loaded.job
+    console.print(f"job_id: {job.job_id}")
+    console.print(f"status: {_status(job.status)}")
+    console.print(f"task_id: {job.task_id}")
+    console.print(f"transition_id: {job.transition_id}")
+    console.print(f"worker_id: {job.worker_id}")
+    console.print(f"workspace_path: {job.workspace_path}")
+    console.print(f"attempts: {job.attempts}")
+
+
+@jobs_app.command("run")
+def run_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+) -> None:
+    """Prepare the workspace and run the configured worker container."""
+    ctx = _runtime_project_context(project)
+    executor = JobExecutor(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        event_store=ctx["event_store"],
+        runtime=ctx["config"].runtime,
+        project_config=ctx["project_config"],
+    )
+    result = executor.run(job_id)
+    if not result.accepted:
+        _print_domain_errors(result.errors)
+        raise typer.Exit(1)
+    if result.run is not None:
+        console.print(f"Worker exited with code {result.run.returncode}.")
+        if not result.run.succeeded:
+            raise typer.Exit(result.run.returncode or 1)
+
+
+@jobs_app.command("run-one")
+def run_one_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """Schedule and run one runnable task."""
+    ctx = _runtime_project_context(project)
+    scheduler = Scheduler(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        workspace_root=ctx["workspace_root"],
+    )
+    scheduled = scheduler.schedule_one(project)
+    if not scheduled.accepted:
+        _print_domain_errors(scheduled.errors)
+        raise typer.Exit(1)
+    if not scheduled.scheduled or scheduled.job is None:
+        console.print("No runnable task.")
+        return
+    run_job(project, scheduled.job.job_id)
+
+
+@jobs_app.command("complete")
+def complete_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+    token: str | None = typer.Option(None, "--token", help="Completion token from the job context."),
+    summary: str = typer.Option("", "--summary", help="Completion summary."),
+    artifact: list[str] | None = typer.Option(None, "--artifact", help="Submitted artifact path. Repeatable."),
+    changed_file: list[str] | None = typer.Option(None, "--changed-file", help="Changed file path. Repeatable."),
+    evidence: list[str] | None = typer.Option(
+        None,
+        "--evidence",
+        help="Validation evidence in validation_id=value form. Repeatable.",
+    ),
+) -> None:
+    """Submit completion evidence through the trusted verifier."""
+    ctx = _runtime_project_context(project)
+    service = CompletionService(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        event_store=ctx["event_store"],
+    )
+    result = service.submit(
+        job_id=job_id,
+        token=token,
+        submission=CompletionSubmission(
+            summary=summary,
+            artifacts=tuple(artifact or ()),
+            changed_files=tuple(changed_file or ()),
+            validation_evidence=_parse_evidence(evidence or ()),
+        ),
+    )
+    if not result.accepted:
+        _print_domain_errors(result.errors)
+        raise typer.Exit(1)
+    console.print("Completion accepted.")
+
+
+@jobs_app.command("logs")
+def job_logs(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+    stream: str = typer.Option("stdout", "--stream", help="stdout, stderr, or command."),
+) -> None:
+    """Print persisted worker logs for one job."""
+    ctx = _runtime_project_context(project)
+    loaded = ctx["job_store"].get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        _print_domain_errors((loaded.error,))
+        raise typer.Exit(1)
+    name = {"stdout": "stdout.log", "stderr": "stderr.log", "command": "command.txt"}.get(stream)
+    if name is None:
+        console.print(Panel("stream must be stdout, stderr, or command", style="red"))
+        raise typer.Exit(2)
+    path = loaded.job.workspace_path
+    log_path = __import__("pathlib").Path(path) / ".open-tulid" / "logs" / name
+    if not log_path.is_file():
+        console.print("No log file.")
+        return
+    console.print(log_path.read_text(encoding="utf-8"), end="")
+
+
 def _project_path(config: Config, name: str):
     if name not in config.projects:
         console.print(Panel(f"Project is not configured: {name}", style="red"))
@@ -293,3 +483,55 @@ def _project_path(config: Config, name: str):
         console.print(Panel(f"Project directory does not exist: {path}", style="red"))
         raise typer.Exit(2)
     return path
+
+
+def _runtime_project_context(project: str) -> dict[str, object]:
+    config, workflow = _load_cli_context()
+    if workflow is None:
+        console.print(Panel("workflow.path is required for runtime job commands.", style="red"))
+        raise typer.Exit(2)
+    project_path = _project_path(config, project)
+    project_config = config.project_configs.get(project) or ProjectConfig(
+        name=project,
+        tracker_path=project,
+    )
+    adapter = ObsidianAdapter(config_from_workflow(
+        project_id=project,
+        project_root=project_path,
+        workflow=workflow,
+    ))
+    return {
+        "config": config,
+        "workflow": workflow,
+        "project_config": project_config,
+        "adapter": adapter,
+        "job_store": FileExecutionJobStore(project_path / "jobs"),
+        "event_store": JsonlEventStore(project_path / "events"),
+        "workspace_root": default_shared_workspace_root(config.runtime, project_path),
+    }
+
+
+def _print_domain_errors(errors) -> None:
+    for error in errors:
+        if error is None:
+            continue
+        location = f" [{error.location}]" if error.location else ""
+        console.print(f"[red]{error.code}[/red]{location}: {error.message}")
+
+
+def _parse_evidence(values) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            console.print(Panel(f"Evidence must use validation_id=value: {value}", style="red"))
+            raise typer.Exit(2)
+        key, item = value.split("=", 1)
+        if not key.strip() or not item.strip():
+            console.print(Panel(f"Evidence must use validation_id=value: {value}", style="red"))
+            raise typer.Exit(2)
+        parsed[key.strip()] = item.strip()
+    return parsed
+
+
+def _status(status) -> str:
+    return status.value if hasattr(status, "value") else str(status)

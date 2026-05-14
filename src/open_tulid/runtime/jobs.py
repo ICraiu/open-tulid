@@ -116,6 +116,35 @@ class FileExecutionJobStore:
                 location=str(path),
             ))
 
+    def update_status(
+        self,
+        job_id: str,
+        status: ExecutionJobStatus | str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        increment_attempts: bool = False,
+    ) -> JobStoreResult:
+        loaded = self.get(job_id)
+        if not loaded.accepted or loaded.job is None:
+            return loaded
+        job = loaded.job
+        now = utc_now()
+        merged_metadata = dict(job.metadata)
+        merged_metadata.update(dict(metadata or {}))
+        merged_metadata["updated_at"] = now
+        updated = ExecutionJob(
+            job_id=job.job_id,
+            project_id=job.project_id,
+            task_id=job.task_id,
+            transition_id=job.transition_id,
+            worker_id=job.worker_id,
+            workspace_path=job.workspace_path,
+            status=status,
+            attempts=job.attempts + (1 if increment_attempts else 0),
+            metadata=MappingProxyType(merged_metadata),
+        )
+        return self.save(updated)
+
     def list(self) -> JobStoreResult:
         jobs: list[ExecutionJob] = []
         if not self.root.exists():

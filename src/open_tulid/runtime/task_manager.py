@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -172,6 +173,7 @@ class TaskManager:
             transition_id=command.transition_id,
             worker_id=transition.worker,
             workspace_path=str(workspace),
+            metadata={"completion_token": secrets.token_urlsafe(24)},
         )
         if self.job_store is not None:
             saved = self.job_store.create(job)

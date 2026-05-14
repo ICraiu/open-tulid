@@ -16,6 +16,10 @@ from .operation_log import OperationEventLogger
 from .jobs import ACTIVE_JOB_STATUSES, FileExecutionJobStore, JobStoreResult
 from .scheduler import ScheduleResult, Scheduler
 from .transactions import EffectApplier, EffectResult, FileTransactionRuntime, TransactionApplyResult
+from .completion import CompletionResult, CompletionService
+from .executor import ExecutorRunResult, JobExecutor
+from .verifier import CompletionSubmission, DeterministicVerifier, VerificationResult, submission_from_mapping
+from .workspaces import WorkspacePrepareResult, WorkspacePreparer
 from .task_manager import (
     CommandResult,
     CreateExecutionJob,
@@ -48,6 +52,16 @@ __all__ = [
     "JobStoreResult",
     "ScheduleResult",
     "Scheduler",
+    "CompletionResult",
+    "CompletionService",
+    "ExecutorRunResult",
+    "JobExecutor",
+    "CompletionSubmission",
+    "DeterministicVerifier",
+    "VerificationResult",
+    "submission_from_mapping",
+    "WorkspacePrepareResult",
+    "WorkspacePreparer",
     "CommandResult",
     "CreateExecutionJob",
     "RecordExecutionResult",
