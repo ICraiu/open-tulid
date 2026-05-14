@@ -228,7 +228,19 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
     shared_root = _runtime_optional_path(raw, "shared_workspace_root", config_dir, table="runtime")
 
     worker_images = _runtime_string_map(raw.get("worker_images", {}), "runtime.worker_images")
+    worker_args = _runtime_string_sequence_map(raw.get("worker_args", {}), "runtime.worker_args")
     env = _runtime_string_map(raw.get("env", {}), "runtime.env")
+    completion_host = _runtime_string(
+        raw, "completion_host", default="0.0.0.0", table="runtime",
+    )
+    completion_port = raw.get("completion_port", 0)
+    if isinstance(completion_port, bool) or not isinstance(completion_port, int):
+        _fail("runtime.completion_port must be an integer")
+    if completion_port < 0 or completion_port > 65535:
+        _fail("runtime.completion_port must be between 0 and 65535")
+    completion_container_host = _runtime_string(
+        raw, "completion_container_host", default="host.docker.internal", table="runtime",
+    )
 
     return RuntimeConfig(
         docker_executable=docker_executable,
@@ -237,7 +249,11 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         image_tag_prefix=image_tag_prefix,
         default_timeout_seconds=timeout,
         worker_images=worker_images,
+        worker_args=worker_args,
         env=env,
+        completion_host=completion_host,
+        completion_port=completion_port,
+        completion_container_host=completion_container_host,
     )
 
 
@@ -277,5 +293,36 @@ def _runtime_string_map(value: object, table: str) -> dict[str, str]:
             _fail(f"{table}.{key} must be a string")
         if not key.strip() or not item.strip():
             _fail(f"{table} entries must not be empty")
+        if table == "runtime.env" and _looks_secret_like(key):
+            _fail(
+                f"{table}.{key} looks secret-like. "
+                "Do not pass secrets directly into worker containers."
+            )
         result[key.strip()] = item.strip()
     return result
+
+
+def _runtime_string_sequence_map(value: object, table: str) -> dict[str, tuple[str, ...]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _fail(f"{table} must be a table")
+    result: dict[str, tuple[str, ...]] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            _fail(f"{table} keys must be non-empty strings")
+        if not isinstance(item, list):
+            _fail(f"{table}.{key} must be a list of strings")
+        values: list[str] = []
+        for index, entry in enumerate(item):
+            if not isinstance(entry, str) or not entry.strip():
+                _fail(f"{table}.{key}[{index}] must be a non-empty string")
+            values.append(entry.strip())
+        result[key.strip()] = tuple(values)
+    return result
+
+
+def _looks_secret_like(key: str) -> bool:
+    normalized = key.upper()
+    secret_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH")
+    return any(marker in normalized for marker in secret_markers)

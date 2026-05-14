@@ -264,8 +264,13 @@ class TestConfigLoading:
             'image_tag_prefix = "registry.local/tulid/agent"\n'
             'default_timeout_seconds = 45\n'
             'shared_workspace_root = "../workspaces"\n'
+            'completion_host = "127.0.0.1"\n'
+            'completion_port = 8765\n'
+            'completion_container_host = "host.test"\n'
             '\n[runtime.worker_images]\n'
             'codex = "registry.local/codex:dev"\n'
+            '\n[runtime.worker_args]\n'
+            'codex = ["exec", "{prompt_packet}"]\n'
             '\n[runtime.env]\n'
             'OPEN_TULID_ENV = "test"\n',
             encoding="utf-8",
@@ -280,7 +285,30 @@ class TestConfigLoading:
             assert config.runtime.default_timeout_seconds == 45
             assert config.runtime.shared_workspace_root == workspaces
             assert config.runtime.worker_images == {"codex": "registry.local/codex:dev"}
+            assert config.runtime.worker_args == {"codex": ("exec", "{prompt_packet}")}
+            assert config.runtime.completion_host == "127.0.0.1"
+            assert config.runtime.completion_port == 8765
+            assert config.runtime.completion_container_host == "host.test"
             assert config.runtime.env == {"OPEN_TULID_ENV": "test"}
+        finally:
+            os.chdir(original)
+
+    def test_config_rejects_secret_like_runtime_env(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[runtime.env]\n'
+            'OPENAI_API_KEY = "secret"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+            assert exc_info.value.code == 2
         finally:
             os.chdir(original)
 

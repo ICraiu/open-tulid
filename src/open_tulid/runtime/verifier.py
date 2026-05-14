@@ -38,6 +38,9 @@ class VerificationResult:
 
 
 class DeterministicVerifier:
+    def __init__(self, *, artifact_templates: Mapping[str, str | None] | None = None) -> None:
+        self.artifact_templates = dict(artifact_templates or {})
+
     def verify(
         self,
         *,
@@ -65,6 +68,13 @@ class DeterministicVerifier:
                     "completion.artifact_unexpected",
                     f"Artifact type is not required by this transition: {artifact.type}",
                     artifact.type,
+                ))
+            template = self.artifact_templates.get(artifact.type)
+            if template and "{" not in template and artifact.path != template:
+                errors.append(_error(
+                    "completion.artifact_template_mismatch",
+                    f"Artifact path must match template for {artifact.type}: {template}",
+                    artifact.path,
                 ))
             artifact_path = _contained_path(output_root, artifact.path)
             if artifact_path is None:

@@ -61,7 +61,12 @@ class CompletionService:
         self.event_store = event_store
         self.journal_store = journal_store
         self.artifact_root = artifact_root
-        self.verifier = verifier or DeterministicVerifier()
+        self.verifier = verifier or DeterministicVerifier(
+            artifact_templates={
+                artifact_id: artifact.template
+                for artifact_id, artifact in workflow.artifact_types.items()
+            },
+        )
 
     def submit(
         self,

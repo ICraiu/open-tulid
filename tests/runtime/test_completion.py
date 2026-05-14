@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
 from open_tulid.domain import (
     ExecutionJob,
+    ArtifactTypeDefinition,
     ProjectSnapshot,
     RequirementDefinition,
     StateDefinition,
@@ -16,7 +17,13 @@ from open_tulid.domain import (
     TransitionDefinition,
     WorkflowDefinition,
 )
-from open_tulid.runtime import CompletionService, CompletionSubmission, FileExecutionJobStore, JsonlEventStore
+from open_tulid.runtime import (
+    ArtifactSubmission,
+    CompletionService,
+    CompletionSubmission,
+    FileExecutionJobStore,
+    JsonlEventStore,
+)
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -146,6 +153,44 @@ def test_completion_rejects_missing_required_artifact(tmp_path: Path):
 
     assert result.accepted is False
     assert result.errors[0].code == "completion.artifact_missing"
+
+
+def test_completion_rejects_artifact_path_that_violates_template(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "output" / "wrong.md").write_text("done\n", encoding="utf-8")
+    workflow = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=workflow.schema_version,
+        states=workflow.states,
+        task_types=workflow.task_types,
+        artifact_types=MappingProxyType({
+            "result.md": ArtifactTypeDefinition(id="result.md", template="result.md"),
+        }),
+        validation_types=workflow.validation_types,
+        operation_types=workflow.operation_types,
+        workers=workflow.workers,
+        transitions=workflow.transitions,
+        storage=workflow.storage,
+    )
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=(ArtifactSubmission(type="result.md", path="wrong.md"),),
+        ),
+    )
+
+    assert result.accepted is False
+    assert {error.code for error in result.errors} == {"completion.artifact_template_mismatch"}
 
 
 def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -404,6 +406,45 @@ def show_job(
     console.print(f"worker_id: {job.worker_id}")
     console.print(f"workspace_path: {job.workspace_path}")
     console.print(f"attempts: {job.attempts}")
+    for key in (
+        "completion_endpoint",
+        "completion_endpoint_host",
+        "completion_endpoint_port",
+        "worker_returncode",
+        "last_verification",
+        "status_reason",
+    ):
+        value = job.metadata.get(key)
+        if value is not None:
+            console.print(f"{key}: {value}")
+
+
+@jobs_app.command("status")
+def jobs_status(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """Show execution job counts and active runtime metadata."""
+    ctx = _runtime_project_context(project)
+    listed = ctx["job_store"].list()
+    if not listed.accepted:
+        _print_domain_errors((listed.error,))
+        raise typer.Exit(1)
+    counts: dict[str, int] = {}
+    for job in listed.jobs:
+        status = _status(job.status)
+        counts[status] = counts.get(status, 0) + 1
+    if not counts:
+        console.print("No jobs.")
+        return
+    console.print(" ".join(f"{key}={counts[key]}" for key in sorted(counts)))
+    for job in listed.jobs:
+        if _status(job.status) in {"pending", "running", "completion_rejected"}:
+            endpoint = job.metadata.get("completion_endpoint")
+            endpoint_part = f" endpoint={endpoint}" if endpoint else ""
+            console.print(
+                f"{job.job_id} status={_status(job.status)} task={job.task_id}"
+                f" worker={job.worker_id}{endpoint_part}"
+            )
 
 
 @jobs_app.command("fail")
@@ -449,6 +490,8 @@ def run_job(
         event_store=ctx["event_store"],
         runtime=ctx["config"].runtime,
         project_config=ctx["project_config"],
+        journal_store=ctx["journal_store"],
+        artifact_root=ctx["project_path"] / "artifacts",
     )
     result = executor.run(job_id)
     if not result.accepted:
@@ -480,6 +523,44 @@ def run_one_job(
         console.print("No runnable task.")
         return
     run_job(project, scheduled.job.job_id)
+
+
+@jobs_app.command("daemon")
+def jobs_daemon(
+    project: str = typer.Argument(..., help="Configured project name."),
+    interval: float = typer.Option(30.0, "--interval", min=0.1, help="Seconds between scheduler scans."),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum jobs to run before exiting."),
+    exit_when_idle: bool = typer.Option(False, "--exit-when-idle", help="Exit after a scan finds no runnable task."),
+) -> None:
+    """Continuously schedule and run runnable jobs."""
+    completed = 0
+    while True:
+        ctx = _runtime_project_context(project)
+        scheduler = Scheduler(
+            workflow=ctx["workflow"],
+            adapter=ctx["adapter"],
+            job_store=ctx["job_store"],
+            workspace_root=ctx["workspace_root"],
+        )
+        scheduled = scheduler.schedule_one(project)
+        if not scheduled.accepted:
+            _print_domain_errors(scheduled.errors)
+            raise typer.Exit(1)
+        if not scheduled.scheduled or scheduled.job is None:
+            console.print("No runnable task.")
+            if exit_when_idle:
+                return
+            time.sleep(interval)
+            continue
+
+        console.print(
+            f"Scheduled job={scheduled.job.job_id} task={scheduled.job.task_id} "
+            f"transition={scheduled.job.transition_id} worker={scheduled.job.worker_id}"
+        )
+        run_job(project, scheduled.job.job_id)
+        completed += 1
+        if limit is not None and completed >= limit:
+            return
 
 
 @jobs_app.command("complete")

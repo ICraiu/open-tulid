@@ -35,6 +35,7 @@ class AgentRunRequest:
     args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     mounts: tuple[ContainerMount, ...] = ()
+    extra_hosts: tuple[str, ...] = ()
     workdir: str = "/workspace/project"
     timeout_seconds: int | None = None
     remove: bool = True
@@ -75,6 +76,7 @@ def request_for_worker(
         workspace=workspace,
         args=tuple(args),
         env={**runtime.env, **dict(env or {})},
+        extra_hosts=_runtime_extra_hosts(runtime),
         workdir=runtime.container_workspace,
         timeout_seconds=runtime.default_timeout_seconds,
     )
@@ -94,6 +96,8 @@ def run_agent_container(
     for mount in mounts:
         mode = "ro" if mount.readonly else "rw"
         command.extend(["-v", f"{mount.host_path.resolve()}:{mount.container_path}:{mode}"])
+    for host in request.extra_hosts:
+        command.extend(["--add-host", host])
     command.extend(["-w", request.workdir])
     for key, value in sorted(request.env.items()):
         command.extend(["-e", f"{key}={value}"])
@@ -140,3 +144,9 @@ def run_agent_container(
 
 def default_shared_workspace_root(runtime: RuntimeConfig, fallback: Path) -> Path:
     return runtime.shared_workspace_root or fallback / ".open-tulid" / "workspaces"
+
+
+def _runtime_extra_hosts(runtime: RuntimeConfig) -> tuple[str, ...]:
+    if runtime.completion_container_host == "host.docker.internal":
+        return ("host.docker.internal:host-gateway",)
+    return ()

@@ -20,7 +20,11 @@ class RuntimeConfig:
     image_tag_prefix: str = "open-tulid/agent"
     default_timeout_seconds: int = 3600
     worker_images: dict[str, str] = field(default_factory=dict)
+    worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    completion_host: str = "0.0.0.0"
+    completion_port: int = 0
+    completion_container_host: str = "host.docker.internal"
 
 
 @dataclass

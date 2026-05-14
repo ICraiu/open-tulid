@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Thread
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.containers.runtime import AgentRunResult, request_for_worker, run_agent_container
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
 from open_tulid.models import ProjectConfig, RuntimeConfig
-from open_tulid.runtime.events import JsonlEventStore, build_event
+from open_tulid.runtime.completion import CompletionService
+from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
+from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver
 from open_tulid.runtime.workspaces import WorkspacePreparer
@@ -37,6 +41,8 @@ class JobExecutor:
         event_store: JsonlEventStore,
         runtime: RuntimeConfig,
         project_config: ProjectConfig,
+        journal_store: TransactionJournalStore | None = None,
+        artifact_root: Path | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -44,6 +50,8 @@ class JobExecutor:
         self.event_store = event_store
         self.runtime = runtime
         self.project_config = project_config
+        self.journal_store = journal_store
+        self.artifact_root = artifact_root
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -65,16 +73,29 @@ class JobExecutor:
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
 
+        endpoint = self._start_completion_endpoint(job.job_id)
         prepared = WorkspacePreparer(repo_root=self.project_config.repo_root).prepare(
             job=job,
             task=task_result.task,
             transition=transition,
-            completion_endpoint=f"/jobs/{job.job_id}/complete",
+            completion_endpoint=endpoint.url,
         )
         if not prepared.accepted or prepared.workspace is None:
+            endpoint.stop()
             return ExecutorRunResult(False, errors=(prepared.error or _error("workspace.prepare_failed", "Workspace failed."),))
 
         prompt_packet = None
+        prompt_text = _build_runtime_prompt(
+            job_id=job.job_id,
+            task_title=task_result.task.title,
+            task_body=task_result.task.body,
+            transition_id=transition.id,
+            from_state=transition.from_state,
+            to_state=transition.to_state,
+            required_artifacts=transition.requires.artifacts,
+            required_validations=tuple(call.type for call in transition.requires.validations),
+            completion_endpoint=endpoint.url,
+        )
         project_root = _adapter_project_root(self.adapter)
         if project_root is not None:
             prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
@@ -82,17 +103,23 @@ class JobExecutor:
                 transition=transition,
             )
             if not prompt_result.accepted:
+                endpoint.stop()
                 return ExecutorRunResult(False, errors=prompt_result.errors)
             prompt_packet = prompt_result.packet
             if prompt_packet is not None:
-                _write_prompt_packet(prepared.workspace, prompt_packet.text)
+                prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
+        prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
 
         self.job_store.update_status(
             job.job_id,
             ExecutionJobStatus.RUNNING,
             metadata={
                 "workspace_prepared": True,
-                "prompt_packet_sha256": prompt_packet.sha256 if prompt_packet is not None else None,
+                "completion_endpoint": endpoint.url,
+                "completion_endpoint_host": endpoint.host,
+                "completion_endpoint_port": endpoint.port,
+                "prompt_packet_sha256": prompt_sha256,
+                "instruction_packet_sha256": prompt_packet.sha256 if prompt_packet is not None else None,
             },
             increment_attempts=True,
         )
@@ -111,17 +138,32 @@ class JobExecutor:
             worker_id=job.worker_id,
             workspace=prepared.workspace,
             runtime=self.runtime,
+            args=_worker_args(
+                runtime=self.runtime,
+                worker_id=job.worker_id,
+                container_workspace=self.runtime.container_workspace,
+                completion_endpoint=endpoint.url,
+            ),
             env={
                 "OPEN_TULID_JOB_ID": job.job_id,
                 "OPEN_TULID_COMPLETION_TOKEN": str(job.metadata.get("completion_token", "")),
                 "OPEN_TULID_OUTPUT_DIR": f"{self.runtime.container_workspace}/output",
-                "OPEN_TULID_COMPLETION_ENDPOINT": f"/jobs/{job.job_id}/complete",
+                "OPEN_TULID_COMPLETION_ENDPOINT": endpoint.url,
                 "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
             },
         )
-        result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
+        try:
+            result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
+        finally:
+            endpoint.stop()
         _write_run_logs(Path(job.workspace_path), result)
-        if not result.succeeded:
+        loaded_after_run = self.job_store.get(job.job_id)
+        status_after_run = (
+            str(loaded_after_run.job.status.value if hasattr(loaded_after_run.job.status, "value") else loaded_after_run.job.status)
+            if loaded_after_run.accepted and loaded_after_run.job is not None
+            else ""
+        )
+        if not result.succeeded and status_after_run != ExecutionJobStatus.ACCEPTED.value:
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.FAILED,
@@ -139,6 +181,50 @@ class JobExecutor:
             ))
         return ExecutorRunResult(True, run=result)
 
+    def _start_completion_endpoint(self, job_id: str) -> "_ManagedCompletionEndpoint":
+        service = CompletionService(
+            workflow=self.workflow,
+            adapter=self.adapter,
+            job_store=self.job_store,
+            event_store=self.event_store,
+            journal_store=self.journal_store,
+            artifact_root=self.artifact_root,
+        )
+        server = serve_completion_endpoint(
+            CompletionEndpointConfig(
+                service=service,
+                allowed_jobs=frozenset({job_id}),
+            ),
+            host=self.runtime.completion_host,
+            port=self.runtime.completion_port,
+        )
+        host, port = server.server_address
+        thread = Thread(target=server.serve_forever, name=f"open-tulid-completion-{job_id}", daemon=True)
+        thread.start()
+        return _ManagedCompletionEndpoint(
+            server=server,
+            thread=thread,
+            host=str(host),
+            port=int(port),
+            url=f"http://{self.runtime.completion_container_host}:{port}/jobs/{job_id}/complete",
+        )
+
+
+@dataclass(frozen=True)
+class _ManagedCompletionEndpoint:
+    server: object
+    thread: Thread
+    host: str
+    port: int
+    url: str
+
+    def stop(self) -> None:
+        shutdown = getattr(self.server, "shutdown")
+        server_close = getattr(self.server, "server_close")
+        shutdown()
+        server_close()
+        self.thread.join(timeout=5)
+
 
 def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
     log_dir = workspace / ".open-tulid" / "logs"
@@ -148,10 +234,78 @@ def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
     (log_dir / "command.txt").write_text(" ".join(result.command) + "\n", encoding="utf-8")
 
 
-def _write_prompt_packet(workspace: Path, text: str) -> None:
+def _write_prompt_packet(workspace: Path, text: str) -> str:
     context_dir = workspace / ".open-tulid"
     context_dir.mkdir(parents=True, exist_ok=True)
     (context_dir / "prompt-packet.md").write_text(text + "\n", encoding="utf-8")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _build_runtime_prompt(
+    *,
+    job_id: str,
+    task_title: str,
+    task_body: str,
+    transition_id: str,
+    from_state: str,
+    to_state: str,
+    required_artifacts: tuple[str, ...],
+    required_validations: tuple[str, ...],
+    completion_endpoint: str,
+) -> str:
+    artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
+    validations = ", ".join(required_validations) if required_validations else "none"
+    return "\n".join((
+        "# Open Tulid Job",
+        "",
+        f"Job: {job_id}",
+        f"Task: {task_title}",
+        f"Transition: {transition_id} ({from_state} -> {to_state})",
+        "",
+        "Read `.open-tulid/job-context.json` before making changes.",
+        "Make the requested code changes in this workspace.",
+        "Write required completion artifacts under `output/`.",
+        f"Required artifacts: {artifacts}",
+        f"Required validations: {validations}",
+        "",
+        "When ready, submit completion evidence with:",
+        "",
+        "```sh",
+        "curl -sS -X POST \\",
+        "  -H \"content-type: application/json\" \\",
+        "  -H \"x-open-tulid-completion-token: $OPEN_TULID_COMPLETION_TOKEN\" \\",
+        f"  \"$OPEN_TULID_COMPLETION_ENDPOINT\" \\",
+        "  -d '{",
+        "    \"summary\": \"what changed\",",
+        "    \"artifacts\": [{\"type\": \"artifact-type\", \"path\": \"relative/path/in/output\"}],",
+        "    \"changed_files\": [\"relative/workspace/path\"],",
+        "    \"validation_evidence\": {\"validation-id\": \"command/result evidence\"}",
+        "  }'",
+        "```",
+        "",
+        "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
+        "",
+        "## Task Body",
+        task_body.strip(),
+    ))
+
+
+def _worker_args(
+    *,
+    runtime: RuntimeConfig,
+    worker_id: str,
+    container_workspace: str,
+    completion_endpoint: str,
+) -> tuple[str, ...]:
+    args = runtime.worker_args.get(worker_id, ())
+    values = {
+        "prompt_packet": f"{container_workspace}/.open-tulid/prompt-packet.md",
+        "job_context": f"{container_workspace}/.open-tulid/job-context.json",
+        "completion_endpoint": completion_endpoint,
+        "workspace": container_workspace,
+        "output_dir": f"{container_workspace}/output",
+    }
+    return tuple(arg.format(**values) for arg in args)
 
 
 def _adapter_project_root(adapter: StorageAdapter) -> Path | None:
