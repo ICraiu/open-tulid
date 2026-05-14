@@ -409,6 +409,7 @@ def compile_workflow(
                 id=stmt.id,
                 type=stmt.type,
                 implementation_id=impl_id,
+                instructions=stmt.instructions,
             )
 
         elif isinstance(stmt, TransitionStatement):
@@ -426,6 +427,7 @@ def compile_workflow(
                 requires=req_def,
                 transaction=txn_def,
                 default_for_scheduler=stmt.default_for_scheduler,
+                instructions=stmt.instructions,
             )
             transition_stmts[stmt.id] = stmt
 

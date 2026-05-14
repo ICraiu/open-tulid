@@ -12,11 +12,22 @@ from open_tulid.domain import DomainError, ExecutionJob, Task, TransitionDefinit
 @dataclass(frozen=True)
 class WorkspacePrepareResult:
     workspace: Path | None = None
+    output_dir: Path | None = None
     error: DomainError | None = None
 
     @property
     def accepted(self) -> bool:
         return self.error is None
+
+
+@dataclass(frozen=True)
+class WorkspaceCleanupResult:
+    removed: tuple[Path, ...] = ()
+    errors: tuple[DomainError, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return not self.errors
 
 
 class WorkspacePreparer:
@@ -32,8 +43,10 @@ class WorkspacePreparer:
         completion_endpoint: str | None = None,
     ) -> WorkspacePrepareResult:
         workspace = Path(job.workspace_path)
+        output_dir = workspace / "output"
         try:
             workspace.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
             if self.repo_root is not None:
                 if not self.repo_root.is_dir():
                     return WorkspacePrepareResult(error=DomainError(
@@ -47,6 +60,7 @@ class WorkspacePreparer:
                 job=job,
                 task=task,
                 transition=transition,
+                output_dir=output_dir,
                 completion_endpoint=completion_endpoint,
             )
         except OSError as exc:
@@ -55,7 +69,30 @@ class WorkspacePreparer:
                 message=f"Cannot prepare workspace: {exc}",
                 location=str(workspace),
             ))
-        return WorkspacePrepareResult(workspace=workspace)
+        return WorkspacePrepareResult(workspace=workspace, output_dir=output_dir)
+
+
+def cleanup_job_workspaces(jobs: tuple[ExecutionJob, ...]) -> WorkspaceCleanupResult:
+    removable_statuses = {"accepted", "failed", "stale", "cancelled"}
+    removed: list[Path] = []
+    errors: list[DomainError] = []
+    for job in jobs:
+        status = job.status.value if hasattr(job.status, "value") else str(job.status)
+        if status not in removable_statuses:
+            continue
+        workspace = Path(job.workspace_path)
+        if not workspace.exists():
+            continue
+        try:
+            shutil.rmtree(workspace)
+            removed.append(workspace)
+        except OSError as exc:
+            errors.append(DomainError(
+                code="workspace.cleanup_failed",
+                message=f"Cannot remove workspace: {exc}",
+                location=str(workspace),
+            ))
+    return WorkspaceCleanupResult(removed=tuple(removed), errors=tuple(errors))
 
 
 def _copy_repo(source: Path, target: Path) -> None:
@@ -80,6 +117,7 @@ def _write_context(
     job: ExecutionJob,
     task: Task,
     transition: TransitionDefinition,
+    output_dir: Path,
     completion_endpoint: str | None,
 ) -> None:
     context_dir = workspace / ".open-tulid"
@@ -95,6 +133,9 @@ def _write_context(
         "required_artifacts": list(transition.requires.artifacts),
         "required_validations": [call.type for call in transition.requires.validations],
         "completion_endpoint": completion_endpoint,
+        "workspace_path": str(workspace),
+        "output_path": str(output_dir),
+        "container_output_path": "/workspace/project/output",
         "task": {
             "id": task.id,
             "title": task.title,

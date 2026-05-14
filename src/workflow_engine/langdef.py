@@ -17,11 +17,11 @@ STATEMENT_KEYS: Final = {
     "task_type": frozenset({"kind", "id", "requirements"}),
     "artifact_type": frozenset({"kind", "id", "template"}),
     "validation_type": frozenset({"kind", "id", "args"}),
-    "worker": frozenset({"kind", "id", "type"}),
+    "worker": frozenset({"kind", "id", "type", "instructions"}),
     "operation_type": frozenset({"kind", "id", "args"}),
     "transition": frozenset({
         "kind", "id", "task_type", "from", "to", "worker", "default_for_scheduler",
-        "requires", "transaction",
+        "requires", "transaction", "instructions",
     }),
 }
 

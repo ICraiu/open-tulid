@@ -95,7 +95,9 @@ def _task() -> Task:
 def _job_store(tmp_path: Path) -> FileExecutionJobStore:
     store = FileExecutionJobStore(tmp_path / "jobs")
     workspace = tmp_path / "workspace"
+    output = workspace / "output"
     workspace.mkdir()
+    output.mkdir()
     assert store.create(ExecutionJob(
         job_id="01J00000000000000000000JOB",
         project_id="Agent",
@@ -103,7 +105,7 @@ def _job_store(tmp_path: Path) -> FileExecutionJobStore:
         transition_id="code",
         worker_id="codex",
         workspace_path=str(workspace),
-        metadata={"completion_token": "secret"},
+        metadata={"completion_token": "secret", "output_path": str(output)},
     )).accepted is True
     return store
 
@@ -149,7 +151,7 @@ def test_completion_rejects_missing_required_artifact(tmp_path: Path):
 def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     store = _job_store(tmp_path)
     workspace = tmp_path / "workspace"
-    (workspace / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
     adapter = FakeAdapter(_task())
     service = CompletionService(
         workflow=_workflow(),
@@ -168,7 +170,7 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     assert adapter.moved_to == "CodeReview"
     loaded = store.get("01J00000000000000000000JOB")
     assert loaded.job is not None
-    assert loaded.job.status == "completed"
+    assert loaded.job.status == "accepted"
     assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()][-2:] == [
         "ReviewRequested",
         "ExecutionFinished",

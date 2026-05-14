@@ -134,6 +134,7 @@ class ValidationTypeStatement(Statement):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class WorkerStatement(Statement):
     type: str | None = None
+    instructions: tuple[str, ...] = ()
 
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_worker(self)
@@ -153,6 +154,7 @@ class TransitionStatement(Statement):
     from_state: str
     to_state: str
     worker: str | None = None
+    instructions: tuple[str, ...] = ()
     default_for_scheduler: bool = False
     requires: RequirementSet = dataclasses.field(default_factory=RequirementSet)
     transaction: TransactionPlan | None = None

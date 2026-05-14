@@ -83,11 +83,16 @@ class EventType(str, Enum):
 
 
 class ExecutionJobStatus(str, Enum):
-    CREATED = "created"
+    PENDING = "pending"
     RUNNING = "running"
-    COMPLETED = "completed"
+    COMPLETION_REJECTED = "completion_rejected"
+    ACCEPTED = "accepted"
     FAILED = "failed"
+    STALE = "stale"
     CANCELLED = "cancelled"
+
+    CREATED = "pending"
+    COMPLETED = "accepted"
 
 
 class JournalStatus(str, Enum):
@@ -231,6 +236,7 @@ class WorkerDefinition:
     id: str
     type: str | None = None
     implementation_id: str | None = None
+    instructions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -243,6 +249,7 @@ class TransitionDefinition:
     requires: "RequirementDefinition"
     transaction: "TransactionDefinition" | None
     default_for_scheduler: bool = False
+    instructions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

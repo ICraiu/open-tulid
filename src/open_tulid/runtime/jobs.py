@@ -13,8 +13,9 @@ from open_tulid.runtime.events import utc_now
 
 
 ACTIVE_JOB_STATUSES = frozenset({
-    ExecutionJobStatus.CREATED.value,
+    ExecutionJobStatus.PENDING.value,
     ExecutionJobStatus.RUNNING.value,
+    ExecutionJobStatus.COMPLETION_REJECTED.value,
 })
 
 

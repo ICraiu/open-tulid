@@ -15,15 +15,23 @@ from open_tulid.containers import (
     list_agent_image_specs,
 )
 from open_tulid.adapters.obsidian import ObsidianAdapter, config_from_workflow
-from open_tulid.domain import WorkflowDefinition
+from open_tulid.domain import EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
 from open_tulid.models import Config, ProjectConfig, ValidationReport
 from open_tulid.runtime import (
+    ArtifactSubmission,
     CompletionService,
+    CompletionEndpointConfig,
     CompletionSubmission,
+    CreateExecutionJob,
     FileExecutionJobStore,
     JobExecutor,
     JsonlEventStore,
+    RequestTransition,
     Scheduler,
+    TaskManager,
+    build_event,
+    cleanup_job_workspaces,
+    serve_completion_endpoint,
     TransactionJournalStore,
 )
 from open_tulid.vault.project import create_project
@@ -91,6 +99,9 @@ app.add_typer(events_app, name="events")
 
 jobs_app = typer.Typer()
 app.add_typer(jobs_app, name="jobs")
+
+tasks_app = typer.Typer()
+app.add_typer(tasks_app, name="tasks")
 
 agents_app = typer.Typer()
 app.add_typer(agents_app, name="agents")
@@ -223,6 +234,12 @@ def validate() -> None:
         raise typer.Exit(1)
 
 
+@app.command("validate")
+def validate_alias() -> None:
+    """Validate all configured projects in the vault."""
+    validate()
+
+
 def _print_report(report: ValidationReport) -> None:
     if not report.passed:
         console.print()
@@ -322,6 +339,32 @@ def schedule_job(
     )
 
 
+@jobs_app.command("create")
+def create_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    task_id: str = typer.Argument(..., help="Task id."),
+    transition_id: str = typer.Argument(..., help="Transition id."),
+) -> None:
+    """Create an execution job for a specific task transition."""
+    ctx = _runtime_project_context(project)
+    manager = TaskManager(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+    )
+    result = manager.create_execution_job(CreateExecutionJob(
+        project_id=project,
+        task_id=task_id,
+        transition_id=transition_id,
+        workspace_root=ctx["workspace_root"],
+    ))
+    if not result.accepted or result.job is None:
+        _print_domain_errors(result.errors)
+        raise typer.Exit(1)
+    ctx["event_store"].append_many(result.events)
+    console.print(f"Created job={result.job.job_id}")
+
+
 @jobs_app.command("list")
 def list_jobs(
     project: str = typer.Argument(..., help="Configured project name."),
@@ -361,6 +404,35 @@ def show_job(
     console.print(f"worker_id: {job.worker_id}")
     console.print(f"workspace_path: {job.workspace_path}")
     console.print(f"attempts: {job.attempts}")
+
+
+@jobs_app.command("fail")
+def fail_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+    reason: str = typer.Option("", "--reason", help="Failure reason."),
+) -> None:
+    """Mark a job failed."""
+    _set_job_status(project, job_id, ExecutionJobStatus.FAILED, reason=reason)
+
+
+@jobs_app.command("cancel")
+def cancel_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+    reason: str = typer.Option("", "--reason", help="Cancellation reason."),
+) -> None:
+    """Mark a job cancelled."""
+    _set_job_status(project, job_id, ExecutionJobStatus.CANCELLED, reason=reason)
+
+
+@jobs_app.command("restart")
+def restart_job(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Execution job id."),
+) -> None:
+    """Return a job to pending."""
+    _set_job_status(project, job_id, ExecutionJobStatus.PENDING, reason="restart requested")
 
 
 @jobs_app.command("run")
@@ -415,8 +487,14 @@ def complete_job(
     project: str = typer.Argument(..., help="Configured project name."),
     job_id: str = typer.Argument(..., help="Execution job id."),
     token: str | None = typer.Option(None, "--token", help="Completion token from the job context."),
+    submission_id: str | None = typer.Option(None, "--submission-id", help="Caller supplied submission id for replay detection."),
+    attempt: int | None = typer.Option(None, "--attempt", min=1, help="Completion attempt number."),
     summary: str = typer.Option("", "--summary", help="Completion summary."),
-    artifact: list[str] | None = typer.Option(None, "--artifact", help="Submitted artifact path. Repeatable."),
+    artifact: list[str] | None = typer.Option(
+        None,
+        "--artifact",
+        help="Submitted artifact as type=path or type=path:sha256. Repeatable.",
+    ),
     changed_file: list[str] | None = typer.Option(None, "--changed-file", help="Changed file path. Repeatable."),
     evidence: list[str] | None = typer.Option(
         None,
@@ -431,13 +509,17 @@ def complete_job(
         adapter=ctx["adapter"],
         job_store=ctx["job_store"],
         event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
+        artifact_root=ctx["project_path"] / "artifacts",
     )
     result = service.submit(
         job_id=job_id,
         token=token,
         submission=CompletionSubmission(
+            submission_id=submission_id,
+            attempt=attempt,
             summary=summary,
-            artifacts=tuple(artifact or ()),
+            artifacts=_parse_artifacts(artifact or ()),
             changed_files=tuple(changed_file or ()),
             validation_evidence=_parse_evidence(evidence or ()),
         ),
@@ -446,6 +528,39 @@ def complete_job(
         _print_domain_errors(result.errors)
         raise typer.Exit(1)
     console.print("Completion accepted.")
+
+
+@jobs_app.command("serve-completions")
+def serve_completions(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str | None = typer.Option(None, "--job", help="Restrict the endpoint to one job id."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host interface to bind."),
+    port: int = typer.Option(8765, "--port", min=0, help="Port to bind. Use 0 for an ephemeral port."),
+) -> None:
+    """Serve the local completion HTTP endpoint."""
+    ctx = _runtime_project_context(project)
+    service = CompletionService(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
+        artifact_root=ctx["project_path"] / "artifacts",
+    )
+    server = serve_completion_endpoint(
+        CompletionEndpointConfig(
+            service=service,
+            allowed_jobs=frozenset({job_id}) if job_id is not None else None,
+        ),
+        host=host,
+        port=port,
+    )
+    bound_host, bound_port = server.server_address
+    console.print(f"Serving completion endpoint at http://{bound_host}:{bound_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
 
 
 @jobs_app.command("logs")
@@ -470,6 +585,100 @@ def job_logs(
         console.print("No log file.")
         return
     console.print(log_path.read_text(encoding="utf-8"), end="")
+
+
+@tasks_app.command("list")
+def list_tasks(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """List tasks from the configured project."""
+    ctx = _runtime_project_context(project)
+    loaded = ctx["adapter"].load_project()
+    if not loaded.accepted or loaded.snapshot is None:
+        _print_domain_errors(loaded.errors)
+        raise typer.Exit(1)
+    for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
+        console.print(f"{task.id} state={task.current_state} type={task.task_type} title={task.title}")
+
+
+@tasks_app.command("runnable")
+def runnable_tasks(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """List tasks with worker-backed outgoing transitions."""
+    ctx = _runtime_project_context(project)
+    loaded = ctx["adapter"].load_project()
+    if not loaded.accepted or loaded.snapshot is None:
+        _print_domain_errors(loaded.errors)
+        raise typer.Exit(1)
+    found = False
+    for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
+        transitions = [
+            transition for transition in ctx["workflow"].transitions.values()
+            if transition.task_type == task.task_type
+            and transition.from_state == task.current_state
+            and transition.worker is not None
+        ]
+        for transition in transitions:
+            found = True
+            console.print(f"{task.id} transition={transition.id} worker={transition.worker}")
+    if not found:
+        console.print("No runnable tasks.")
+
+
+@app.command("transition")
+def transition_task(
+    project: str = typer.Argument(..., help="Configured project name."),
+    task_id: str = typer.Argument(..., help="Task id."),
+    transition_id: str = typer.Argument(..., help="Transition id."),
+) -> None:
+    """Apply a trusted manual transition."""
+    ctx = _runtime_project_context(project)
+    manager = TaskManager(workflow=ctx["workflow"], adapter=ctx["adapter"])
+    checked = manager.request_transition(RequestTransition(
+        project_id=project,
+        task_id=task_id,
+        transition_id=transition_id,
+        actor=EventActor(type="user", id="cli"),
+    ))
+    if not checked.accepted:
+        _print_domain_errors(checked.errors)
+        raise typer.Exit(1)
+    transition = ctx["workflow"].transitions[transition_id]
+    moved = ctx["adapter"].move_task(task_id, transition.to_state)
+    if not moved.accepted:
+        _print_domain_errors(moved.errors)
+        raise typer.Exit(1)
+    ctx["event_store"].append(build_event(
+        project_id=project,
+        actor=EventActor(type="user", id="cli"),
+        event_type=EventType.TaskMoved,
+        correlation_id=task_id,
+        task_id=task_id,
+        transition_id=transition_id,
+        data={"to_state": transition.to_state, "path": moved.path},
+    ))
+    console.print(f"Moved {task_id} to {transition.to_state}.")
+
+
+@jobs_app.command("cleanup")
+def cleanup_jobs(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """Remove workspaces for terminal jobs."""
+    ctx = _runtime_project_context(project)
+    listed = ctx["job_store"].list()
+    if not listed.accepted:
+        _print_domain_errors((listed.error,))
+        raise typer.Exit(1)
+    result = cleanup_job_workspaces(listed.jobs)
+    if not result.accepted:
+        _print_domain_errors(result.errors)
+        raise typer.Exit(1)
+    for path in result.removed:
+        console.print(f"Removed {path}")
+    if not result.removed:
+        console.print("No terminal job workspaces to remove.")
 
 
 def _project_path(config: Config, name: str):
@@ -507,6 +716,8 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         "adapter": adapter,
         "job_store": FileExecutionJobStore(project_path / "jobs"),
         "event_store": JsonlEventStore(project_path / "events"),
+        "journal_store": TransactionJournalStore(project_path / "events" / "journals"),
+        "project_path": project_path,
         "workspace_root": default_shared_workspace_root(config.runtime, project_path),
     }
 
@@ -517,6 +728,30 @@ def _print_domain_errors(errors) -> None:
             continue
         location = f" [{error.location}]" if error.location else ""
         console.print(f"[red]{error.code}[/red]{location}: {error.message}")
+
+
+def _set_job_status(project: str, job_id: str, status: ExecutionJobStatus, *, reason: str = "") -> None:
+    ctx = _runtime_project_context(project)
+    updated = ctx["job_store"].update_status(
+        job_id,
+        status,
+        metadata={"status_reason": reason} if reason else None,
+    )
+    if not updated.accepted or updated.job is None:
+        _print_domain_errors((updated.error,))
+        raise typer.Exit(1)
+    event_type = EventType.ExecutionFailed if status == ExecutionJobStatus.FAILED else "ExecutionJobStatusChanged"
+    ctx["event_store"].append(build_event(
+        project_id=project,
+        actor=EventActor(type="user", id="cli"),
+        event_type=event_type,
+        correlation_id=job_id,
+        job_id=job_id,
+        task_id=updated.job.task_id,
+        transition_id=updated.job.transition_id,
+        data={"status": status.value, "reason": reason},
+    ))
+    console.print(f"{job_id} status={status.value}")
 
 
 def _parse_evidence(values) -> dict[str, str]:
@@ -531,6 +766,28 @@ def _parse_evidence(values) -> dict[str, str]:
             raise typer.Exit(2)
         parsed[key.strip()] = item.strip()
     return parsed
+
+
+def _parse_artifacts(values) -> tuple[ArtifactSubmission, ...]:
+    artifacts: list[ArtifactSubmission] = []
+    for value in values:
+        if "=" not in value:
+            clean = value.strip()
+            if not clean:
+                continue
+            artifacts.append(ArtifactSubmission(type=clean, path=clean))
+            continue
+        artifact_type, rest = value.split("=", 1)
+        path, sep, sha256 = rest.partition(":")
+        if not artifact_type.strip() or not path.strip():
+            console.print(Panel(f"Artifact must use type=path or type=path:sha256: {value}", style="red"))
+            raise typer.Exit(2)
+        artifacts.append(ArtifactSubmission(
+            type=artifact_type.strip(),
+            path=path.strip(),
+            sha256=sha256.strip() if sep and sha256.strip() else None,
+        ))
+    return tuple(artifacts)
 
 
 def _status(status) -> str:

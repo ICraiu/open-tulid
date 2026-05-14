@@ -166,6 +166,7 @@ class TaskManager:
             ),))
         job_id = new_ulid()
         workspace = command.workspace_root / job_id
+        output_path = workspace / "output"
         job = ExecutionJob(
             job_id=job_id,
             project_id=command.project_id,
@@ -173,7 +174,10 @@ class TaskManager:
             transition_id=command.transition_id,
             worker_id=transition.worker,
             workspace_path=str(workspace),
-            metadata={"completion_token": secrets.token_urlsafe(24)},
+            metadata={
+                "completion_token": secrets.token_urlsafe(24),
+                "output_path": str(output_path),
+            },
         )
         if self.job_store is not None:
             saved = self.job_store.create(job)

@@ -342,7 +342,7 @@ def _build_statement(
 
     # Build field_spans for semantic validation
     field_spans: dict[str, SourceSpan] = {}
-    for field_name in ("task_type", "from", "to", "worker", "default_for_scheduler"):
+    for field_name in ("task_type", "from", "to", "worker", "default_for_scheduler", "instructions"):
         if field_name in raw:
             fs = key_span(raw, field_name, f"{item_path}.{field_name}")
             if fs:
@@ -373,7 +373,16 @@ def _build_statement(
                 t_span,
             ))
             return diagnostics, None
-        return diagnostics, WorkerStatement(id=stmt_id, type=wtype, span=item_span)
+        inst_diags, instructions = _build_instruction_refs(raw, f"{item_path}.instructions")
+        diagnostics.extend(inst_diags)
+        if diagnostics:
+            return diagnostics, None
+        return diagnostics, WorkerStatement(
+            id=stmt_id,
+            type=wtype,
+            instructions=instructions,
+            span=item_span,
+        )
 
     if kind == "task_type":
         return _build_task_type(raw, stmt_id, item_path, item_span, source_name)
@@ -657,6 +666,9 @@ def _build_transition(
         ))
         return diagnostics, None
 
+    inst_diags, instructions = _build_instruction_refs(raw, f"{item_path}.instructions")
+    diagnostics.extend(inst_diags)
+
     default_for_scheduler = raw.get("default_for_scheduler", False)
     if not isinstance(default_for_scheduler, bool):
         default_span = key_span(raw, "default_for_scheduler", f"{item_path}.default_for_scheduler")
@@ -694,12 +706,41 @@ def _build_transition(
         from_state=from_state,
         to_state=to_state,
         worker=worker,
+        instructions=instructions,
         default_for_scheduler=default_for_scheduler,
         requires=requires,
         transaction=transaction,
         span=item_span,
         field_spans=dict(field_spans),
     )
+
+
+def _build_instruction_refs(raw: dict, path: str) -> tuple[list[Diagnostic], tuple[str, ...]]:
+    diagnostics: list[Diagnostic] = []
+    if "instructions" not in raw:
+        return diagnostics, ()
+    value = raw.get("instructions")
+    span = key_span(raw, "instructions", path)
+    if isinstance(value, str):
+        return diagnostics, (value,)
+    if not isinstance(value, list):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type",
+            "instructions must be a string or list of strings",
+            span,
+        ))
+        return diagnostics, ()
+    refs: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                f"instruction reference must be a string, got {type(item).__name__}",
+                list_item_span(value, index, f"{path}[{index}]"),
+            ))
+            continue
+        refs.append(item)
+    return diagnostics, tuple(refs)
 
 
 def _build_storage(raw: object) -> tuple[list[Diagnostic], WorkflowStorage | None]:
