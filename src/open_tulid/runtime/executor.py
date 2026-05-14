@@ -163,7 +163,9 @@ class JobExecutor:
             if loaded_after_run.accepted and loaded_after_run.job is not None
             else ""
         )
-        if not result.succeeded and status_after_run != ExecutionJobStatus.ACCEPTED.value:
+        if status_after_run == ExecutionJobStatus.ACCEPTED.value:
+            return ExecutorRunResult(True, run=result)
+        if not result.succeeded:
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.FAILED,
@@ -178,6 +180,22 @@ class JobExecutor:
                 job_id=job.job_id,
                 transition_id=job.transition_id,
                 data={"returncode": result.returncode},
+            ))
+        else:
+            self.job_store.update_status(
+                job.job_id,
+                ExecutionJobStatus.FAILED,
+                metadata={"worker_returncode": result.returncode, "failure_reason": "completion_not_accepted"},
+            )
+            self.event_store.append(build_event(
+                project_id=job.project_id,
+                actor=EventActor(type="system", id="executor"),
+                event_type=EventType.ExecutionFailed,
+                correlation_id=job.job_id,
+                task_id=job.task_id,
+                job_id=job.job_id,
+                transition_id=job.transition_id,
+                data={"returncode": result.returncode, "reason": "completion_not_accepted"},
             ))
         return ExecutorRunResult(True, run=result)
 

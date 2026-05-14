@@ -186,6 +186,7 @@ def test_scheduler_creates_first_runnable_job_in_board_order(tmp_path: Path):
     assert result.task_id == TASK_ID
     assert result.transition_id == "implement"
     assert result.job is not None
+    assert [event.event_type for event in result.events] == ["TransitionAccepted", "ExecutionJobCreated"]
     assert store.get(result.job.job_id).accepted is True
     assert [skip.code for skip in result.skipped] == ["task.dependency_missing"]
 

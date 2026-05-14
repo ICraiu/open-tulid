@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from open_tulid.adapters.base import StorageAdapter
-from open_tulid.domain import DomainError, ExecutionJob, ProjectSnapshot, Task, TransitionDefinition, WorkflowDefinition
+from open_tulid.domain import DomainError, EventEnvelope, ExecutionJob, ProjectSnapshot, Task, TransitionDefinition, WorkflowDefinition
 
 from .jobs import FileExecutionJobStore
 from .task_manager import CreateExecutionJob, TaskManager
@@ -18,6 +18,7 @@ class ScheduleResult:
     transition_id: str | None = None
     errors: tuple[DomainError, ...] = ()
     skipped: tuple[DomainError, ...] = ()
+    events: tuple[EventEnvelope, ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -89,18 +90,20 @@ class Scheduler:
             ))
             if not created.accepted:
                 return ScheduleResult(
-                    scheduled=False,
-                    task_id=task.id,
-                    transition_id=transition.id,
-                    errors=created.errors,
-                    skipped=tuple(skipped),
-                )
+                scheduled=False,
+                task_id=task.id,
+                transition_id=transition.id,
+                errors=created.errors,
+                skipped=tuple(skipped),
+                events=created.events,
+            )
             return ScheduleResult(
                 scheduled=True,
                 job=created.job,
                 task_id=task.id,
                 transition_id=transition.id,
                 skipped=tuple(skipped),
+                events=created.events,
             )
 
         return ScheduleResult(scheduled=False, skipped=tuple(skipped))

@@ -335,6 +335,7 @@ def schedule_job(
     if not result.scheduled or result.job is None:
         console.print("No runnable task.")
         return
+    ctx["event_store"].append_many(result.events)
     console.print(
         f"Scheduled job={result.job.job_id} task={result.job.task_id} "
         f"transition={result.job.transition_id} worker={result.job.worker_id}"
@@ -522,6 +523,7 @@ def run_one_job(
     if not scheduled.scheduled or scheduled.job is None:
         console.print("No runnable task.")
         return
+    ctx["event_store"].append_many(scheduled.events)
     run_job(project, scheduled.job.job_id)
 
 
@@ -553,6 +555,7 @@ def jobs_daemon(
             time.sleep(interval)
             continue
 
+        ctx["event_store"].append_many(scheduled.events)
         console.print(
             f"Scheduled job={scheduled.job.job_id} task={scheduled.job.task_id} "
             f"transition={scheduled.job.transition_id} worker={scheduled.job.worker_id}"
