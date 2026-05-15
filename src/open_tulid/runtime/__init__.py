@@ -21,7 +21,22 @@ from .instructions import (
     PromptPacket,
     PromptPacketResult,
 )
-from .scheduler import ScheduleResult, Scheduler
+from .scheduler import ScheduleResult, Scheduler, recover_job_creation_transactions
+from .resources import FileResourceLeaseStore, ResourceLease, ResourceLeaseResult
+from .model_proxy import (
+    LocalModelAdapter,
+    FileModelProxySessionStore,
+    BackendReadiness,
+    ModelProxyService,
+    ModelProxySession,
+    ModelProxySessionStore,
+    OpenAIAdapter,
+    ProxyRequest,
+    ProxyResponse,
+    check_backend_readiness,
+    make_model_proxy_handler,
+    serve_model_proxy,
+)
 from .transactions import EffectApplier, EffectResult, FileTransactionRuntime, TransactionApplyResult
 from .completion import CompletionResult, CompletionService
 from .completion_http import (
@@ -82,6 +97,22 @@ __all__ = [
     "PromptPacketResult",
     "ScheduleResult",
     "Scheduler",
+    "recover_job_creation_transactions",
+    "FileResourceLeaseStore",
+    "ResourceLease",
+    "ResourceLeaseResult",
+    "LocalModelAdapter",
+    "FileModelProxySessionStore",
+    "BackendReadiness",
+    "ModelProxyService",
+    "ModelProxySession",
+    "ModelProxySessionStore",
+    "OpenAIAdapter",
+    "ProxyRequest",
+    "ProxyResponse",
+    "check_backend_readiness",
+    "make_model_proxy_handler",
+    "serve_model_proxy",
     "CompletionResult",
     "CompletionService",
     "CompletionEndpointConfig",

@@ -21,11 +21,35 @@ class RuntimeConfig:
     default_timeout_seconds: int = 3600
     worker_images: dict[str, str] = field(default_factory=dict)
     worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    worker_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    worker_types: dict[str, str] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
     completion_host: str = "0.0.0.0"
     completion_port: int = 0
     completion_container_host: str = "host.docker.internal"
     container_volume_relabel: bool = False
+
+
+@dataclass(frozen=True)
+class ResourceConfig:
+    kind: str
+    capacity: int
+    proxy: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelProxyConfig:
+    kind: str
+    base_url: str
+    api_key_env: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelProxyServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 8787
+    log_root: Path | None = None
+    body_logging: str = "metadata"
 
 
 @dataclass
@@ -36,6 +60,9 @@ class Config:
     workflow_path: Path | None = None
     project_configs: dict[str, ProjectConfig] = field(default_factory=dict)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    resources: dict[str, ResourceConfig] = field(default_factory=dict)
+    model_proxy: dict[str, ModelProxyConfig] = field(default_factory=dict)
+    model_proxy_server: ModelProxyServerConfig = field(default_factory=ModelProxyServerConfig)
 
 
 @dataclass

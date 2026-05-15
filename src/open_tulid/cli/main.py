@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -33,16 +34,25 @@ from open_tulid.runtime import (
     CompletionSubmission,
     CreateExecutionJob,
     FileExecutionJobStore,
+    FileModelProxySessionStore,
+    FileResourceLeaseStore,
     JobExecutor,
     JsonlEventStore,
+    LocalModelAdapter,
+    ModelProxyService,
+    OpenAIAdapter,
     RequestTransition,
     Scheduler,
     TaskManager,
     build_event,
+    check_backend_readiness,
     cleanup_job_workspaces,
+    recover_job_creation_transactions,
     serve_completion_endpoint,
+    serve_model_proxy,
     TransactionJournalStore,
     human_event_type,
+    new_ulid,
 )
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
@@ -119,8 +129,10 @@ app.add_typer(agents_app, name="agents")
 install_app = typer.Typer()
 app.add_typer(install_app, name="install")
 
-scheduler_app = typer.Typer()
-app.add_typer(scheduler_app, name="scheduler")
+runtime_app = typer.Typer()
+model_proxy_app = typer.Typer()
+app.add_typer(runtime_app, name="runtime")
+app.add_typer(model_proxy_app, name="model-proxy")
 
 
 @app.command()
@@ -352,6 +364,10 @@ def schedule_job(
         adapter=ctx["adapter"],
         job_store=ctx["job_store"],
         workspace_root=ctx["workspace_root"],
+        lease_store=ctx["lease_store"],
+        worker_resources=ctx["config"].runtime.worker_resources,
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
     )
     result = scheduler.schedule_one(project)
     if not result.accepted:
@@ -362,7 +378,8 @@ def schedule_job(
     if not result.scheduled or result.job is None:
         console.print("No runnable task.")
         return
-    ctx["event_store"].append_many(result.events)
+    if not result.events_persisted:
+        ctx["event_store"].append_many(result.events)
     console.print(
         f"Scheduled job={result.job.job_id} task={result.job.task_id} "
         f"transition={result.job.transition_id} worker={result.job.worker_id}"
@@ -377,22 +394,55 @@ def create_job(
 ) -> None:
     """Create an execution job for a specific task transition."""
     ctx = _runtime_project_context(project)
-    manager = TaskManager(
+    transition = ctx["workflow"].transitions.get(transition_id)
+    worker_id = transition.worker if transition is not None else None
+    job_id = new_ulid()
+    required_resources = ctx["config"].runtime.worker_resources.get(worker_id or "", ())
+    scheduler = Scheduler(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
         job_store=ctx["job_store"],
+        workspace_root=ctx["workspace_root"],
+        lease_store=ctx["lease_store"],
+        worker_resources=ctx["config"].runtime.worker_resources,
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
     )
-    result = manager.create_execution_job(CreateExecutionJob(
+    manager = TaskManager(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=None,
+    )
+    command = CreateExecutionJob(
         project_id=project,
         task_id=task_id,
         transition_id=transition_id,
         workspace_root=ctx["workspace_root"],
-    ))
+        job_id=job_id,
+    )
+    if required_resources:
+        reserved, result = ctx["lease_store"].admit(
+            required_resources,
+            job_id=job_id,
+            worker_id=worker_id or "",
+            owner_path=ctx["job_store"].path_for(job_id),
+            commit=lambda: scheduler._create_job(manager, command),
+        )
+        if not reserved.acquired:
+            console.print(_runtime_log_line(
+                "JOB_CREATE_DEFERRED",
+                f"project={project} task={task_id} resources={','.join(reserved.busy_resources)}",
+            ))
+            raise typer.Exit(1)
+        assert result is not None
+    else:
+        result = scheduler._create_job(manager, command)
     if not result.accepted or result.job is None:
+        if required_resources:
+            ctx["lease_store"].release_job(job_id)
         _print_domain_errors(result.errors)
         raise typer.Exit(1)
-    ctx["event_store"].append_many(result.events)
-    console.print(f"Created job={result.job.job_id}")
+    console.print(_runtime_log_line("EXECUTION_JOB_CREATED", f"job={result.job.job_id}"))
 
 
 @jobs_app.command("list")
@@ -520,6 +570,10 @@ def run_job(
         project_config=ctx["project_config"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        lease_store=ctx["lease_store"],
+        resources=ctx["config"].resources,
+        model_proxy_sessions=ctx["model_proxy_sessions"],
+        model_proxy_endpoint_base=_model_proxy_endpoint_base(ctx["config"]),
     )
     result = executor.run(job_id)
     if not result.accepted:
@@ -542,6 +596,10 @@ def run_one_job(
         adapter=ctx["adapter"],
         job_store=ctx["job_store"],
         workspace_root=ctx["workspace_root"],
+        lease_store=ctx["lease_store"],
+        worker_resources=ctx["config"].runtime.worker_resources,
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
     )
     scheduled = scheduler.schedule_one(project)
     if not scheduled.accepted:
@@ -550,7 +608,8 @@ def run_one_job(
     if not scheduled.scheduled or scheduled.job is None:
         console.print("No runnable task.")
         return
-    ctx["event_store"].append_many(scheduled.events)
+    if not scheduled.events_persisted:
+        ctx["event_store"].append_many(scheduled.events)
     run_job(project, scheduled.job.job_id)
 
 
@@ -570,91 +629,259 @@ def jobs_daemon(
             adapter=ctx["adapter"],
             job_store=ctx["job_store"],
             workspace_root=ctx["workspace_root"],
+            lease_store=ctx["lease_store"],
+            worker_resources=ctx["config"].runtime.worker_resources,
+            event_store=ctx["event_store"],
+            journal_store=ctx["journal_store"],
         )
         scheduled = scheduler.schedule_one(project)
         if not scheduled.accepted:
             _print_domain_errors(scheduled.errors)
             raise typer.Exit(1)
+        for skipped in scheduled.skipped:
+            console.print(_runtime_log_line(
+                "SCHEDULER_SKIPPED",
+                f"project={project} code={skipped.code} message={skipped.message}",
+            ))
         if not scheduled.scheduled or scheduled.job is None:
-            console.print("No runnable task.")
+            console.print(_runtime_log_line("SCHEDULER_IDLE", f"project={project}"))
             if exit_when_idle:
                 return
             time.sleep(interval)
             continue
 
-        ctx["event_store"].append_many(scheduled.events)
-        console.print(
-            f"Scheduled job={scheduled.job.job_id} task={scheduled.job.task_id} "
-            f"transition={scheduled.job.transition_id} worker={scheduled.job.worker_id}"
-        )
-        run_job(project, scheduled.job.job_id)
+        if not scheduled.events_persisted:
+            ctx["event_store"].append_many(scheduled.events)
+        console.print(_runtime_log_line(
+            "SCHEDULER_SCHEDULED",
+            f"project={project} job={scheduled.job.job_id} task={scheduled.job.task_id} "
+            f"transition={scheduled.job.transition_id} worker={scheduled.job.worker_id}",
+        ))
+        try:
+            run_job(project, scheduled.job.job_id)
+        except typer.Exit as exc:
+            console.print(_runtime_log_line(
+                "JOB_RUN_FAILED",
+                f"project={project} job={scheduled.job.job_id} exit_code={exc.exit_code}",
+            ))
+        except Exception as exc:
+            console.print(_runtime_log_line(
+                "JOB_RUN_FAILED",
+                f"project={project} job={scheduled.job.job_id} error={exc}",
+            ))
         completed += 1
         if limit is not None and completed >= limit:
             return
 
 
-@scheduler_app.command("start")
-def scheduler_start(
+@runtime_app.command("start")
+def runtime_start(
     project: str | None = typer.Option(None, "--project", help="Configured project name."),
     interval: float = typer.Option(30.0, "--interval", min=0.1, help="Seconds between scheduler scans."),
 ) -> None:
-    """Start the scheduler as a detached background process."""
+    """Start the runtime services as detached background processes."""
     config = _load_cli_config()
     project_name = _resolve_project_name(config, project)
-    state_path = _scheduler_state_path(config, project_name)
-    state = _load_scheduler_state(state_path)
-    if state is not None and _pid_is_running(state.get("pid")):
-        console.print(f"Scheduler already running for {project_name} pid={state['pid']}")
+    state_path = _runtime_state_path(config, project_name)
+    state = _load_runtime_state(state_path)
+    proxy_state_path = _proxy_state_path(config)
+    proxy_state = _load_runtime_state(proxy_state_path)
+    scheduler_running = state is not None and _pid_is_running(state.get("scheduler_pid"))
+    proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
+    if scheduler_running and proxy_running:
+        console.print(f"Runtime already running for {project_name}")
         return
 
-    process = subprocess.Popen(
-        [sys.argv[0], "jobs", "daemon", project_name, "--interval", str(interval)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps({
-        "pid": process.pid,
-        "project": project_name,
-        "interval": interval,
-        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-    }, sort_keys=True), encoding="utf-8")
-    console.print(f"Scheduler started for {project_name} pid={process.pid}")
+    readiness = check_backend_readiness(config.model_proxy, env=os.environ)
+    for result in readiness:
+        if result.ready:
+            console.print(_runtime_log_line(
+                "MODEL_PROXY_HEALTH_OK",
+                f"proxy={result.proxy_id} status={result.status}",
+            ))
+        else:
+            detail = f"proxy={result.proxy_id}"
+            if result.status is not None:
+                detail += f" status={result.status}"
+            if result.error:
+                detail += f" error={result.error}"
+            console.print(_runtime_log_line("MODEL_PROXY_HEALTH_FAILED", detail))
+    if any(not result.ready for result in readiness):
+        raise typer.Exit(1)
+
+    proxy_pid = None
+    started_new_proxy = False
+    if proxy_running:
+        proxy_pid = int(proxy_state["proxy_pid"])
+        console.print(_runtime_log_line("MODEL_PROXY_ALREADY_RUNNING", f"pid={proxy_pid}"))
+    else:
+        proxy_process = _spawn_runtime_process(
+            config,
+            "model-proxy",
+            [sys.argv[0], "model-proxy", "serve"],
+        )
+        if not _process_survived_startup(proxy_process):
+            console.print(_runtime_log_line("MODEL_PROXY_START_FAILED", f"pid={proxy_process.pid}"))
+            raise typer.Exit(1)
+        if not _proxy_listener_ready(config):
+            console.print(_runtime_log_line("MODEL_PROXY_LISTENER_FAILED", f"pid={proxy_process.pid}"))
+            _stop_new_proxy_after_failed_start(proxy_process, proxy_state_path)
+            raise typer.Exit(1)
+        proxy_pid = proxy_process.pid
+        started_new_proxy = True
+        proxy_state_path.parent.mkdir(parents=True, exist_ok=True)
+        proxy_state_path.write_text(json.dumps({
+            "proxy_pid": proxy_pid,
+            "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }, sort_keys=True), encoding="utf-8")
+        console.print(_runtime_log_line("MODEL_PROXY_STARTED", f"pid={proxy_pid}"))
+    if scheduler_running:
+        console.print(_runtime_log_line(
+            "SCHEDULER_ALREADY_RUNNING",
+            f"project={project_name} pid={state['scheduler_pid']}",
+        ))
+    else:
+        scheduler_process = _spawn_runtime_process(
+            config,
+            f"scheduler-{project_name}",
+            [sys.argv[0], "jobs", "daemon", project_name, "--interval", str(interval)],
+        )
+        if not _process_survived_startup(scheduler_process):
+            console.print(_runtime_log_line("SCHEDULER_START_FAILED", f"project={project_name} pid={scheduler_process.pid}"))
+            if started_new_proxy:
+                _stop_new_proxy_after_failed_start(proxy_process, proxy_state_path)
+            raise typer.Exit(1)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({
+            "scheduler_pid": scheduler_process.pid,
+            "project": project_name,
+            "interval": interval,
+            "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }, sort_keys=True), encoding="utf-8")
+        console.print(_runtime_log_line(
+            "SCHEDULER_STARTED",
+            f"project={project_name} pid={scheduler_process.pid} interval={interval}",
+        ))
 
 
-@scheduler_app.command("stop")
-def scheduler_stop(
+@runtime_app.command("stop")
+def runtime_stop(
     project: str | None = typer.Option(None, "--project", help="Configured project name."),
 ) -> None:
-    """Stop the detached scheduler process."""
+    """Stop the detached runtime processes."""
     config = _load_cli_config()
     project_name = _resolve_project_name(config, project)
-    state_path = _scheduler_state_path(config, project_name)
-    state = _load_scheduler_state(state_path)
-    if state is None or not _pid_is_running(state.get("pid")):
+    state_path = _runtime_state_path(config, project_name)
+    state = _load_runtime_state(state_path)
+    if state is None:
         state_path.unlink(missing_ok=True)
-        console.print(f"Scheduler is not running for {project_name}")
+        console.print(f"Runtime is not running for {project_name}")
         return
-    os.kill(int(state["pid"]), signal.SIGTERM)
+    for key in ("scheduler_pid",):
+        pid = state.get(key)
+        if _pid_is_running(pid):
+            os.kill(int(pid), signal.SIGTERM)
+            if not _wait_for_pid_exit(int(pid)):
+                console.print(_runtime_log_line(
+                    "SCHEDULER_STOP_TIMEOUT",
+                    f"project={project_name} pid={pid}",
+                ))
+                raise typer.Exit(1)
     state_path.unlink(missing_ok=True)
-    console.print(f"Scheduler stopped for {project_name}")
+    if not _any_scheduler_running(config):
+        proxy_state_path = _proxy_state_path(config)
+        proxy_state = _load_runtime_state(proxy_state_path)
+        if proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid")):
+            os.kill(int(proxy_state["proxy_pid"]), signal.SIGTERM)
+            if not _wait_for_pid_exit(int(proxy_state["proxy_pid"])):
+                console.print(_runtime_log_line(
+                    "MODEL_PROXY_STOP_TIMEOUT",
+                    f"pid={proxy_state['proxy_pid']}",
+                ))
+                raise typer.Exit(1)
+            console.print(_runtime_log_line("MODEL_PROXY_STOPPED", f"pid={proxy_state['proxy_pid']}"))
+        proxy_state_path.unlink(missing_ok=True)
+    console.print(f"Runtime stopped for {project_name}")
 
 
-@scheduler_app.command("status")
-def scheduler_status(
+@runtime_app.command("status")
+def runtime_status(
     project: str | None = typer.Option(None, "--project", help="Configured project name."),
 ) -> None:
-    """Show whether the detached scheduler is running."""
+    """Show whether the detached runtime processes are running."""
     config = _load_cli_config()
     project_name = _resolve_project_name(config, project)
-    state_path = _scheduler_state_path(config, project_name)
-    state = _load_scheduler_state(state_path)
-    if state is None or not _pid_is_running(state.get("pid")):
-        console.print(f"Scheduler not running for {project_name}")
+    state_path = _runtime_state_path(config, project_name)
+    state = _load_runtime_state(state_path)
+    if state is None:
+        console.print(f"Runtime not running for {project_name}")
         return
-    console.print(f"Scheduler running for {project_name} pid={state['pid']}")
+    scheduler_running = _pid_is_running(state.get("scheduler_pid"))
+    proxy_state = _load_runtime_state(_proxy_state_path(config))
+    proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
+    if scheduler_running and proxy_running:
+        console.print(
+            f"Runtime running for {project_name} "
+            f"scheduler_pid={state['scheduler_pid']} proxy_pid={proxy_state['proxy_pid']}"
+        )
+        return
+    console.print(
+        f"Runtime degraded for {project_name} "
+        f"scheduler_running={scheduler_running} proxy_running={proxy_running}"
+    )
+
+
+@model_proxy_app.command("serve")
+def model_proxy_serve() -> None:
+    """Serve configured model proxy endpoints."""
+    config = _load_cli_config()
+    readiness = check_backend_readiness(config.model_proxy, env=os.environ)
+    for result in readiness:
+        if result.ready:
+            console.print(_runtime_log_line(
+                "MODEL_PROXY_HEALTH_OK",
+                f"proxy={result.proxy_id} status={result.status}",
+            ))
+        else:
+            detail = f"proxy={result.proxy_id}"
+            if result.status is not None:
+                detail += f" status={result.status}"
+            if result.error:
+                detail += f" error={result.error}"
+            console.print(_runtime_log_line("MODEL_PROXY_HEALTH_FAILED", detail))
+    if any(not result.ready for result in readiness):
+        raise typer.Exit(1)
+    sessions = FileModelProxySessionStore(_model_proxy_session_root(config))
+    adapters = {}
+    for proxy_id, proxy in config.model_proxy.items():
+        if proxy.kind == "local":
+            adapters[proxy_id] = LocalModelAdapter(proxy)
+        elif proxy.kind == "openai":
+            adapters[proxy_id] = OpenAIAdapter(proxy, os.environ)
+    transcript_root = config.model_proxy_server.log_root or (
+        (config.config_dir or Path.cwd()) / "model-proxy-logs"
+    )
+    service = ModelProxyService(
+        sessions=sessions,
+        adapters=adapters,
+        lease_store=FileResourceLeaseStore(
+            (config.config_dir or Path.cwd()) / "resource-leases",
+            config.resources,
+        ),
+        transcript_root=transcript_root,
+        body_logging=config.model_proxy_server.body_logging,
+    )
+    server = serve_model_proxy(
+        service,
+        host=config.model_proxy_server.host,
+        port=config.model_proxy_server.port,
+    )
+    host, port = server.server_address
+    console.print(f"Serving model proxy at http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
 
 
 @jobs_app.command("complete")
@@ -884,16 +1111,34 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         project_root=project_path,
         workflow=workflow,
     ))
+    job_store = FileExecutionJobStore(project_path / "jobs")
+    event_store = JsonlEventStore(project_path / "events")
+    journal_store = TransactionJournalStore(project_path / "events" / "journals")
+    recovered = recover_job_creation_transactions(
+        job_store=job_store,
+        event_store=event_store,
+        journal_store=journal_store,
+    )
+    for journal_id in recovered:
+        console.print(_runtime_log_line(
+            "JOB_CREATION_RECOVERED",
+            f"project={project} journal={journal_id}",
+        ))
     return {
         "config": config,
         "workflow": workflow,
         "project_config": project_config,
         "adapter": adapter,
-        "job_store": FileExecutionJobStore(project_path / "jobs"),
-        "event_store": JsonlEventStore(project_path / "events"),
-        "journal_store": TransactionJournalStore(project_path / "events" / "journals"),
+        "job_store": job_store,
+        "event_store": event_store,
+        "journal_store": journal_store,
         "project_path": project_path,
         "workspace_root": default_shared_workspace_root(config.runtime, project_path),
+        "lease_store": FileResourceLeaseStore(
+            (config.config_dir or project_path / ".open-tulid") / "resource-leases",
+            config.resources,
+        ),
+        "model_proxy_sessions": FileModelProxySessionStore(_model_proxy_session_root(config)),
     }
 
 
@@ -903,6 +1148,14 @@ def _print_domain_errors(errors) -> None:
             continue
         location = f" [{error.location}]" if error.location else ""
         console.print(f"[red]{error.code}[/red]{location}: {error.message}")
+
+
+def _model_proxy_session_root(config: Config) -> Path:
+    return (config.config_dir or Path.cwd()) / "model-proxy-sessions"
+
+
+def _model_proxy_endpoint_base(config: Config) -> str:
+    return f"http://{config.runtime.completion_container_host}:{config.model_proxy_server.port}"
 
 
 def _set_job_status(project: str, job_id: str, status: ExecutionJobStatus, *, reason: str = "") -> None:
@@ -915,6 +1168,14 @@ def _set_job_status(project: str, job_id: str, status: ExecutionJobStatus, *, re
     if not updated.accepted or updated.job is None:
         _print_domain_errors((updated.error,))
         raise typer.Exit(1)
+    if status in {
+        ExecutionJobStatus.ACCEPTED,
+        ExecutionJobStatus.FAILED,
+        ExecutionJobStatus.STALE,
+        ExecutionJobStatus.CANCELLED,
+    }:
+        ctx["lease_store"].release_job(job_id)
+        ctx["model_proxy_sessions"].revoke_job(job_id)
     event_type = EventType.ExecutionFailed if status == ExecutionJobStatus.FAILED else "ExecutionJobStatusChanged"
     ctx["event_store"].append(build_event(
         project_id=project,
@@ -1005,16 +1266,75 @@ def _follow_human_logs(log_dir: Path, *, poll_interval: float = 0.2) -> None:
         return
 
 
-def _scheduler_state_path(config: Config, project: str) -> Path:
-    return _project_path(config, project) / ".open-tulid" / "scheduler.json"
+def _runtime_state_path(config: Config, project: str) -> Path:
+    return _project_path(config, project) / ".open-tulid" / "runtime.json"
 
 
-def _load_scheduler_state(path: Path) -> dict[str, object] | None:
+def _proxy_state_path(config: Config) -> Path:
+    return (config.config_dir or Path.cwd()) / "model-proxy-runtime.json"
+
+
+def _load_runtime_state(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _runtime_log_line(event_type: str, detail: str) -> str:
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return f">>> {timestamp} {event_type} {detail}"
+
+
+def _runtime_log_root(config: Config) -> Path:
+    return (config.config_dir or Path.cwd()) / "runtime-logs"
+
+
+def _spawn_runtime_process(config: Config, name: str, args: list[str]) -> subprocess.Popen:
+    log_root = _runtime_log_root(config)
+    log_root.mkdir(parents=True, exist_ok=True)
+    stdout = (log_root / f"{name}.stdout.log").open("ab")
+    stderr = (log_root / f"{name}.stderr.log").open("ab")
+    return subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    )
+
+
+def _process_survived_startup(process: subprocess.Popen, *, delay: float = 0.1) -> bool:
+    time.sleep(delay)
+    poll = getattr(process, "poll", None)
+    return poll is None or poll() is None
+
+
+def _stop_new_proxy_after_failed_start(process: subprocess.Popen, state_path: Path) -> None:
+    if _pid_is_running(process.pid):
+        os.kill(process.pid, signal.SIGTERM)
+    state_path.unlink(missing_ok=True)
+    console.print(_runtime_log_line("MODEL_PROXY_STOPPED_AFTER_START_FAILURE", f"pid={process.pid}"))
+
+
+def _proxy_listener_ready(config: Config, *, timeout: float = 1.0) -> bool:
+    host = config.model_proxy_server.host
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    try:
+        with socket.create_connection((host, config.model_proxy_server.port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _any_scheduler_running(config: Config) -> bool:
+    for project in config.projects:
+        state = _load_runtime_state(_runtime_state_path(config, project))
+        if state is not None and _pid_is_running(state.get("scheduler_pid")):
+            return True
+    return False
 
 
 def _pid_is_running(value: object) -> bool:
@@ -1027,3 +1347,12 @@ def _pid_is_running(value: object) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _wait_for_pid_exit(pid: int, *, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(poll_interval)
+    return not _pid_is_running(pid)

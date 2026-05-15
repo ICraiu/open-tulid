@@ -6,11 +6,13 @@ import re
 import secrets
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
+import fcntl
 
 from open_tulid.domain import (
     DomainError,
@@ -152,10 +154,13 @@ class JsonlEventStore:
 
     def append(self, event: EventEnvelope) -> EventAppendResult:
         try:
-            path = self._path_for(event)
-            line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
-            self._append_lines(path, (line,))
-            self._append_lines(self._human_path_for(event), (_human_event_line(event),))
+            with self._locked():
+                path = self._path_for(event)
+                if self._event_id_exists_unlocked(event.event_id):
+                    return EventAppendResult(path=path)
+                line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
+                self._append_lines(path, (line,))
+                self._append_lines(self._human_path_for(event), (_human_event_line(event),))
         except (OSError, TypeError, ValueError) as exc:
             return EventAppendResult(error=DomainError(
                 code="event.append_failed",
@@ -165,41 +170,31 @@ class JsonlEventStore:
         return EventAppendResult(path=path)
 
     def append_many(self, events: tuple[EventEnvelope, ...]) -> EventAppendResult:
-        prepared: dict[Path, list[str]] = {}
-        human_prepared: dict[Path, list[str]] = {}
         try:
-            for event in events:
-                path = self._path_for(event)
-                line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
-                prepared.setdefault(path, []).append(line)
-                human_prepared.setdefault(self._human_path_for(event), []).append(_human_event_line(event))
-        except (TypeError, ValueError) as exc:
+            with self._locked():
+                prepared: dict[Path, list[str]] = {}
+                human_prepared: dict[Path, list[str]] = {}
+                existing_ids = self._event_ids_unlocked()
+                for event in events:
+                    if event.event_id in existing_ids:
+                        continue
+                    path = self._path_for(event)
+                    line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
+                    prepared.setdefault(path, []).append(line)
+                    human_prepared.setdefault(self._human_path_for(event), []).append(_human_event_line(event))
+                    existing_ids.add(event.event_id)
+                last_path: Path | None = None
+                for path, lines in prepared.items():
+                    self._append_lines(path, tuple(lines))
+                    last_path = path
+                for path, lines in human_prepared.items():
+                    self._append_lines(path, tuple(lines))
+        except (OSError, TypeError, ValueError) as exc:
             return EventAppendResult(error=DomainError(
                 code="event.append_failed",
                 message=f"Cannot append event batch: {exc}",
                 location=str(self.root),
             ))
-
-        last_path: Path | None = None
-        for path, lines in prepared.items():
-            try:
-                self._append_lines(path, tuple(lines))
-            except OSError as exc:
-                return EventAppendResult(error=DomainError(
-                    code="event.append_failed",
-                    message=f"Cannot append event batch: {exc}",
-                    location=str(path),
-                ))
-            last_path = path
-        for path, lines in human_prepared.items():
-            try:
-                self._append_lines(path, tuple(lines))
-            except OSError as exc:
-                return EventAppendResult(error=DomainError(
-                    code="event.append_failed",
-                    message=f"Cannot append human-readable event batch: {exc}",
-                    location=str(path),
-                ))
         return EventAppendResult(path=last_path)
 
     def iter_events(self) -> tuple[EventEnvelope, ...]:
@@ -261,6 +256,22 @@ class JsonlEventStore:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date):
             raise ValueError("event timestamp must start with YYYY-MM-DD")
         return self.root / f"{event_date}.log"
+
+    def _event_id_exists_unlocked(self, event_id: str) -> bool:
+        return event_id in self._event_ids_unlocked()
+
+    def _event_ids_unlocked(self) -> set[str]:
+        return {event.event_id for event in self.iter_events()}
+
+    @contextmanager
+    def _locked(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".lock").open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class TransactionJournalStore:

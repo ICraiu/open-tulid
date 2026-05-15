@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
@@ -8,12 +9,14 @@ from threading import Thread
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.containers.runtime import AgentRunResult, request_for_worker, run_agent_container
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
-from open_tulid.models import ProjectConfig, RuntimeConfig
+from open_tulid.models import ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime.completion import CompletionService
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
 from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver
+from open_tulid.runtime.resources import FileResourceLeaseStore
+from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
 from open_tulid.runtime.workspaces import WorkspacePreparer
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -43,6 +46,10 @@ class JobExecutor:
         project_config: ProjectConfig,
         journal_store: TransactionJournalStore | None = None,
         artifact_root: Path | None = None,
+        lease_store: FileResourceLeaseStore | None = None,
+        resources: dict[str, ResourceConfig] | None = None,
+        model_proxy_sessions: ModelProxySessionStore | FileModelProxySessionStore | None = None,
+        model_proxy_endpoint_base: str | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -52,6 +59,10 @@ class JobExecutor:
         self.project_config = project_config
         self.journal_store = journal_store
         self.artifact_root = artifact_root
+        self.lease_store = lease_store
+        self.resources = resources or {}
+        self.model_proxy_sessions = model_proxy_sessions
+        self.model_proxy_endpoint_base = model_proxy_endpoint_base
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -73,103 +84,170 @@ class JobExecutor:
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
 
-        endpoint = self._start_completion_endpoint(job.job_id)
-        prepared = WorkspacePreparer(repo_root=self.project_config.repo_root).prepare(
-            job=job,
-            task=task_result.task,
-            transition=transition,
-            completion_endpoint=endpoint.url,
-        )
-        if not prepared.accepted or prepared.workspace is None:
-            endpoint.stop()
-            return ExecutorRunResult(False, errors=(prepared.error or _error("workspace.prepare_failed", "Workspace failed."),))
+        required_resources = self.runtime.worker_resources.get(job.worker_id, ())
+        lease_acquired = False
+        if required_resources and self.lease_store is not None:
+            if not self.lease_store.job_holds(required_resources, job.job_id):
+                lease_result = self.lease_store.try_acquire(
+                    required_resources,
+                    job_id=job.job_id,
+                    worker_id=job.worker_id,
+                    owner_path=self.job_store.path_for(job.job_id),
+                )
+                if not lease_result.acquired:
+                    return ExecutorRunResult(False, errors=(_error(
+                        "resource.busy",
+                        f"Execution job {job.job_id!r} requires busy resources: "
+                        f"{', '.join(lease_result.busy_resources)}.",
+                        job.job_id,
+                    ),))
+            lease_acquired = True
 
-        prompt_packet = None
-        prompt_text = _build_runtime_prompt(
-            job_id=job.job_id,
-            task_title=task_result.task.title,
-            task_body=task_result.task.body,
-            transition_id=transition.id,
-            from_state=transition.from_state,
-            to_state=transition.to_state,
-            required_artifacts=transition.requires.artifacts,
-            required_validations=tuple(call.type for call in transition.requires.validations),
-            completion_endpoint=endpoint.url,
-        )
-        project_root = _adapter_project_root(self.adapter)
-        if project_root is not None:
-            prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
-                worker=worker,
-                transition=transition,
-            )
-            if not prompt_result.accepted:
-                endpoint.stop()
-                return ExecutorRunResult(False, errors=prompt_result.errors)
-            prompt_packet = prompt_result.packet
-            if prompt_packet is not None:
-                prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
-        prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
-
-        self.job_store.update_status(
-            job.job_id,
-            ExecutionJobStatus.RUNNING,
-            metadata={
-                "workspace_prepared": True,
-                "completion_endpoint": endpoint.url,
-                "completion_endpoint_host": endpoint.host,
-                "completion_endpoint_port": endpoint.port,
-                "prompt_packet_sha256": prompt_sha256,
-                "instruction_packet_sha256": prompt_packet.sha256 if prompt_packet is not None else None,
-            },
-            increment_attempts=True,
-        )
-        self.event_store.append(build_event(
-            project_id=job.project_id,
-            actor=EventActor(type="system", id="executor"),
-            event_type=EventType.ExecutionStarted,
-            correlation_id=job.job_id,
-            task_id=job.task_id,
-            job_id=job.job_id,
-            transition_id=job.transition_id,
-            data={"worker_id": job.worker_id, "workspace_path": str(prepared.workspace)},
-        ))
-
-        request = request_for_worker(
-            worker_id=job.worker_id,
-            workspace=prepared.workspace,
-            runtime=self.runtime,
-            args=_worker_args(
-                runtime=self.runtime,
-                worker_id=job.worker_id,
-                container_workspace=self.runtime.container_workspace,
-                completion_endpoint=endpoint.url,
-            ),
-            env={
-                "OPEN_TULID_JOB_ID": job.job_id,
-                "OPEN_TULID_COMPLETION_TOKEN": str(job.metadata.get("completion_token", "")),
-                "OPEN_TULID_OUTPUT_DIR": f"{self.runtime.container_workspace}/output",
-                "OPEN_TULID_COMPLETION_ENDPOINT": endpoint.url,
-                "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
-            },
-        )
         try:
-            result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
-        finally:
-            endpoint.stop()
-        _write_run_logs(Path(job.workspace_path), result)
-        loaded_after_run = self.job_store.get(job.job_id)
-        status_after_run = (
-            str(loaded_after_run.job.status.value if hasattr(loaded_after_run.job.status, "value") else loaded_after_run.job.status)
-            if loaded_after_run.accepted and loaded_after_run.job is not None
-            else ""
-        )
-        if status_after_run == ExecutionJobStatus.ACCEPTED.value:
+            endpoint = self._start_completion_endpoint(job.job_id)
+            prepared = WorkspacePreparer(repo_root=self.project_config.repo_root).prepare(
+                job=job,
+                task=task_result.task,
+                transition=transition,
+                completion_endpoint=endpoint.url,
+            )
+            if not prepared.accepted or prepared.workspace is None:
+                endpoint.stop()
+                return self._fail_before_run(
+                    job,
+                    prepared.error or _error("workspace.prepare_failed", "Workspace failed."),
+                )
+
+            prompt_packet = None
+            prompt_text = _build_runtime_prompt(
+                job_id=job.job_id,
+                task_title=task_result.task.title,
+                task_body=task_result.task.body,
+                transition_id=transition.id,
+                from_state=transition.from_state,
+                to_state=transition.to_state,
+                required_artifacts=transition.requires.artifacts,
+                required_validations=tuple(call.type for call in transition.requires.validations),
+                completion_endpoint=endpoint.url,
+            )
+            project_root = _adapter_project_root(self.adapter)
+            if project_root is not None:
+                prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
+                    worker=worker,
+                    transition=transition,
+                )
+                if not prompt_result.accepted:
+                    endpoint.stop()
+                    return self._fail_before_run(
+                        job,
+                        prompt_result.errors[0] if prompt_result.errors else _error(
+                            "instructions.invalid",
+                            "Prompt instructions failed.",
+                        ),
+                    )
+                prompt_packet = prompt_result.packet
+                if prompt_packet is not None:
+                    prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
+            prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
+
+            self.job_store.update_status(
+                job.job_id,
+                ExecutionJobStatus.RUNNING,
+                metadata={
+                    "workspace_prepared": True,
+                    "completion_endpoint": endpoint.url,
+                    "completion_endpoint_host": endpoint.host,
+                    "completion_endpoint_port": endpoint.port,
+                    "prompt_packet_sha256": prompt_sha256,
+                    "instruction_packet_sha256": prompt_packet.sha256 if prompt_packet is not None else None,
+                },
+                increment_attempts=True,
+            )
+            self.event_store.append(build_event(
+                project_id=job.project_id,
+                actor=EventActor(type="system", id="executor"),
+                event_type=EventType.ExecutionStarted,
+                correlation_id=job.job_id,
+                task_id=job.task_id,
+                job_id=job.job_id,
+                transition_id=job.transition_id,
+                data={"worker_id": job.worker_id, "workspace_path": str(prepared.workspace)},
+            ))
+
+            request = request_for_worker(
+                worker_id=job.worker_id,
+                workspace=prepared.workspace,
+                runtime=self.runtime,
+                args=_worker_args(
+                    runtime=self.runtime,
+                    worker_id=job.worker_id,
+                    container_workspace=self.runtime.container_workspace,
+                    completion_endpoint=endpoint.url,
+                ),
+                env={
+                    "OPEN_TULID_JOB_ID": job.job_id,
+                    "OPEN_TULID_COMPLETION_TOKEN": str(job.metadata.get("completion_token", "")),
+                    "OPEN_TULID_OUTPUT_DIR": f"{self.runtime.container_workspace}/output",
+                    "OPEN_TULID_COMPLETION_ENDPOINT": endpoint.url,
+                    "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
+                    **self._model_proxy_env(job.job_id, job.worker_id, required_resources),
+                },
+            )
+            try:
+                result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
+            finally:
+                endpoint.stop()
+            _write_run_logs(Path(job.workspace_path), result)
+            loaded_after_run = self.job_store.get(job.job_id)
+            status_after_run = (
+                str(
+                    loaded_after_run.job.status.value
+                    if hasattr(loaded_after_run.job.status, "value")
+                    else loaded_after_run.job.status
+                )
+                if loaded_after_run.accepted and loaded_after_run.job is not None
+                else ""
+            )
+            if status_after_run == ExecutionJobStatus.ACCEPTED.value:
+                return ExecutorRunResult(True, run=result)
+            if not result.succeeded:
+                self.job_store.update_status(
+                    job.job_id,
+                    ExecutionJobStatus.FAILED,
+                    metadata={"worker_returncode": result.returncode},
+                )
+                self.event_store.append(build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="system", id="executor"),
+                    event_type=EventType.ExecutionFailed,
+                    correlation_id=job.job_id,
+                    task_id=job.task_id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    data={"returncode": result.returncode},
+                ))
+            else:
+                self.job_store.update_status(
+                    job.job_id,
+                    ExecutionJobStatus.FAILED,
+                    metadata={"worker_returncode": result.returncode, "failure_reason": "completion_not_accepted"},
+                )
+                self.event_store.append(build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="system", id="executor"),
+                    event_type=EventType.ExecutionFailed,
+                    correlation_id=job.job_id,
+                    task_id=job.task_id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    data={"returncode": result.returncode, "reason": "completion_not_accepted"},
+                ))
             return ExecutorRunResult(True, run=result)
-        if not result.succeeded:
+        except Exception as exc:
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.FAILED,
-                metadata={"worker_returncode": result.returncode},
+                metadata={"failure_reason": "executor_exception", "failure_detail": str(exc)},
             )
             self.event_store.append(build_event(
                 project_id=job.project_id,
@@ -179,25 +257,18 @@ class JobExecutor:
                 task_id=job.task_id,
                 job_id=job.job_id,
                 transition_id=job.transition_id,
-                data={"returncode": result.returncode},
+                data={"reason": "executor_exception", "detail": str(exc)},
             ))
-        else:
-            self.job_store.update_status(
+            return ExecutorRunResult(False, errors=(_error(
+                "executor.exception",
+                f"Execution job {job.job_id!r} failed unexpectedly: {exc}",
                 job.job_id,
-                ExecutionJobStatus.FAILED,
-                metadata={"worker_returncode": result.returncode, "failure_reason": "completion_not_accepted"},
-            )
-            self.event_store.append(build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="executor"),
-                event_type=EventType.ExecutionFailed,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
-                data={"returncode": result.returncode, "reason": "completion_not_accepted"},
-            ))
-        return ExecutorRunResult(True, run=result)
+            ),))
+        finally:
+            if lease_acquired and self.lease_store is not None:
+                self.lease_store.release_job(job.job_id)
+            if self.model_proxy_sessions is not None:
+                self.model_proxy_sessions.revoke_job(job.job_id)
 
     def _start_completion_endpoint(self, job_id: str) -> "_ManagedCompletionEndpoint":
         service = CompletionService(
@@ -226,6 +297,61 @@ class JobExecutor:
             port=int(port),
             url=f"http://{self.runtime.completion_container_host}:{port}/jobs/{job_id}/complete",
         )
+
+    def _fail_before_run(self, job, error: DomainError) -> ExecutorRunResult:
+        self.job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.FAILED,
+            metadata={"failure_reason": error.code, "failure_detail": error.message},
+        )
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="executor"),
+            event_type=EventType.ExecutionFailed,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            data={"reason": error.code, "detail": error.message},
+        ))
+        return ExecutorRunResult(False, errors=(error,))
+
+    def _model_proxy_env(
+        self,
+        job_id: str,
+        worker_id: str,
+        required_resources: tuple[str, ...],
+    ) -> dict[str, str]:
+        if self.model_proxy_sessions is None or self.model_proxy_endpoint_base is None:
+            return {}
+        endpoints: list[dict[str, str]] = []
+        for resource_id in required_resources:
+            resource = self.resources.get(resource_id)
+            if resource is None or resource.proxy is None:
+                continue
+            session = self.model_proxy_sessions.issue(
+                job_id=job_id,
+                worker_id=worker_id,
+                proxy_id=resource.proxy,
+                resource_id=resource_id,
+            )
+            endpoints.append({
+                "resource_id": resource_id,
+                "endpoint": f"{self.model_proxy_endpoint_base.rstrip('/')}/proxies/{resource.proxy}",
+                "token": session.token,
+                "proxy_id": resource.proxy,
+            })
+        if not endpoints:
+            return {}
+        env = {"OPEN_TULID_MODEL_ENDPOINTS": json.dumps(endpoints, sort_keys=True)}
+        if len(endpoints) == 1:
+            endpoint = endpoints[0]
+            env.update({
+                "OPEN_TULID_MODEL_ENDPOINT": endpoint["endpoint"],
+                "OPEN_TULID_MODEL_SESSION_TOKEN": endpoint["token"],
+                "OPEN_TULID_MODEL_PROXY_ID": endpoint["proxy_id"],
+            })
+        return env
 
 
 @dataclass(frozen=True)

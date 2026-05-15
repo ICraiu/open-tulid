@@ -272,8 +272,20 @@ class TestConfigLoading:
             'codex = "registry.local/codex:dev"\n'
             '\n[runtime.worker_args]\n'
             'codex = ["exec", "{prompt_packet}"]\n'
+            '\n[runtime.worker_resources]\n'
+            'codex = ["remote-llm"]\n'
+            '\n[runtime.worker_types]\n'
+            'codex = "codex"\n'
             '\n[runtime.env]\n'
-            'OPEN_TULID_ENV = "test"\n',
+            'OPEN_TULID_ENV = "test"\n'
+            '\n[model_proxy.openai]\n'
+            'kind = "openai"\n'
+            'base_url = "https://api.openai.com/v1"\n'
+            'api_key_env = "OPENAI_API_KEY"\n'
+            '\n[resources.remote-llm]\n'
+            'kind = "model"\n'
+            'capacity = 1\n'
+            'proxy = "openai"\n',
             encoding="utf-8",
         )
         original = os.getcwd()
@@ -287,11 +299,16 @@ class TestConfigLoading:
             assert config.runtime.shared_workspace_root == workspaces
             assert config.runtime.worker_images == {"codex": "registry.local/codex:dev"}
             assert config.runtime.worker_args == {"codex": ("exec", "{prompt_packet}")}
+            assert config.runtime.worker_resources == {"codex": ("remote-llm",)}
+            assert config.runtime.worker_types == {"codex": "codex"}
             assert config.runtime.completion_host == "127.0.0.1"
             assert config.runtime.completion_port == 8765
             assert config.runtime.completion_container_host == "host.test"
             assert config.runtime.container_volume_relabel is True
             assert config.runtime.env == {"OPEN_TULID_ENV": "test"}
+            assert config.resources["remote-llm"].capacity == 1
+            assert config.resources["remote-llm"].proxy == "openai"
+            assert config.model_proxy["openai"].api_key_env == "OPENAI_API_KEY"
         finally:
             os.chdir(original)
 
@@ -303,6 +320,34 @@ class TestConfigLoading:
             f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
             '\n[runtime.env]\n'
             'OPENAI_API_KEY = "secret"\n',
+            encoding="utf-8",
+        )
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_vault)
+            with pytest.raises(SystemExit) as exc_info:
+                load_config()
+            assert exc_info.value.code == 2
+        finally:
+            os.chdir(original)
+
+    def test_config_rejects_codex_worker_bound_to_local_model_proxy(self, tmp_vault: Path):
+        config_dir = tmp_vault / CONFIG_DIRNAME
+        config_dir.mkdir()
+        cfg = config_dir / CONFIG_FILENAME
+        cfg.write_text(
+            f'[vault]\nroot = "{tmp_vault}"\nprojects = ["Agent"]\n'
+            '\n[runtime.worker_resources]\n'
+            'codex = ["local-llm"]\n'
+            '\n[runtime.worker_types]\n'
+            'codex = "codex"\n'
+            '\n[model_proxy.local]\n'
+            'kind = "local"\n'
+            'base_url = "http://127.0.0.1:8080/v1"\n'
+            '\n[resources.local-llm]\n'
+            'kind = "model"\n'
+            'capacity = 1\n'
+            'proxy = "local"\n',
             encoding="utf-8",
         )
         original = os.getcwd()

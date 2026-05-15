@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
 from open_tulid.containers.runtime import AgentRunResult
 from open_tulid.domain import (
+    DomainError,
     ExecutionJob,
     ProjectSnapshot,
     RequirementDefinition,
@@ -19,8 +20,8 @@ from open_tulid.domain import (
     TransitionDefinition,
     WorkflowDefinition,
 )
-from open_tulid.models import ProjectConfig, RuntimeConfig
-from open_tulid.runtime import FileExecutionJobStore, JobExecutor, JsonlEventStore
+from open_tulid.models import ProjectConfig, ResourceConfig, RuntimeConfig
+from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -138,6 +139,234 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     loaded = store.get(JOB_ID)
     assert loaded.job is not None
     assert loaded.job.status == "accepted"
+
+
+def test_executor_releases_resource_lease_when_worker_fails(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"local-llm": ResourceConfig(kind="model", capacity=1)},
+    )
+
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.run_agent_container",
+        lambda request, *, docker_executable: AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=17,
+        ),
+    )
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_resources={"codex": ("local-llm",)},
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        lease_store=leases,
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert leases.leases_for("local-llm") == ()
+
+
+def test_executor_marks_job_failed_when_internal_error_occurs_after_running(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.run_agent_container",
+        lambda request, *, docker_executable: (_ for _ in ()).throw(RuntimeError("docker exploded")),
+    )
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+    loaded = store.get(JOB_ID)
+
+    assert result.accepted is False
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "executor_exception"
+    assert [event.event_type for event in events.iter_events()] == ["ExecutionStarted", "ExecutionFailed"]
+
+
+def test_executor_marks_job_failed_when_workspace_preparation_fails(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    from open_tulid.runtime.workspaces import WorkspacePrepareResult
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.WorkspacePreparer.prepare",
+        lambda self, **kwargs: WorkspacePrepareResult(error=DomainError(
+            code="workspace.prepare_failed",
+            message="cannot prepare",
+        )),
+    )
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+    loaded = store.get(JOB_ID)
+
+    assert result.accepted is False
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "workspace.prepare_failed"
+    assert [event.event_type for event in events.iter_events()] == ["ExecutionFailed"]
+
+
+def test_executor_passes_scoped_model_proxy_session_to_worker(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"remote-llm": ResourceConfig(kind="model", capacity=1, proxy="openai")},
+    )
+    from open_tulid.runtime import ModelProxySessionStore
+    sessions = ModelProxySessionStore()
+    seen = {}
+
+    def fake_run(request, *, docker_executable):
+        seen.update(request.env)
+        return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=1)
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run)
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_resources={"codex": ("remote-llm",)},
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        lease_store=leases,
+        resources={"remote-llm": ResourceConfig(kind="model", capacity=1, proxy="openai")},
+        model_proxy_sessions=sessions,
+        model_proxy_endpoint_base="http://host.docker.internal:8787",
+    )
+
+    executor.run(JOB_ID)
+
+    assert seen["OPEN_TULID_MODEL_ENDPOINT"] == "http://host.docker.internal:8787/proxies/openai"
+    assert seen["OPEN_TULID_MODEL_PROXY_ID"] == "openai"
+    assert seen["OPEN_TULID_MODEL_SESSION_TOKEN"]
+    assert sessions.get(seen["OPEN_TULID_MODEL_SESSION_TOKEN"]) is None
+
+
+def test_executor_passes_all_required_model_proxy_sessions(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {
+            "remote-a": ResourceConfig(kind="model", capacity=1, proxy="openai-a"),
+            "remote-b": ResourceConfig(kind="model", capacity=1, proxy="openai-b"),
+        },
+    )
+    from open_tulid.runtime import ModelProxySessionStore
+    sessions = ModelProxySessionStore()
+    seen = {}
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.run_agent_container",
+        lambda request, *, docker_executable: seen.update(request.env) or AgentRunResult(
+            agent_id=request.agent_id, image=request.image, command=("fake",), returncode=1,
+        ),
+    )
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_resources={"codex": ("remote-a", "remote-b")},
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        lease_store=leases,
+        resources={
+            "remote-a": ResourceConfig(kind="model", capacity=1, proxy="openai-a"),
+            "remote-b": ResourceConfig(kind="model", capacity=1, proxy="openai-b"),
+        },
+        model_proxy_sessions=sessions,
+        model_proxy_endpoint_base="http://host.docker.internal:8787",
+    )
+
+    executor.run(JOB_ID)
+
+    endpoints = json.loads(seen["OPEN_TULID_MODEL_ENDPOINTS"])
+    assert [item["proxy_id"] for item in endpoints] == ["openai-a", "openai-b"]
+    assert "OPEN_TULID_MODEL_ENDPOINT" not in seen
 
 
 def _workflow() -> WorkflowDefinition:

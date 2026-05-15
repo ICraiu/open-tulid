@@ -38,6 +38,7 @@ class CreateExecutionJob:
     task_id: str
     transition_id: str
     workspace_root: Path
+    job_id: str | None = None
     actor: EventActor = field(default_factory=lambda: EventActor(type="system", id="task-manager"))
 
 
@@ -164,7 +165,7 @@ class TaskManager:
                 f"Transition {transition.id!r} has no worker.",
                 transition.id,
             ),))
-        job_id = new_ulid()
+        job_id = command.job_id or new_ulid()
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
         job = ExecutionJob(

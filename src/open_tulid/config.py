@@ -9,7 +9,14 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from open_tulid.models import Config, ProjectConfig, RuntimeConfig
+from open_tulid.models import (
+    Config,
+    ModelProxyConfig,
+    ModelProxyServerConfig,
+    ProjectConfig,
+    ResourceConfig,
+    RuntimeConfig,
+)
 
 
 CONFIG_DIRNAME = ".tuluid"
@@ -83,6 +90,11 @@ def load_config(path: Path | None = None) -> Config:
 
     workflow_path = _load_workflow_path(data, config_dir)
     runtime = _load_runtime_config(data, config_dir)
+    resources = _load_resources(data)
+    model_proxy = _load_model_proxy(data)
+    model_proxy_server = _load_model_proxy_server(data, config_dir)
+    _validate_resource_proxy_refs(resources, model_proxy)
+    _validate_worker_resource_compatibility(runtime, resources, model_proxy)
 
     return Config(
         vault_root=vault_root,
@@ -91,6 +103,9 @@ def load_config(path: Path | None = None) -> Config:
         workflow_path=workflow_path,
         project_configs=project_configs,
         runtime=runtime,
+        resources=resources,
+        model_proxy=model_proxy,
+        model_proxy_server=model_proxy_server,
     )
 
 
@@ -229,6 +244,10 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
 
     worker_images = _runtime_string_map(raw.get("worker_images", {}), "runtime.worker_images")
     worker_args = _runtime_string_sequence_map(raw.get("worker_args", {}), "runtime.worker_args")
+    worker_resources = _runtime_string_sequence_map(
+        raw.get("worker_resources", {}), "runtime.worker_resources",
+    )
+    worker_types = _runtime_string_map(raw.get("worker_types", {}), "runtime.worker_types")
     env = _runtime_string_map(raw.get("env", {}), "runtime.env")
     completion_host = _runtime_string(
         raw, "completion_host", default="0.0.0.0", table="runtime",
@@ -253,12 +272,129 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         default_timeout_seconds=timeout,
         worker_images=worker_images,
         worker_args=worker_args,
+        worker_resources=worker_resources,
+        worker_types=worker_types,
         env=env,
         completion_host=completion_host,
         completion_port=completion_port,
         completion_container_host=completion_container_host,
         container_volume_relabel=container_volume_relabel,
     )
+
+
+def _load_resources(data: dict) -> dict[str, ResourceConfig]:
+    raw = data.get("resources", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        _fail("[resources] must be a table when present")
+    resources: dict[str, ResourceConfig] = {}
+    for name, item in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            _fail("resources keys must be non-empty strings")
+        if not isinstance(item, dict):
+            _fail(f"resources.{name} must be a table")
+        kind = _required_table_string(item, "kind", f"resources.{name}")
+        capacity = item.get("capacity")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            _fail(f"resources.{name}.capacity must be a positive integer")
+        proxy = item.get("proxy")
+        if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
+            _fail(f"resources.{name}.proxy must be a non-empty string")
+        resources[name.strip()] = ResourceConfig(kind=kind, capacity=capacity, proxy=proxy.strip() if proxy else None)
+    return resources
+
+
+def _load_model_proxy(data: dict) -> dict[str, ModelProxyConfig]:
+    raw = data.get("model_proxy", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        _fail("[model_proxy] must be a table when present")
+    proxies: dict[str, ModelProxyConfig] = {}
+    for name, item in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            _fail("model_proxy keys must be non-empty strings")
+        if not isinstance(item, dict):
+            _fail(f"model_proxy.{name} must be a table")
+        kind = _required_table_string(item, "kind", f"model_proxy.{name}")
+        if kind not in {"local", "openai"}:
+            _fail(f"model_proxy.{name}.kind must be local or openai")
+        base_url = _required_table_string(item, "base_url", f"model_proxy.{name}")
+        api_key_env = item.get("api_key_env")
+        if api_key_env is not None and (not isinstance(api_key_env, str) or not api_key_env.strip()):
+            _fail(f"model_proxy.{name}.api_key_env must be a non-empty string")
+        if kind == "openai" and api_key_env is None:
+            _fail(f"model_proxy.{name}.api_key_env is required for openai proxies")
+        proxies[name.strip()] = ModelProxyConfig(
+            kind=kind,
+            base_url=base_url,
+            api_key_env=api_key_env.strip() if isinstance(api_key_env, str) else None,
+        )
+    return proxies
+
+
+def _load_model_proxy_server(data: dict, config_dir: Path) -> ModelProxyServerConfig:
+    raw = data.get("model_proxy_server", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        _fail("[model_proxy_server] must be a table when present")
+    host = _runtime_string(raw, "host", default="0.0.0.0", table="model_proxy_server")
+    port = raw.get("port", 8787)
+    if isinstance(port, bool) or not isinstance(port, int) or port < 0 or port > 65535:
+        _fail("model_proxy_server.port must be between 0 and 65535")
+    log_root = _runtime_optional_path(raw, "log_root", config_dir, table="model_proxy_server")
+    body_logging = _runtime_string(raw, "body_logging", default="metadata", table="model_proxy_server")
+    if body_logging not in {"none", "metadata", "full"}:
+        _fail("model_proxy_server.body_logging must be none, metadata, or full")
+    return ModelProxyServerConfig(host=host, port=port, log_root=log_root, body_logging=body_logging)
+
+
+def _validate_resource_proxy_refs(
+    resources: dict[str, ResourceConfig],
+    proxies: dict[str, ModelProxyConfig],
+) -> None:
+    for name, resource in resources.items():
+        if resource.proxy is not None and resource.proxy not in proxies:
+            _fail(f"resources.{name}.proxy references unknown model_proxy {resource.proxy!r}")
+
+
+def _validate_worker_resource_compatibility(
+    runtime: RuntimeConfig,
+    resources: dict[str, ResourceConfig],
+    proxies: dict[str, ModelProxyConfig],
+) -> None:
+    allowed_proxy_kinds = {
+        "codex": {"openai"},
+        "opencode": {"local", "openai"},
+    }
+    for worker_id, resource_ids in runtime.worker_resources.items():
+        worker_type = runtime.worker_types.get(worker_id)
+        if worker_type is None:
+            _fail(f"runtime.worker_types.{worker_id} is required when worker resources are configured")
+        allowed = allowed_proxy_kinds.get(worker_type)
+        if allowed is None:
+            _fail(f"runtime.worker_types.{worker_id} has unsupported worker type {worker_type!r}")
+        for resource_id in resource_ids:
+            resource = resources.get(resource_id)
+            if resource is None:
+                _fail(f"runtime.worker_resources.{worker_id} references unknown resource {resource_id!r}")
+            if resource.proxy is None:
+                continue
+            proxy = proxies[resource.proxy]
+            if proxy.kind not in allowed:
+                _fail(
+                    f"runtime.worker_resources.{worker_id} uses model_proxy kind "
+                    f"{proxy.kind!r}, but worker type {worker_type!r} requires one of {sorted(allowed)!r}"
+                )
+
+
+def _required_table_string(raw: dict, key: str, table: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        _fail(f"{table}.{key} must be a non-empty string")
+    return value.strip()
 
 
 def _runtime_string(raw: dict, key: str, *, default: str, table: str) -> str:

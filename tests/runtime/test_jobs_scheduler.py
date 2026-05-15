@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from multiprocessing import get_context
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
 from open_tulid.domain import (
     BoardPosition,
+    DomainError,
     ExecutionJob,
     ProjectSnapshot,
     RequirementDefinition,
@@ -17,7 +19,15 @@ from open_tulid.domain import (
     TransitionDefinition,
     WorkflowDefinition,
 )
-from open_tulid.runtime import FileExecutionJobStore, Scheduler
+from open_tulid.models import ResourceConfig
+from open_tulid.runtime import (
+    FileExecutionJobStore,
+    FileResourceLeaseStore,
+    JsonlEventStore,
+    Scheduler,
+    TransactionJournalStore,
+    recover_job_creation_transactions,
+)
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -155,6 +165,34 @@ def test_file_execution_job_store_rejects_duplicate_active_job(tmp_path: Path):
     assert duplicate.error.code == "job.active_exists"
 
 
+def _create_same_active_job(root: str, suffix: str, queue) -> None:
+    store = FileExecutionJobStore(Path(root))
+    result = store.create(ExecutionJob(
+        job_id=f"01J0000000000000000000{suffix}",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(Path(root) / suffix),
+    ))
+    queue.put(result.accepted)
+
+
+def test_file_execution_job_store_rejects_duplicate_active_job_across_processes(tmp_path: Path):
+    ctx = get_context("fork")
+    queue = ctx.Queue()
+    root = tmp_path / "jobs"
+    first = ctx.Process(target=_create_same_active_job, args=(str(root), "JOB", queue))
+    second = ctx.Process(target=_create_same_active_job, args=(str(root), "J02", queue))
+
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert sorted((queue.get(), queue.get())) == [False, True]
+
+
 def test_scheduler_creates_first_runnable_job_in_board_order(tmp_path: Path):
     blocked = Task(
         id="01J00000000000000000000002",
@@ -214,3 +252,162 @@ def test_scheduler_skips_when_active_job_exists(tmp_path: Path):
     assert result.accepted is True
     assert result.scheduled is False
     assert result.skipped[0].code == "job.active_exists"
+
+
+def test_scheduler_defers_task_when_required_resource_is_busy(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"local-llm": ResourceConfig(kind="model", capacity=1)},
+    )
+    assert leases.try_acquire(("local-llm",), job_id="existing", worker_id="codex").acquired is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        lease_store=leases,
+        worker_resources={"codex": ("local-llm",)},
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "resource.busy"
+    assert store.list().jobs == ()
+
+
+def test_scheduler_reserves_resource_for_created_job(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"local-llm": ResourceConfig(kind="model", capacity=1)},
+    )
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        lease_store=leases,
+        worker_resources={"codex": ("local-llm",)},
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.scheduled is True
+    assert result.job is not None
+    assert leases.job_holds(("local-llm",), result.job.job_id) is True
+
+
+def test_scheduler_transactionally_persists_creation_events(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        event_store=JsonlEventStore(tmp_path / "events"),
+        journal_store=TransactionJournalStore(tmp_path / "events" / "journals"),
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.scheduled is True
+    assert result.events_persisted is True
+    assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()] == [
+        "TransitionAccepted",
+        "ExecutionJobCreated",
+    ]
+    journals = TransactionJournalStore(tmp_path / "events" / "journals").iter_journals()
+    assert len(journals) == 1
+    assert journals[0].status == "committed"
+
+
+def test_recover_job_creation_transactions_finishes_prepared_creation(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    event_store = JsonlEventStore(tmp_path / "events")
+    journal_store = TransactionJournalStore(tmp_path / "events" / "journals")
+    planner = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+    planned = planner.schedule_one("Agent")
+    assert planned.job is not None
+    assert store.get(planned.job.job_id).accepted is True
+    prepared = journal_store.prepare(
+        journal_id="01J00000000000000000000JRN",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        effects=planned.events and ({"type": "create_execution_job", "job": {
+            "job_id": planned.job.job_id,
+            "project_id": planned.job.project_id,
+            "task_id": planned.job.task_id,
+            "transition_id": planned.job.transition_id,
+            "worker_id": planned.job.worker_id,
+            "workspace_path": planned.job.workspace_path,
+            "status": str(planned.job.status.value if hasattr(planned.job.status, "value") else planned.job.status),
+            "attempts": planned.job.attempts,
+            "metadata": dict(planned.job.metadata),
+        }},),
+        events=planned.events,
+    )
+    assert prepared.accepted is True
+
+    recovered = recover_job_creation_transactions(
+        job_store=store,
+        event_store=event_store,
+        journal_store=journal_store,
+    )
+
+    assert recovered == ("01J00000000000000000000JRN",)
+    assert [event.event_type for event in event_store.iter_events()] == [
+        "TransitionAccepted",
+        "ExecutionJobCreated",
+    ]
+
+
+def test_recover_job_creation_transactions_ignores_failed_creation(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    event_store = JsonlEventStore(tmp_path / "events")
+    journal_store = TransactionJournalStore(tmp_path / "events" / "journals")
+    planner = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=FileExecutionJobStore(tmp_path / "planned-jobs"),
+        workspace_root=tmp_path / "workspaces",
+    )
+    planned = planner.schedule_one("Agent")
+    assert planned.job is not None
+    prepared = journal_store.prepare(
+        journal_id="01J00000000000000000000JRN",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        effects=({"type": "create_execution_job", "job": {
+            "job_id": planned.job.job_id,
+            "project_id": planned.job.project_id,
+            "task_id": planned.job.task_id,
+            "transition_id": planned.job.transition_id,
+            "worker_id": planned.job.worker_id,
+            "workspace_path": planned.job.workspace_path,
+            "status": str(planned.job.status.value if hasattr(planned.job.status, "value") else planned.job.status),
+            "attempts": planned.job.attempts,
+            "metadata": dict(planned.job.metadata),
+        }},),
+        events=planned.events,
+    )
+    assert prepared.record is not None
+    journal_store.fail(prepared.record, DomainError(code="effect.failed", message="boom"))
+
+    recovered = recover_job_creation_transactions(
+        job_store=store,
+        event_store=event_store,
+        journal_store=journal_store,
+    )
+
+    assert recovered == ()
+    assert store.list().jobs == ()

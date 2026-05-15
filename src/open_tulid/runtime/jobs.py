@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -36,35 +38,36 @@ class FileExecutionJobStore:
         self.root = root
 
     def create(self, job: ExecutionJob) -> JobStoreResult:
-        active = self.find_active(job.project_id, job.task_id, job.transition_id)
-        if not active.accepted:
-            return JobStoreResult(error=active.error)
-        if active.jobs:
-            return JobStoreResult(error=DomainError(
-                code="job.active_exists",
-                message=(
-                    "An active execution job already exists for "
-                    f"task {job.task_id!r} and transition {job.transition_id!r}."
-                ),
-                location=active.jobs[0].job_id,
-            ))
+        with self._locked():
+            active = self.find_active(job.project_id, job.task_id, job.transition_id)
+            if not active.accepted:
+                return JobStoreResult(error=active.error)
+            if active.jobs:
+                return JobStoreResult(error=DomainError(
+                    code="job.active_exists",
+                    message=(
+                        "An active execution job already exists for "
+                        f"task {job.task_id!r} and transition {job.transition_id!r}."
+                    ),
+                    location=active.jobs[0].job_id,
+                ))
 
-        now = utc_now()
-        metadata = dict(job.metadata)
-        metadata.setdefault("created_at", now)
-        metadata.setdefault("updated_at", now)
-        job_to_save = ExecutionJob(
-            job_id=job.job_id,
-            project_id=job.project_id,
-            task_id=job.task_id,
-            transition_id=job.transition_id,
-            worker_id=job.worker_id,
-            workspace_path=job.workspace_path,
-            status=job.status,
-            attempts=job.attempts,
-            metadata=MappingProxyType(metadata),
-        )
-        return self.save(job_to_save)
+            now = utc_now()
+            metadata = dict(job.metadata)
+            metadata.setdefault("created_at", now)
+            metadata.setdefault("updated_at", now)
+            job_to_save = ExecutionJob(
+                job_id=job.job_id,
+                project_id=job.project_id,
+                task_id=job.task_id,
+                transition_id=job.transition_id,
+                worker_id=job.worker_id,
+                workspace_path=job.workspace_path,
+                status=job.status,
+                attempts=job.attempts,
+                metadata=MappingProxyType(metadata),
+            )
+            return self.save(job_to_save)
 
     def save(self, job: ExecutionJob) -> JobStoreResult:
         path = self._path_for(job.job_id)
@@ -179,6 +182,19 @@ class FileExecutionJobStore:
 
     def _path_for(self, job_id: str) -> Path:
         return self.root / job_id / "job.json"
+
+    def path_for(self, job_id: str) -> Path:
+        return self._path_for(job_id)
+
+    @contextmanager
+    def _locked(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".lock").open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _job_to_payload(job: ExecutionJob) -> dict[str, Any]:
