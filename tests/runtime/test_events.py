@@ -79,6 +79,9 @@ class TestJsonlEventStore:
         path = tmp_path / "events" / "2026-05-09.jsonl"
         assert result.path == path
         assert json.loads(path.read_text(encoding="utf-8"))["event_type"] == "TaskMoved"
+        assert (tmp_path / "events" / "2026-05-09.log").read_text(encoding="utf-8") == (
+            ">>> 2026-05-09T12:00:00Z TASK_MOVED\n"
+        )
 
     def test_iter_events_reads_all_jsonl_files_in_order(self, tmp_path: Path):
         store = JsonlEventStore(tmp_path / "events")
@@ -105,6 +108,9 @@ class TestJsonlEventStore:
             "01J00000000000000000000E01",
             "01J00000000000000000000E02",
         ]
+        assert (tmp_path / "events" / "2026-05-08.log").read_text(encoding="utf-8").startswith(
+            ">>> 2026-05-08T12:00:00Z TRANSITION_REQUESTED"
+        )
 
     def test_append_returns_structured_error_for_non_json_payload(self, tmp_path: Path):
         store = JsonlEventStore(tmp_path / "events")

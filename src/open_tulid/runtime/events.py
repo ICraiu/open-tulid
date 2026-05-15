@@ -155,6 +155,7 @@ class JsonlEventStore:
             path = self._path_for(event)
             line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
             self._append_lines(path, (line,))
+            self._append_lines(self._human_path_for(event), (_human_event_line(event),))
         except (OSError, TypeError, ValueError) as exc:
             return EventAppendResult(error=DomainError(
                 code="event.append_failed",
@@ -165,11 +166,13 @@ class JsonlEventStore:
 
     def append_many(self, events: tuple[EventEnvelope, ...]) -> EventAppendResult:
         prepared: dict[Path, list[str]] = {}
+        human_prepared: dict[Path, list[str]] = {}
         try:
             for event in events:
                 path = self._path_for(event)
                 line = json.dumps(event_to_dict(event), sort_keys=True, separators=(",", ":")) + "\n"
                 prepared.setdefault(path, []).append(line)
+                human_prepared.setdefault(self._human_path_for(event), []).append(_human_event_line(event))
         except (TypeError, ValueError) as exc:
             return EventAppendResult(error=DomainError(
                 code="event.append_failed",
@@ -188,6 +191,15 @@ class JsonlEventStore:
                     location=str(path),
                 ))
             last_path = path
+        for path, lines in human_prepared.items():
+            try:
+                self._append_lines(path, tuple(lines))
+            except OSError as exc:
+                return EventAppendResult(error=DomainError(
+                    code="event.append_failed",
+                    message=f"Cannot append human-readable event batch: {exc}",
+                    location=str(path),
+                ))
         return EventAppendResult(path=last_path)
 
     def iter_events(self) -> tuple[EventEnvelope, ...]:
@@ -243,6 +255,12 @@ class JsonlEventStore:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date):
             raise ValueError("event timestamp must start with YYYY-MM-DD")
         return self.root / f"{event_date}.jsonl"
+
+    def _human_path_for(self, event: EventEnvelope) -> Path:
+        event_date = event.timestamp[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date):
+            raise ValueError("event timestamp must start with YYYY-MM-DD")
+        return self.root / f"{event_date}.log"
 
 
 class TransactionJournalStore:
@@ -437,6 +455,22 @@ def _safe_stem(value: str) -> str:
     if Path(value).name != value:
         raise ValueError("journal id must be a safe file stem")
     return value
+
+
+def human_event_type(event_type: EventType | str) -> str:
+    value = event_type.value if isinstance(event_type, EventType) else str(event_type)
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).upper()
+
+
+def _human_event_line(event: EventEnvelope) -> str:
+    parts = [">>>", event.timestamp, human_event_type(event.event_type)]
+    for key in ("task_id", "job_id", "transition_id", "submission_id"):
+        value = getattr(event, key)
+        if value is not None:
+            parts.append(f"{key.removesuffix('_id')}={value}")
+    if event.data:
+        parts.append(f"data={json.dumps(dict(event.data), sort_keys=True, separators=(',', ':'))}")
+    return " ".join(parts) + "\n"
 
 
 def _fsync_directory(path: Path) -> None:

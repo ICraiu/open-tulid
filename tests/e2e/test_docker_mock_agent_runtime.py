@@ -253,12 +253,14 @@ def _print_system_logs(project: Path, capsys: pytest.CaptureFixture[str]) -> Non
                     }, sort_keys=True))
                 continue
             print(text.rstrip() or "<empty>")
+        _print_trusted_task_state(project)
         print("--- end open-tulid e2e system logs ---")
 
 
 def _system_log_paths(project: Path) -> tuple[Path, ...]:
     paths: list[Path] = []
     paths.extend(sorted((project / "jobs").glob("*/job.json")))
+    paths.extend(sorted((project / "events").glob("*.log")))
     paths.extend(sorted((project / "events").glob("*.jsonl")))
     for job_path in sorted((project / "jobs").glob("*/job.json")):
         workspace = Path(json.loads(job_path.read_text(encoding="utf-8"))["workspace_path"])
@@ -269,6 +271,22 @@ def _system_log_paths(project: Path) -> tuple[Path, ...]:
             log_dir / "stderr.log",
         ) if path.exists())
     return tuple(paths)
+
+
+def _print_trusted_task_state(project: Path) -> None:
+    task_path = project / "tasks" / f"{TASK_ID}-healthz.md"
+    board_path = project / "kanban" / "Work.md"
+    print(f"[trusted-state] {task_path}")
+    print(_frontmatter_state(task_path.read_text(encoding="utf-8")))
+    print(f"[trusted-state] {board_path}")
+    print(board_path.read_text(encoding="utf-8").rstrip())
+
+
+def _frontmatter_state(content: str) -> str:
+    for line in content.splitlines():
+        if line.startswith("state:"):
+            return line
+    return "state: <missing>"
 
 
 def _docker_available() -> bool:

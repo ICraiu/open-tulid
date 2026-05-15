@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import signal
+import subprocess
+import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -35,6 +42,7 @@ from open_tulid.runtime import (
     cleanup_job_workspaces,
     serve_completion_endpoint,
     TransactionJournalStore,
+    human_event_type,
 )
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
@@ -110,6 +118,9 @@ app.add_typer(agents_app, name="agents")
 
 install_app = typer.Typer()
 app.add_typer(install_app, name="install")
+
+scheduler_app = typer.Typer()
+app.add_typer(scheduler_app, name="scheduler")
 
 
 @app.command()
@@ -289,7 +300,7 @@ def list_events(
         task_part = f" task={event.task_id}" if event.task_id else ""
         transition_part = f" transition={event.transition_id}" if event.transition_id else ""
         console.print(
-            f"{event.timestamp} {event.event_type} id={event.event_id}"
+            f">>> {event.timestamp} {human_event_type(event.event_type)} id={event.event_id}"
             f"{task_part}{transition_part}"
         )
 
@@ -312,6 +323,22 @@ def event_status(
         if status in {"prepared", "failed"}:
             suffix = f" task={journal.task_id}" if journal.task_id else ""
             console.print(f"{status} {journal.journal_id}{suffix}")
+
+
+@app.command("log")
+def log_events(
+    lines: int | None = typer.Argument(None, min=1, help="Number of recent human log lines to print."),
+    project: str | None = typer.Option(None, "--project", help="Configured project name."),
+) -> None:
+    """Tail human-readable project events, or follow them when no line count is given."""
+    config = _load_cli_config()
+    project_name = _resolve_project_name(config, project)
+    log_dir = _project_path(config, project_name) / "events"
+    if lines is not None:
+        for line in _tail_human_logs(log_dir, lines):
+            console.print(line)
+        return
+    _follow_human_logs(log_dir)
 
 
 @jobs_app.command("schedule")
@@ -564,6 +591,70 @@ def jobs_daemon(
         completed += 1
         if limit is not None and completed >= limit:
             return
+
+
+@scheduler_app.command("start")
+def scheduler_start(
+    project: str | None = typer.Option(None, "--project", help="Configured project name."),
+    interval: float = typer.Option(30.0, "--interval", min=0.1, help="Seconds between scheduler scans."),
+) -> None:
+    """Start the scheduler as a detached background process."""
+    config = _load_cli_config()
+    project_name = _resolve_project_name(config, project)
+    state_path = _scheduler_state_path(config, project_name)
+    state = _load_scheduler_state(state_path)
+    if state is not None and _pid_is_running(state.get("pid")):
+        console.print(f"Scheduler already running for {project_name} pid={state['pid']}")
+        return
+
+    process = subprocess.Popen(
+        [sys.argv[0], "jobs", "daemon", project_name, "--interval", str(interval)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "pid": process.pid,
+        "project": project_name,
+        "interval": interval,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }, sort_keys=True), encoding="utf-8")
+    console.print(f"Scheduler started for {project_name} pid={process.pid}")
+
+
+@scheduler_app.command("stop")
+def scheduler_stop(
+    project: str | None = typer.Option(None, "--project", help="Configured project name."),
+) -> None:
+    """Stop the detached scheduler process."""
+    config = _load_cli_config()
+    project_name = _resolve_project_name(config, project)
+    state_path = _scheduler_state_path(config, project_name)
+    state = _load_scheduler_state(state_path)
+    if state is None or not _pid_is_running(state.get("pid")):
+        state_path.unlink(missing_ok=True)
+        console.print(f"Scheduler is not running for {project_name}")
+        return
+    os.kill(int(state["pid"]), signal.SIGTERM)
+    state_path.unlink(missing_ok=True)
+    console.print(f"Scheduler stopped for {project_name}")
+
+
+@scheduler_app.command("status")
+def scheduler_status(
+    project: str | None = typer.Option(None, "--project", help="Configured project name."),
+) -> None:
+    """Show whether the detached scheduler is running."""
+    config = _load_cli_config()
+    project_name = _resolve_project_name(config, project)
+    state_path = _scheduler_state_path(config, project_name)
+    state = _load_scheduler_state(state_path)
+    if state is None or not _pid_is_running(state.get("pid")):
+        console.print(f"Scheduler not running for {project_name}")
+        return
+    console.print(f"Scheduler running for {project_name} pid={state['pid']}")
 
 
 @jobs_app.command("complete")
@@ -876,3 +967,63 @@ def _parse_artifacts(values) -> tuple[ArtifactSubmission, ...]:
 
 def _status(status) -> str:
     return status.value if hasattr(status, "value") else str(status)
+
+
+def _resolve_project_name(config: Config, project: str | None) -> str:
+    if project is not None:
+        _project_path(config, project)
+        return project
+    if len(config.projects) == 1:
+        return config.projects[0]
+    console.print(Panel("Multiple projects configured. Pass --project.", style="red"))
+    raise typer.Exit(2)
+
+
+def _tail_human_logs(log_dir: Path, lines: int) -> tuple[str, ...]:
+    gathered: list[str] = []
+    for path in sorted(log_dir.glob("*.log")):
+        gathered.extend(path.read_text(encoding="utf-8").splitlines())
+    return tuple(gathered[-lines:])
+
+
+def _follow_human_logs(log_dir: Path, *, poll_interval: float = 0.2) -> None:
+    positions = {
+        path: path.stat().st_size
+        for path in sorted(log_dir.glob("*.log"))
+    }
+    try:
+        while True:
+            for path in sorted(log_dir.glob("*.log")):
+                offset = positions.get(path, 0)
+                with path.open("r", encoding="utf-8") as handle:
+                    handle.seek(offset)
+                    for line in handle:
+                        console.print(line.rstrip("\n"))
+                    positions[path] = handle.tell()
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        return
+
+
+def _scheduler_state_path(config: Config, project: str) -> Path:
+    return _project_path(config, project) / ".open-tulid" / "scheduler.json"
+
+
+def _load_scheduler_state(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _pid_is_running(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

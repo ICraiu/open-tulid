@@ -219,7 +219,11 @@ class CompletionService:
                 job_id=job.job_id,
                 transition_id=job.transition_id,
                 submission_id=submission_id,
-                data={"to_state": transition.to_state},
+                data={
+                    "from_state": transition.from_state,
+                    "to_state": transition.to_state,
+                    "reason": "completion_accepted",
+                },
             ),
             *(
                 build_event(

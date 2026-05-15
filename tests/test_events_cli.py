@@ -56,7 +56,7 @@ def test_events_list_shows_recent_project_events(tmp_path: Path):
         result = runner.invoke(app, ["events", "list", "Agent"])
 
     assert result.exit_code == 0
-    assert "OperationFinished" in result.output
+    assert ">>> 2026-05-09T12:00:00Z OPERATION_FINISHED" in result.output
     assert "task=TASK-1" in result.output
     assert "transition=StartWork" in result.output
 
@@ -80,7 +80,7 @@ def test_events_list_reports_corrupt_records_without_hiding_valid_events(tmp_pat
 
     assert result.exit_code == 0
     assert "Skipped corrupt event" in result.output
-    assert "OperationStarted" in result.output
+    assert "OPERATION_STARTED" in result.output
 
 
 def test_events_status_shows_prepared_and_failed_journals(tmp_path: Path):
