@@ -167,6 +167,56 @@ class TestParseYaml:
         result = build_ast(parsed.value)
         assert any(d.code == "workflow.shape.wrong_type" for d in result.diagnostics)
 
+    def test_changed_files_requirement_is_preserved(self):
+        parsed = parse_yaml("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: task_type
+    id: T
+    requirements:
+      Todo:
+        changed_files:
+          required: true
+""")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is not None
+        task_type = result.document.statements[1]
+        assert task_type.requirements_by_state["Todo"].changed_files_required is True
+
+    def test_changed_files_requirement_rejects_non_boolean_required(self):
+        parsed = parse_yaml("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: task_type
+    id: T
+    requirements:
+      Todo:
+        changed_files:
+          required: nope
+""")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert any(d.code == "workflow.shape.wrong_type" for d in result.diagnostics)
+
+    def test_task_type_instructions_are_preserved(self):
+        parsed = parse_yaml("""
+schema_version: 1
+statements:
+  - kind: task_type
+    id: BackendTask
+    instructions: backend-python
+""")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is not None
+        task_type = result.document.statements[0]
+        assert task_type.instructions == ("backend-python",)
+
     def test_operation_step_not_mapping(self):
         parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: transition\n    id: T\n    task_type: TT\n    from: S\n    to: S\n    transaction:\n      steps:\n        - not-a-map\n  - kind: task_type\n    id: TT\n  - kind: state\n    id: S\n")
         assert parsed.value is not None

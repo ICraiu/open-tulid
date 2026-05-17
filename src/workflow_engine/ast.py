@@ -33,6 +33,7 @@ class ValidationCall:
 class RequirementSet:
     artifacts: tuple[str, ...] = ()
     validations: tuple[ValidationCall, ...] = ()
+    changed_files_required: bool = False
     span: SourceSpan | None = None
     artifact_spans: tuple[SourceSpan | None, ...] = ()
 
@@ -110,6 +111,7 @@ class StateStatement(Statement):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class TaskTypeStatement(Statement):
     requirements_by_state: Mapping[str, RequirementSet] = dataclasses.field(default_factory=dict)
+    instructions: tuple[str, ...] = ()
 
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_task_type(self)

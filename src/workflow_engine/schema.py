@@ -94,6 +94,13 @@ def _build_statement_properties(kind: str, allowed: frozenset) -> dict:
             "propertyNames": {"type": "string"},
             "additionalProperties": _requirement_set_schema(),
         }
+    if "instructions" in allowed:
+        props["instructions"] = {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ],
+        }
 
     # Add transition-specific fields
     transition_fields = {
@@ -143,6 +150,13 @@ def _requirement_set_schema() -> dict:
             "validations": {
                 "type": "array",
                 "items": _validation_call_schema(),
+            },
+            "changed_files": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "required": {"type": "boolean"},
+                },
             },
         },
     }

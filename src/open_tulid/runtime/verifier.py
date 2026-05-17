@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from open_tulid.domain import DomainError, TransitionDefinition
 
@@ -38,8 +39,16 @@ class VerificationResult:
 
 
 class DeterministicVerifier:
-    def __init__(self, *, artifact_templates: Mapping[str, str | None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_templates: Mapping[str, str | None] | None = None,
+        validation_implementations: Mapping[str, Callable[..., object]] | None = None,
+        validation_context_factory: Callable[[Path, Path], object] | None = None,
+    ) -> None:
         self.artifact_templates = dict(artifact_templates or {})
+        self.validation_implementations = dict(validation_implementations or {})
+        self.validation_context_factory = validation_context_factory
 
     def verify(
         self,
@@ -52,6 +61,27 @@ class DeterministicVerifier:
         errors: list[DomainError] = []
         output_root = output_dir or workspace / "output"
         submitted_artifacts = normalize_artifacts(submission.artifacts)
+        duplicate_artifact_types = _duplicates(artifact.type for artifact in submitted_artifacts)
+        duplicate_artifact_paths = _duplicates(artifact.path for artifact in submitted_artifacts)
+        duplicate_changed_files = _duplicates(submission.changed_files)
+        for artifact_type in duplicate_artifact_types:
+            errors.append(_error(
+                "completion.artifact_duplicate_type",
+                f"Artifact type was submitted more than once: {artifact_type}",
+                artifact_type,
+            ))
+        for artifact_path in duplicate_artifact_paths:
+            errors.append(_error(
+                "completion.artifact_duplicate_path",
+                f"Artifact path was submitted more than once: {artifact_path}",
+                artifact_path,
+            ))
+        for changed_file in duplicate_changed_files:
+            errors.append(_error(
+                "completion.changed_file_duplicate",
+                f"Changed file was submitted more than once: {changed_file}",
+                changed_file,
+            ))
         artifact_types = {artifact.type for artifact in submitted_artifacts}
 
         for artifact in transition.requires.artifacts:
@@ -122,6 +152,17 @@ class DeterministicVerifier:
                     f"Validation evidence is missing for {validation}.",
                     validation,
                 ))
+        errors.extend(self._run_trusted_validations(
+            workspace=workspace,
+            output_root=output_root,
+            transition=transition,
+        ))
+
+        if transition.requires.changed_files_required and not submission.changed_files:
+            errors.append(_error(
+                "completion.changed_files_missing",
+                "Changed-file evidence is required for this transition.",
+            ))
 
         for changed_file in submission.changed_files:
             changed_path = _contained_path(workspace, changed_file)
@@ -138,7 +179,61 @@ class DeterministicVerifier:
                     changed_file,
                 ))
 
+        actual_changed_files = _git_changed_files(workspace)
+        if actual_changed_files is not None:
+            submitted = set(submission.changed_files)
+            if submitted != actual_changed_files:
+                errors.append(_error(
+                    "completion.changed_files_mismatch",
+                    "Submitted changed files do not match the workspace diff.",
+                    ",".join(sorted(actual_changed_files)),
+                ))
+
         return VerificationResult(accepted=not errors, errors=tuple(errors))
+
+    def _run_trusted_validations(
+        self,
+        *,
+        workspace: Path,
+        output_root: Path,
+        transition: TransitionDefinition,
+    ) -> tuple[DomainError, ...]:
+        errors: list[DomainError] = []
+        if not transition.requires.validations:
+            return ()
+        if self.validation_context_factory is None:
+            return tuple(_error(
+                "completion.validation_unavailable",
+                "Trusted validation runtime is not configured.",
+                call.type,
+            ) for call in transition.requires.validations)
+        context = self.validation_context_factory(workspace, output_root)
+        for call in transition.requires.validations:
+            implementation = self.validation_implementations.get(call.type)
+            if implementation is None:
+                errors.append(_error(
+                    "completion.validation_unimplemented",
+                    f"No trusted validation implementation is installed for {call.type}.",
+                    call.type,
+                ))
+                continue
+            try:
+                result = implementation(context, **dict(call.args))
+            except Exception as exc:
+                errors.append(_error(
+                    "completion.validation_error",
+                    f"Trusted validation {call.type} raised: {exc}",
+                    call.type,
+                ))
+                continue
+            if not bool(getattr(result, "passed", False)):
+                message = str(getattr(result, "message", "") or "validation failed")
+                errors.append(_error(
+                    "completion.validation_failed",
+                    f"Trusted validation {call.type} failed: {message}",
+                    call.type,
+                ))
+        return tuple(errors)
 
 
 def submission_from_mapping(payload: Mapping[str, object]) -> CompletionSubmission:
@@ -253,3 +348,42 @@ def _optional_int(value: object) -> int | None:
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:
     return DomainError(code=code, message=message, location=location)
+
+
+def _duplicates(values: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for raw in values:
+        value = str(raw)
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return tuple(duplicates)
+
+
+def _git_changed_files(workspace: Path) -> set[str] | None:
+    if not (workspace / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ("git", "status", "--porcelain"),
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    changed: set[str] = set()
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path:
+            changed.add(path)
+    return changed

@@ -14,7 +14,7 @@ SUPPORTED_KINDS: Final = frozenset({
 
 STATEMENT_KEYS: Final = {
     "state": frozenset({"kind", "id"}),
-    "task_type": frozenset({"kind", "id", "requirements"}),
+    "task_type": frozenset({"kind", "id", "requirements", "instructions"}),
     "artifact_type": frozenset({"kind", "id", "template"}),
     "validation_type": frozenset({"kind", "id", "args"}),
     "worker": frozenset({"kind", "id", "type", "instructions"}),
@@ -61,7 +61,7 @@ REFERENCE_ARG_TYPES: Final = {
 
 ARG_SPEC_KEYS: Final = frozenset({"type", "required", "many"})
 
-REQUIREMENT_SET_KEYS: Final = frozenset({"artifacts", "validations"})
+REQUIREMENT_SET_KEYS: Final = frozenset({"artifacts", "validations", "changed_files"})
 
 VALIDATION_CALL_KEYS: Final = frozenset({"type", "args"})
 

@@ -90,6 +90,7 @@ def _requirement_set_to_def(req: RequirementSet) -> RequirementDefinition:
     return RequirementDefinition(
         artifacts=req.artifacts,
         validations=tuple(validations),
+        changed_files_required=req.changed_files_required,
     )
 
 
@@ -345,6 +346,7 @@ def compile_workflow(
             task_types[stmt.id] = TaskTypeDefinition(
                 id=stmt.id,
                 requirements_by_state=_freeze_mapping(reqs),
+                instructions=stmt.instructions,
             )
             task_type_stmts[stmt.id] = stmt
 

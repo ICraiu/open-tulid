@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from open_tulid.domain import DomainError, TransitionDefinition, WorkerDefinition
+from open_tulid.domain import DomainError, TaskTypeDefinition, TransitionDefinition, WorkerDefinition
 
 
 @dataclass(frozen=True)
@@ -41,11 +41,13 @@ class AgentInstructionResolver:
         self,
         *,
         worker: WorkerDefinition | None,
+        task_type: TaskTypeDefinition | None,
         transition: TransitionDefinition,
     ) -> PromptPacketResult:
         refs = _unique_refs((
             "default",
             *(worker.instructions if worker is not None else ()),
+            *(task_type.instructions if task_type is not None else ()),
             *transition.instructions,
         ))
         docs: list[InstructionDocument] = []

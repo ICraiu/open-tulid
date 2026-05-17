@@ -48,6 +48,7 @@ from open_tulid.runtime import (
     check_backend_readiness,
     cleanup_job_workspaces,
     recover_job_creation_transactions,
+    recover_completion_transactions,
     serve_completion_endpoint,
     serve_model_proxy,
     TransactionJournalStore,
@@ -57,6 +58,10 @@ from open_tulid.runtime import (
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
 from open_tulid.workflow.runtime import load_workflow_definition
+from open_tulid.workflow.implementations import (
+    VALIDATION_IMPLEMENTATIONS,
+    WorkflowExecutionContext,
+)
 
 app = typer.Typer(
     name="tulid",
@@ -131,8 +136,10 @@ app.add_typer(install_app, name="install")
 
 runtime_app = typer.Typer()
 model_proxy_app = typer.Typer()
+transactions_app = typer.Typer()
 app.add_typer(runtime_app, name="runtime")
 app.add_typer(model_proxy_app, name="model-proxy")
+app.add_typer(transactions_app, name="transactions")
 
 
 @app.command()
@@ -574,6 +581,8 @@ def run_job(
         resources=ctx["config"].resources,
         model_proxy_sessions=ctx["model_proxy_sessions"],
         model_proxy_endpoint_base=_model_proxy_endpoint_base(ctx["config"]),
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=_validation_context,
     )
     result = executor.run(job_id)
     if not result.accepted:
@@ -913,6 +922,8 @@ def complete_job(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=_validation_context,
     )
     result = service.submit(
         job_id=job_id,
@@ -932,6 +943,54 @@ def complete_job(
     console.print("Completion accepted.")
 
 
+@transactions_app.command("list")
+def list_transactions(project: str = typer.Argument(..., help="Configured project name.")) -> None:
+    """List prepared and failed transaction journals."""
+    ctx = _runtime_project_context(project)
+    records = (
+        *ctx["journal_store"].iter_journals("prepared"),
+        *ctx["journal_store"].iter_journals("failed"),
+    )
+    if not records:
+        console.print("No incomplete or failed transactions.")
+        return
+    for record in records:
+        error = f" error={record.error.code}" if record.error is not None else ""
+        console.print(
+            f"{record.journal_id} status={record.status.value} task={record.task_id or '-'} "
+            f"transition={record.transition_id or '-'} effects={len(record.effects)}{error}"
+        )
+
+
+@transactions_app.command("recover")
+def recover_transactions(project: str = typer.Argument(..., help="Configured project name.")) -> None:
+    """Attempt recovery of prepared job-creation and completion journals."""
+    ctx = _runtime_project_context(project)
+    recovered_jobs = recover_job_creation_transactions(
+        job_store=ctx["job_store"],
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
+    )
+    service = CompletionService(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        job_store=ctx["job_store"],
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
+        artifact_root=ctx["project_path"] / "artifacts",
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=_validation_context,
+    )
+    recovered_completions = recover_completion_transactions(
+        service=service,
+        event_store=ctx["event_store"],
+        journal_store=ctx["journal_store"],
+    )
+    console.print(
+        f"Recovered job journals={len(recovered_jobs)} completion journals={len(recovered_completions)}."
+    )
+
+
 @jobs_app.command("serve-completions")
 def serve_completions(
     project: str = typer.Argument(..., help="Configured project name."),
@@ -948,6 +1007,8 @@ def serve_completions(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=_validation_context,
     )
     server = serve_completion_endpoint(
         CompletionEndpointConfig(
@@ -1122,6 +1183,26 @@ def _runtime_project_context(project: str) -> dict[str, object]:
     for journal_id in recovered:
         console.print(_runtime_log_line(
             "JOB_CREATION_RECOVERED",
+            f"project={project} journal={journal_id}",
+        ))
+    completion_recovery_service = CompletionService(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=job_store,
+        event_store=event_store,
+        journal_store=journal_store,
+        artifact_root=project_path / "artifacts",
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=_validation_context,
+    )
+    recovered_completions = recover_completion_transactions(
+        service=completion_recovery_service,
+        event_store=event_store,
+        journal_store=journal_store,
+    )
+    for journal_id in recovered_completions:
+        console.print(_runtime_log_line(
+            "COMPLETION_RECOVERED",
             f"project={project} journal={journal_id}",
         ))
     return {
@@ -1356,3 +1437,10 @@ def _wait_for_pid_exit(pid: int, *, timeout: float = 5.0, poll_interval: float =
             return True
         time.sleep(poll_interval)
     return not _pid_is_running(pid)
+
+
+def _validation_context(workspace: Path, output_root: Path) -> WorkflowExecutionContext:
+    return WorkflowExecutionContext(
+        project_root=workspace,
+        vault_root=output_root,
+    )

@@ -407,10 +407,14 @@ def _build_task_type(
     source_name: str,
 ) -> tuple[list[Diagnostic], Statement | None]:
     diagnostics: list[Diagnostic] = []
+    inst_diags, instructions = _build_instruction_refs(raw, f"{item_path}.instructions")
+    diagnostics.extend(inst_diags)
     requirements_raw = raw.get("requirements")
 
     if requirements_raw is None:
-        return diagnostics, TaskTypeStatement(id=stmt_id, span=item_span)
+        if diagnostics:
+            return diagnostics, None
+        return diagnostics, TaskTypeStatement(id=stmt_id, instructions=instructions, span=item_span)
 
     if not isinstance(requirements_raw, dict):
         req_span = key_span(raw, "requirements", f"{item_path}.requirements")
@@ -445,7 +449,12 @@ def _build_task_type(
     if diagnostics:
         return diagnostics, None
 
-    return diagnostics, TaskTypeStatement(id=stmt_id, requirements_by_state=reqs_by_state, span=item_span)
+    return diagnostics, TaskTypeStatement(
+        id=stmt_id,
+        requirements_by_state=reqs_by_state,
+        instructions=instructions,
+        span=item_span,
+    )
 
 
 def _build_validation_type(
@@ -935,6 +944,34 @@ def _build_requirement_set(
             if val_call is not None:
                 validations.append(val_call)
 
+    changed_files_required = False
+    changed_files_raw = raw.get("changed_files")
+    if changed_files_raw is not None:
+        if not isinstance(changed_files_raw, dict):
+            changed_span = key_span(raw, "changed_files", f"{req_path}.changed_files")
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "changed_files must be a mapping",
+                changed_span,
+            ))
+            return diagnostics, None
+        for key in changed_files_raw:
+            if key != "required":
+                diagnostics.append(_diag_from_span(
+                    "workflow.shape.unknown_key",
+                    f"unknown key {key!r} in changed_files requirement",
+                    key_span(changed_files_raw, key, f"{req_path}.changed_files.{key}"),
+                ))
+        required_value = changed_files_raw.get("required", False)
+        if not isinstance(required_value, bool):
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "changed_files.required must be a boolean",
+                key_span(changed_files_raw, "required", f"{req_path}.changed_files.required"),
+            ))
+            return diagnostics, None
+        changed_files_required = required_value
+
     if diagnostics:
         return diagnostics, None
 
@@ -942,6 +979,7 @@ def _build_requirement_set(
     return diagnostics, RequirementSet(
         artifacts=tuple(artifacts),
         validations=tuple(validations),
+        changed_files_required=changed_files_required,
         span=span,
         artifact_spans=tuple(artifact_spans),
     )

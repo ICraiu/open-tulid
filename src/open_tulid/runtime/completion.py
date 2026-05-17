@@ -54,6 +54,8 @@ class CompletionService:
         journal_store: TransactionJournalStore | None = None,
         artifact_root: Path | None = None,
         verifier: DeterministicVerifier | None = None,
+        validation_implementations: Mapping[str, object] | None = None,
+        validation_context_factory: object | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -66,6 +68,8 @@ class CompletionService:
                 artifact_id: artifact.template
                 for artifact_id, artifact in workflow.artifact_types.items()
             },
+            validation_implementations=validation_implementations,
+            validation_context_factory=validation_context_factory,
         )
 
     def submit(
@@ -197,6 +201,7 @@ class CompletionService:
             output_dir=output_dir,
             task_id=job.task_id,
             artifacts=normalize_artifacts(submission.artifacts),
+            existing_task=self.adapter.read_task(job.task_id).task,
         )
         events = (
             build_event(
@@ -333,6 +338,8 @@ class CompletionService:
             journals=self.journal_store,
             events=self.event_store,
             apply_effect=self._apply_effect,
+            compensate_effect=self._compensate_effect,
+            validate_final_state=lambda: self._validate_final_state(task_id, transition_id),
         )
         applied = runtime.apply(
             project_id=project_id,
@@ -380,6 +387,55 @@ class CompletionService:
             f"Unknown completion effect: {effect_type}",
         ),))
 
+    def _compensate_effect(self, effect: Mapping[str, object]) -> _EffectApplyResult:
+        effect_type = effect.get("type")
+        if effect_type != "promote_artifact":
+            return _EffectApplyResult(True)
+        target_path = Path(str(effect.get("target_path", "")))
+        target_existed = bool(effect.get("target_existed", False))
+        if not target_existed and target_path.exists():
+            try:
+                target_path.unlink()
+            except OSError as exc:
+                return _EffectApplyResult(False, f"artifact compensation failed: {exc}", (_error(
+                    "artifact.compensation_failed",
+                    f"Cannot remove promoted artifact during compensation: {exc}",
+                    str(target_path),
+                ),))
+        previous_links = effect.get("previous_links")
+        task_id = str(effect.get("task_id", ""))
+        if isinstance(previous_links, (list, tuple)):
+            loaded = self.adapter.read_task(task_id)
+            if loaded.accepted and loaded.task is not None:
+                restored = _task_with_links(loaded.task, tuple(str(link) for link in previous_links))
+                written = self.adapter.write_task(restored)
+                if not written.accepted:
+                    return _EffectApplyResult(False, "artifact link compensation failed", written.errors)
+        return _EffectApplyResult(True)
+
+    def _validate_final_state(self, task_id: str, transition_id: str) -> _EffectApplyResult:
+        transition = self.workflow.transitions.get(transition_id)
+        if transition is None:
+            return _EffectApplyResult(False, "transition missing after apply", (_error(
+                "transition.not_found",
+                f"Transition {transition_id!r} is not defined.",
+                transition_id,
+            ),))
+        loaded = self.adapter.read_task(task_id)
+        if not loaded.accepted or loaded.task is None:
+            return _EffectApplyResult(False, "task missing after apply", loaded.errors or (_error(
+                "task.not_found",
+                f"Task {task_id!r} was not found after mutation.",
+                task_id,
+            ),))
+        if loaded.task.current_state != transition.to_state:
+            return _EffectApplyResult(False, "task final state mismatch", (_error(
+                "transaction.final_state_invalid",
+                f"Task {task_id!r} ended in {loaded.task.current_state!r}, expected {transition.to_state!r}.",
+                task_id,
+            ),))
+        return _EffectApplyResult(True)
+
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:
     return DomainError(code=code, message=message, location=location)
@@ -395,10 +451,11 @@ def _promotion_plan(
     output_dir: Path,
     task_id: str,
     artifacts: tuple[ArtifactSubmission, ...],
-) -> tuple[Mapping[str, str], ...]:
+    existing_task: Task | None,
+) -> tuple[Mapping[str, object], ...]:
     if artifact_root is None:
         return ()
-    planned: list[Mapping[str, str]] = []
+    planned: list[Mapping[str, object]] = []
     for artifact in artifacts:
         source = output_dir / artifact.path
         file_name = Path(artifact.path).name
@@ -408,6 +465,8 @@ def _promotion_plan(
             "source_path": str(source),
             "target_path": str(target),
             "link": _artifact_link(artifact_root, target),
+            "target_existed": target.exists(),
+            "previous_links": tuple(existing_task.artifact_links) if existing_task is not None else (),
         })
     return tuple(planned)
 
@@ -473,3 +532,40 @@ def _record_submission(
             "feedback": tuple(dict(item) for item in feedback),
         },
     }
+
+
+def recover_completion_transactions(
+    *,
+    service: CompletionService,
+    event_store: JsonlEventStore,
+    journal_store: TransactionJournalStore,
+) -> tuple[str, ...]:
+    recovered: list[str] = []
+    existing_event_ids = {event.event_id for event in event_store.iter_events()}
+    for record in journal_store.list_incomplete():
+        effect_types = {effect.get("type") for effect in record.effects}
+        if not effect_types or not effect_types.issubset({"promote_artifact", "move_task"}):
+            continue
+        if record.task_id is None or record.transition_id is None:
+            continue
+        all_effects_ok = True
+        for effect in record.effects:
+            result = service._apply_effect(effect)
+            if not result.accepted:
+                all_effects_ok = False
+                break
+        if not all_effects_ok:
+            continue
+        final = service._validate_final_state(record.task_id, record.transition_id)
+        if not final.accepted:
+            continue
+        missing_events = tuple(event for event in record.events if event.event_id not in existing_event_ids)
+        if missing_events:
+            appended = event_store.append_many(missing_events)
+            if not appended.accepted:
+                continue
+            existing_event_ids.update(event.event_id for event in missing_events)
+        committed = journal_store.commit(record)
+        if committed.accepted:
+            recovered.append(record.journal_id)
+    return tuple(recovered)

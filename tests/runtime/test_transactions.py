@@ -152,3 +152,38 @@ class TestFileTransactionRuntime:
         assert result.error is not None
         assert result.error.code == "journal.write_failed"
         assert calls == []
+
+    def test_final_validation_failure_compensates_applied_effects(self, tmp_path: Path):
+        applied: list[str] = []
+        compensated: list[str] = []
+
+        def apply_effect(effect):
+            applied.append(str(effect["type"]))
+            return OperationResult(accepted=True, code="ok")
+
+        def compensate_effect(effect):
+            compensated.append(str(effect["type"]))
+            return OperationResult(accepted=True, code="ok")
+
+        runtime = FileTransactionRuntime(
+            journals=TransactionJournalStore(tmp_path / "events" / "journals"),
+            events=JsonlEventStore(tmp_path / "events"),
+            apply_effect=apply_effect,
+            compensate_effect=compensate_effect,
+            validate_final_state=lambda: OperationResult(
+                accepted=False,
+                code="final_invalid",
+                message="bad final state",
+            ),
+        )
+
+        result = runtime.apply(
+            journal_id="01J00000000000000000000JRN",
+            project_id="Agent",
+            effects=({"type": "first"}, {"type": "second"}),
+            events=(_event(),),
+        )
+
+        assert result.accepted is False
+        assert applied == ["first", "second"]
+        assert compensated == ["second", "first"]

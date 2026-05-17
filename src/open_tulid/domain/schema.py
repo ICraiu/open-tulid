@@ -209,6 +209,7 @@ class StateDefinition:
 class TaskTypeDefinition:
     id: str
     requirements_by_state: Mapping[str, "RequirementDefinition"]
+    instructions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -256,6 +257,7 @@ class TransitionDefinition:
 class RequirementDefinition:
     artifacts: tuple[str, ...] = ()
     validations: tuple["ValidationCallDefinition", ...] = ()
+    changed_files_required: bool = False
 
 
 @dataclass(frozen=True)

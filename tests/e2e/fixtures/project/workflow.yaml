@@ -25,6 +25,9 @@ statements:
     template: test-result.md
   - kind: validation_type
     id: tests_pass
+    args:
+      command:
+        type: string
   - kind: worker
     id: codex
     type: codex
@@ -41,3 +44,5 @@ statements:
         - TestResult
       validations:
         - type: tests_pass
+          args:
+            command: "python -V"

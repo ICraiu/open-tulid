@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
+from typing import Mapping
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.containers.runtime import AgentRunResult, request_for_worker, run_agent_container
@@ -50,6 +51,8 @@ class JobExecutor:
         resources: dict[str, ResourceConfig] | None = None,
         model_proxy_sessions: ModelProxySessionStore | FileModelProxySessionStore | None = None,
         model_proxy_endpoint_base: str | None = None,
+        validation_implementations: Mapping[str, object] | None = None,
+        validation_context_factory: object | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -63,6 +66,8 @@ class JobExecutor:
         self.resources = resources or {}
         self.model_proxy_sessions = model_proxy_sessions
         self.model_proxy_endpoint_base = model_proxy_endpoint_base
+        self.validation_implementations = validation_implementations
+        self.validation_context_factory = validation_context_factory
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -80,6 +85,7 @@ class JobExecutor:
         if transition is None:
             return ExecutorRunResult(False, errors=(_error("transition.not_found", "Transition was not found."),))
         worker = self.workflow.workers.get(job.worker_id)
+        task_type = self.workflow.task_types.get(transition.task_type)
         task_result = self.adapter.read_task(job.task_id)
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
@@ -134,6 +140,7 @@ class JobExecutor:
             if project_root is not None:
                 prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
                     worker=worker,
+                    task_type=task_type,
                     transition=transition,
                 )
                 if not prompt_result.accepted:
@@ -278,6 +285,8 @@ class JobExecutor:
             event_store=self.event_store,
             journal_store=self.journal_store,
             artifact_root=self.artifact_root,
+            validation_implementations=self.validation_implementations,
+            validation_context_factory=self.validation_context_factory,
         )
         server = serve_completion_endpoint(
             CompletionEndpointConfig(

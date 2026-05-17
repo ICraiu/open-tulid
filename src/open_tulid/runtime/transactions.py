@@ -15,6 +15,8 @@ class EffectResult(Protocol):
 
 
 EffectApplier = Callable[[Mapping[str, object]], EffectResult]
+EffectCompensator = Callable[[Mapping[str, object]], EffectResult]
+FinalValidator = Callable[[], EffectResult]
 
 
 @dataclass(frozen=True)
@@ -31,10 +33,14 @@ class FileTransactionRuntime:
         journals: TransactionJournalStore,
         events: JsonlEventStore,
         apply_effect: EffectApplier,
+        compensate_effect: EffectCompensator | None = None,
+        validate_final_state: FinalValidator | None = None,
     ):
         self.journals = journals
         self.events = events
         self.apply_effect = apply_effect
+        self.compensate_effect = compensate_effect
+        self.validate_final_state = validate_final_state
 
     def apply(
         self,
@@ -69,6 +75,7 @@ class FileTransactionRuntime:
             )
 
         record = prepared.record
+        applied_effects: list[Mapping[str, object]] = []
         for effect in effects:
             try:
                 result = self.apply_effect(effect)
@@ -78,6 +85,7 @@ class FileTransactionRuntime:
                     message=f"Effect raised exception: {exc}",
                 )
                 failed = self.journals.fail(record, error)
+                self._compensate(applied_effects)
                 return TransactionApplyResult(
                     accepted=False,
                     journal=failed.record or record,
@@ -86,6 +94,23 @@ class FileTransactionRuntime:
             if not result.accepted:
                 error = _operation_error(effect, result)
                 failed = self.journals.fail(record, error)
+                self._compensate(applied_effects)
+                return TransactionApplyResult(
+                    accepted=False,
+                    journal=failed.record or record,
+                    error=error,
+                )
+            applied_effects.append(effect)
+
+        if self.validate_final_state is not None:
+            try:
+                final_result = self.validate_final_state()
+            except Exception as exc:
+                final_result = _SimpleEffectResult(False, f"Final validation raised exception: {exc}")
+            if not final_result.accepted:
+                error = _operation_error({"type": "validate_final_state"}, final_result)
+                failed = self.journals.fail(record, error)
+                self._compensate(applied_effects)
                 return TransactionApplyResult(
                     accepted=False,
                     journal=failed.record or record,
@@ -99,6 +124,7 @@ class FileTransactionRuntime:
                 message="Event append failed.",
             )
             failed = self.journals.fail(record, error)
+            self._compensate(applied_effects)
             return TransactionApplyResult(
                 accepted=False,
                 journal=failed.record or record,
@@ -117,6 +143,15 @@ class FileTransactionRuntime:
             journal=committed.record,
         )
 
+    def _compensate(self, applied_effects: list[Mapping[str, object]]) -> None:
+        if self.compensate_effect is None:
+            return
+        for effect in reversed(applied_effects):
+            try:
+                self.compensate_effect(effect)
+            except Exception:
+                continue
+
 
 def _operation_error(effect: Mapping[str, object], result: EffectResult) -> DomainError:
     if result.errors:
@@ -125,3 +160,10 @@ def _operation_error(effect: Mapping[str, object], result: EffectResult) -> Doma
         code="effect.failed",
         message=result.message or f"Effect failed: {dict(effect)}",
     )
+
+
+@dataclass(frozen=True)
+class _SimpleEffectResult:
+    accepted: bool
+    message: str = ""
+    errors: tuple[DomainError, ...] = ()

@@ -38,7 +38,7 @@ from .model_proxy import (
     serve_model_proxy,
 )
 from .transactions import EffectApplier, EffectResult, FileTransactionRuntime, TransactionApplyResult
-from .completion import CompletionResult, CompletionService
+from .completion import CompletionResult, CompletionService, recover_completion_transactions
 from .completion_http import (
     CompletionEndpointConfig,
     MAX_COMPLETION_PAYLOAD_BYTES,
@@ -115,6 +115,7 @@ __all__ = [
     "serve_model_proxy",
     "CompletionResult",
     "CompletionService",
+    "recover_completion_transactions",
     "CompletionEndpointConfig",
     "MAX_COMPLETION_PAYLOAD_BYTES",
     "make_completion_handler",

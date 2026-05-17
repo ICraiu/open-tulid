@@ -97,6 +97,49 @@ statements:
     assert result.definition.transitions["Implement"].default_for_scheduler is True
 
 
+def test_compiles_changed_file_requirement_into_domain_definition():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: Review
+  - kind: task_type
+    id: task
+  - kind: transition
+    id: Implement
+    task_type: task
+    from: Todo
+    to: Review
+    requires:
+      changed_files:
+        required: true
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.transitions["Implement"].requires.changed_files_required is True
+
+
+def test_compiles_task_type_instruction_refs():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: task_type
+    id: BackendTask
+    instructions: backend-python
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.task_types["BackendTask"].instructions == ("backend-python",)
+
+
 class TestCompilePositive:
     def test_compile_valid_minimal(self):
         result = workflow_engine.load_yaml(str(FIXTURES / "valid_minimal.yaml"))
