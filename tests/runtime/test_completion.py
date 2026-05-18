@@ -257,6 +257,35 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     ]
 
 
+def test_completion_promotes_changed_files_into_repo_root(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is True
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
+
+
 def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
     store = _job_store(tmp_path)
     output = tmp_path / "workspace" / "output"

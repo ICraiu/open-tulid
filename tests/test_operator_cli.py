@@ -8,9 +8,12 @@ from types import SimpleNamespace
 import typer
 from typer.testing import CliRunner
 
+from open_tulid.cli import main as cli_main
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.runtime.scheduler import ScheduleResult
+from open_tulid.domain import ExecutionJob
+from open_tulid.runtime import FileExecutionJobStore
 
 
 runner = CliRunner()
@@ -117,6 +120,72 @@ def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path
     assert result.exit_code == 0
     assert "SCHEDULER_ALREADY_RUNNING project=Agent pid=9876" in result.output
     assert len(seen) == 1
+
+
+def test_runtime_start_fails_active_jobs_from_dead_prior_scheduler(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"scheduler_pid": 9876, "project": "Agent", "interval": 5.0}', encoding="utf-8")
+    job_store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert job_store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="task-1",
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "workspace"),
+    )).accepted is True
+    assert job_store.update_status("01J00000000000000000000JOB", "running").accepted is True
+
+    processes = iter((type("ProxyProcess", (), {"pid": 4321})(), type("SchedulerProcess", (), {"pid": 6543})()))
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: False)
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: next(processes))
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
+    monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start"])
+
+    loaded = job_store.get("01J00000000000000000000JOB")
+    assert result.exit_code == 0
+    assert "JOB_ORPHANED project=Agent" in result.output
+    assert "job=01J00000000000000000000JOB prior_status=running" in result.output
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+
+
+def test_proxy_listener_ready_retries_until_listener_accepts(monkeypatch):
+    attempts = {"count": 0}
+
+    class DummySocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_create_connection(address, timeout):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise OSError("not ready")
+        return DummySocket()
+
+    monkeypatch.setattr("open_tulid.cli.main.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("open_tulid.cli.main.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "open_tulid.cli.main.time.monotonic",
+        iter((0.0, 0.0, 0.1, 0.2)).__next__,
+    )
+
+    config = type("Cfg", (), {
+        "model_proxy_server": type("ProxyCfg", (), {"host": "0.0.0.0", "port": 8787})(),
+    })()
+
+    assert cli_main._proxy_listener_ready(config, timeout=1.0, poll_interval=0.05) is True
+    assert attempts["count"] == 3
+
+
 
 
 def test_runtime_status_reports_running_processes(tmp_path: Path, monkeypatch):

@@ -6,9 +6,9 @@ from open_tulid.domain import Task
 from open_tulid.runtime.context import LinkedContextResolver
 
 
-def _task(*, body: str = "", artifact_links: tuple[str, ...] = ()) -> Task:
+def _task(*, body: str = "", artifact_links: tuple[str, ...] = (), task_id: str = "01J00000000000000000000001") -> Task:
     return Task(
-        id="01J00000000000000000000001",
+        id=task_id,
         title="Task",
         path="tasks/task.md",
         current_state="Todo",
@@ -62,3 +62,17 @@ def test_linked_context_rejects_artifact_path_escape(tmp_path: Path):
 
     assert result.accepted is False
     assert result.errors[0].code == "context.link_not_found"
+
+
+def test_linked_context_includes_parent_links(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "parent-context.md").write_text("Parent context.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(body="Child body."),
+        parent_tasks=(_task(body="See [[parent-context]].", task_id="parent"),),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == ["parent-context"]

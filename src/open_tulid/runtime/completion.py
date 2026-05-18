@@ -56,6 +56,7 @@ class CompletionService:
         event_store: JsonlEventStore,
         journal_store: TransactionJournalStore | None = None,
         artifact_root: Path | None = None,
+        repo_root: Path | None = None,
         verifier: DeterministicVerifier | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
@@ -66,6 +67,7 @@ class CompletionService:
         self.event_store = event_store
         self.journal_store = journal_store
         self.artifact_root = artifact_root
+        self.repo_root = repo_root
         self.verifier = verifier or DeterministicVerifier(
             artifact_templates={
                 artifact_id: artifact.template
@@ -206,6 +208,11 @@ class CompletionService:
             artifacts=normalize_artifacts(submission.artifacts),
             existing_task=self.adapter.read_task(job.task_id).task,
         )
+        promoted_files = _changed_file_plan(
+            repo_root=self.repo_root,
+            workspace=Path(job.workspace_path),
+            changed_files=submission.changed_files,
+        )
         derived_tasks, derivation_errors = _derived_task_plan(
             output_dir=output_dir,
             transition=transition,
@@ -303,6 +310,14 @@ class CompletionService:
         effects = (
             *(
                 {
+                    "type": "promote_changed_file",
+                    "source_path": item["source_path"],
+                    "target_path": item["target_path"],
+                }
+                for item in promoted_files
+            ),
+            *(
+                {
                     "type": "promote_artifact",
                     "task_id": job.task_id,
                     "source_path": item["source_path"],
@@ -348,6 +363,7 @@ class CompletionService:
             metadata={
                 "completed_submission_id": submission_id,
                 "promoted_artifacts": tuple(promoted_artifacts),
+                "promoted_files": tuple(promoted_files),
                 "completion_submissions": _record_submission(
                     job.metadata,
                     submission_id,
@@ -442,6 +458,19 @@ class CompletionService:
                     if not written.accepted:
                         return _EffectApplyResult(False, "artifact link update failed", written.errors)
             return _EffectApplyResult(True)
+        if effect_type == "promote_changed_file":
+            source_path = Path(str(effect.get("source_path", "")))
+            target_path = Path(str(effect.get("target_path", "")))
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_path)
+            except OSError as exc:
+                return _EffectApplyResult(False, f"changed file promotion failed: {exc}", (_error(
+                    "changed_file.promotion_failed",
+                    f"Cannot promote changed file: {exc}",
+                    str(target_path),
+                ),))
+            return _EffectApplyResult(True)
         return _EffectApplyResult(False, f"unknown effect: {effect_type}", (_error(
             "effect.unknown",
             f"Unknown completion effect: {effect_type}",
@@ -533,6 +562,35 @@ def _promotion_plan(
             "target_existed": target.exists(),
             "previous_links": tuple(existing_task.artifact_links) if existing_task is not None else (),
         })
+    return tuple(planned)
+
+
+def _changed_file_plan(
+    *,
+    repo_root: Path | None,
+    workspace: Path,
+    changed_files: tuple[str, ...],
+) -> tuple[Mapping[str, object], ...]:
+    if repo_root is None:
+        return ()
+    workspace_root = workspace.resolve()
+    repository_root = repo_root.resolve()
+    planned: list[Mapping[str, object]] = []
+    for ref in changed_files:
+        relative = Path(ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        source = (workspace_root / relative).resolve()
+        target = (repository_root / relative).resolve()
+        if source != workspace_root and workspace_root not in source.parents:
+            continue
+        if target != repository_root and repository_root not in target.parents:
+            continue
+        if source.is_file():
+            planned.append({
+                "source_path": str(source),
+                "target_path": str(target),
+            })
     return tuple(planned)
 
 

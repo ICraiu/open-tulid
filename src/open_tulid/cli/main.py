@@ -704,6 +704,8 @@ def runtime_start(
     if scheduler_running and proxy_running:
         console.print(f"Runtime already running for {project_name}")
         return
+    if state is not None and not scheduler_running:
+        _fail_orphaned_runtime_jobs(config, project_name)
 
     readiness = check_backend_readiness(config.model_proxy, env=os.environ)
     for result in readiness:
@@ -926,6 +928,7 @@ def complete_job(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        repo_root=ctx["project_config"].repo_root,
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
     )
@@ -982,6 +985,7 @@ def recover_transactions(project: str = typer.Argument(..., help="Configured pro
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        repo_root=ctx["project_config"].repo_root,
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
     )
@@ -1011,6 +1015,7 @@ def serve_completions(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         artifact_root=ctx["project_path"] / "artifacts",
+        repo_root=ctx["project_config"].repo_root,
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
     )
@@ -1222,6 +1227,7 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         event_store=event_store,
         journal_store=journal_store,
         artifact_root=project_path / "artifacts",
+        repo_root=project_config.repo_root,
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
     )
@@ -1449,15 +1455,23 @@ def _stop_new_proxy_after_failed_start(process: subprocess.Popen, state_path: Pa
     console.print(_runtime_log_line("MODEL_PROXY_STOPPED_AFTER_START_FAILURE", f"pid={process.pid}"))
 
 
-def _proxy_listener_ready(config: Config, *, timeout: float = 1.0) -> bool:
+def _proxy_listener_ready(
+    config: Config,
+    *,
+    timeout: float = 5.0,
+    poll_interval: float = 0.05,
+) -> bool:
     host = config.model_proxy_server.host
     if host in {"0.0.0.0", "::"}:
         host = "127.0.0.1"
-    try:
-        with socket.create_connection((host, config.model_proxy_server.port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, config.model_proxy_server.port), timeout=poll_interval):
+                return True
+        except OSError:
+            time.sleep(poll_interval)
+    return False
 
 
 def _any_scheduler_running(config: Config) -> bool:
@@ -1466,6 +1480,49 @@ def _any_scheduler_running(config: Config) -> bool:
         if state is not None and _pid_is_running(state.get("scheduler_pid")):
             return True
     return False
+
+
+def _fail_orphaned_runtime_jobs(config: Config, project: str) -> None:
+    app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
+    job_store = FileExecutionJobStore(app_state / "jobs" / project)
+    event_store = JsonlEventStore(_project_path(config, project) / "events")
+    lease_store = FileResourceLeaseStore(app_state / "resource-leases", config.resources)
+    model_proxy_sessions = FileModelProxySessionStore(_model_proxy_session_root(config))
+    listed = job_store.list()
+    if not listed.accepted:
+        return
+    orphanable = {
+        ExecutionJobStatus.PENDING.value,
+        ExecutionJobStatus.RUNNING.value,
+        ExecutionJobStatus.COMPLETION_REJECTED.value,
+    }
+    for job in listed.jobs:
+        status = job.status.value if hasattr(job.status, "value") else str(job.status)
+        if status not in orphanable:
+            continue
+        updated = job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.FAILED,
+            metadata={"status_reason": "orphaned after detached scheduler was not running at runtime start"},
+        )
+        if not updated.accepted:
+            continue
+        lease_store.release_job(job.job_id)
+        model_proxy_sessions.revoke_job(job.job_id)
+        event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="runtime-start"),
+            event_type=EventType.ExecutionFailed,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            data={"reason": "orphaned_after_scheduler_exit"},
+        ))
+        console.print(_runtime_log_line(
+            "JOB_ORPHANED",
+            f"project={project} job={job.job_id} prior_status={status}",
+        ))
 
 
 def _pid_is_running(value: object) -> bool:

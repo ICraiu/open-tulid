@@ -43,16 +43,17 @@ class LinkedContextResolver:
         self.max_documents = max_documents
         self.max_bytes = max_bytes
 
-    def build_context_packet(self, task: Task) -> ContextPacketResult:
+    def build_context_packet(self, task: Task, *, parent_tasks: tuple[Task, ...] = ()) -> ContextPacketResult:
         docs: list[ContextDocument] = []
         errors: list[DomainError] = []
         seen: set[Path] = set()
         total_bytes = 0
 
-        queue: list[tuple[str, int, bool]] = [
-            *((link, 0, True) for link in task.artifact_links),
-            *((link, 0, False) for link in _wiki_links(task.body)),
-        ]
+        seed_tasks = (task, *parent_tasks)
+        queue: list[tuple[str, int, bool]] = []
+        for seed_task in seed_tasks:
+            queue.extend((link, 0, True) for link in seed_task.artifact_links)
+            queue.extend((link, 0, False) for link in _wiki_links(seed_task.body))
         while queue:
             ref, depth, required = queue.pop(0)
             if depth > self.max_depth:

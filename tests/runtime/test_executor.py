@@ -144,6 +144,103 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     assert loaded.job.status == "accepted"
 
 
+def test_executor_implicitly_completes_successful_jobs_without_explicit_evidence(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    workflow = _workflow_without_requirements()
+    adapter = FakeAdapter()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        (Path(request.workspace) / "src").mkdir(parents=True, exist_ok=True)
+        (Path(request.workspace) / "src" / "app.py").write_text("print('done')\n", encoding="utf-8")
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    monkeypatch.setattr("open_tulid.runtime.executor._git_changed_files", lambda workspace: {"src/app.py"})
+
+    executor = JobExecutor(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert adapter.moved_to == "CodeReview"
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "accepted"
+    assert loaded.job.metadata["promoted_files"] == []
+
+
+def test_executor_implicit_completion_can_diff_workspace_against_repo_root(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    repo_root = tmp_path / "repo"
+    (repo_root / "src").mkdir(parents=True)
+    (repo_root / "src" / "app.py").write_text("print('before')\n", encoding="utf-8")
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    adapter = FakeAdapter()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        (Path(request.workspace) / "src" / "app.py").write_text("print('after')\n", encoding="utf-8")
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+
+    executor = JobExecutor(
+        workflow=_workflow_without_requirements(),
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent", repo_root=repo_root),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert adapter.moved_to == "CodeReview"
+    assert (repo_root / "src" / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+
+
 def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace"
     project = tmp_path / "project"
@@ -152,6 +249,7 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
     (project / "agents").mkdir()
     (project / "artifacts" / "spec.md").write_text("Spec sees [[extra]].\n", encoding="utf-8")
     (project / "docs" / "extra.md").write_text("Extra context.\n", encoding="utf-8")
+    (project / "docs" / "parent-extra.md").write_text("Parent extra context.\n", encoding="utf-8")
     (project / "agents" / "default.agent.md").write_text("Default instructions.\n", encoding="utf-8")
     store = FileExecutionJobStore(tmp_path / "jobs")
     assert store.create(ExecutionJob(
@@ -168,15 +266,27 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         config = type("Cfg", (), {"project_root": project})()
 
         def read_task(self, task_id: str) -> ReadTaskResult:
-            return ReadTaskResult(task=Task(
-                id=TASK_ID,
-                title="Task",
-                path="tasks/task.md",
-                current_state="Todo",
-                task_type="task",
-                artifact_links=("artifacts/spec.md",),
-                body="Task body.",
-            ))
+            if task_id == TASK_ID:
+                return ReadTaskResult(task=Task(
+                    id=TASK_ID,
+                    title="Task",
+                    path="tasks/task.md",
+                    current_state="Todo",
+                    task_type="task",
+                    artifact_links=("artifacts/spec.md",),
+                    parent_id="parent-task",
+                    body="Task body.",
+                ))
+            if task_id == "parent-task":
+                return ReadTaskResult(task=Task(
+                    id="parent-task",
+                    title="Parent Task",
+                    path="tasks/parent.md",
+                    current_state="Done",
+                    task_type="task",
+                    body="Parent body sees [[parent-extra]].",
+                ))
+            return ReadTaskResult()
 
     def fake_run_agent_container(request, *, docker_executable):
         output = Path(request.workspace) / "output"
@@ -184,8 +294,11 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         (output / "result.md").write_text("done\n", encoding="utf-8")
         prompt = (Path(request.workspace) / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
         assert "Task body." in prompt
+        assert "## Parent Task 1" in prompt
+        assert "Parent body sees" in prompt
         assert "Spec sees" in prompt
         assert "Extra context." in prompt
+        assert "Parent extra context." in prompt
         assert "Default instructions." in prompt
         return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=17)
 
@@ -636,6 +749,30 @@ def _workflow() -> WorkflowDefinition:
                 to_state="CodeReview",
                 worker="codex",
                 requires=RequirementDefinition(artifacts=("result.md",)),
+                transaction=None,
+            ),
+        }),
+    )
+
+
+def _workflow_without_requirements() -> WorkflowDefinition:
+    workflow = _workflow()
+    return WorkflowDefinition(
+        schema_version=workflow.schema_version,
+        states=workflow.states,
+        task_types=workflow.task_types,
+        artifact_types=workflow.artifact_types,
+        validation_types=workflow.validation_types,
+        operation_types=workflow.operation_types,
+        workers=workflow.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
                 transaction=None,
             ),
         }),
