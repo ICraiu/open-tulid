@@ -126,6 +126,27 @@ class ValidationVisitor:
 
         node.requires.accept(self)
 
+        if node.derives is not None:
+            p, l, c = _span_info(node.derives.span or node.span)
+            if node.derives.task_type not in self.table.task_types:
+                self.diagnostics.append(Diagnostic(
+                    code="workflow.reference.unknown_task_type",
+                    message=f"transition {node.id!r} derives unknown task_type: {node.derives.task_type!r}",
+                    path=p, line=l, column=c,
+                ))
+            if node.derives.state not in self.table.states:
+                self.diagnostics.append(Diagnostic(
+                    code="workflow.reference.unknown_state",
+                    message=f"transition {node.id!r} derives into unknown state: {node.derives.state!r}",
+                    path=p, line=l, column=c,
+                ))
+            if node.derives.artifact_type not in self.table.artifact_types:
+                self.diagnostics.append(Diagnostic(
+                    code="workflow.reference.unknown_artifact",
+                    message=f"transition {node.id!r} derives from unknown artifact_type: {node.derives.artifact_type!r}",
+                    path=p, line=l, column=c,
+                ))
+
         if node.transaction is not None:
             node.transaction.accept(self)
 

@@ -35,6 +35,7 @@ from open_tulid.domain.schema import (
     TaskTypeDefinition,
     TransactionDefinition,
     TransitionDefinition,
+    DerivesDefinition,
     ValidationCallDefinition,
     ValidationTypeDefinition,
     WorkflowDefinition,
@@ -237,6 +238,27 @@ def _validate_cross_references_with_ast(
         _validate_requirement_refs_with_spans(
             trans_stmt.requires, artifact_types, validation_types, diagnostics, ctx,
         )
+        if trans_stmt.derives is not None:
+            span = trans_stmt.derives.span or trans_stmt.span
+            path, line, column = _span_to_diag_fields(span)
+            if trans_stmt.derives.task_type not in task_types:
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.unknown_task_type_ref",
+                    message=f"{ctx} derives unknown task_type {trans_stmt.derives.task_type!r}",
+                    path=path, line=line, column=column,
+                ))
+            if trans_stmt.derives.state not in states:
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.unknown_state_ref",
+                    message=f"{ctx} derives into unknown state {trans_stmt.derives.state!r}",
+                    path=path, line=line, column=column,
+                ))
+            if trans_stmt.derives.artifact_type not in artifact_types:
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.unknown_artifact_ref",
+                    message=f"{ctx} derives from unknown artifact_type {trans_stmt.derives.artifact_type!r}",
+                    path=path, line=line, column=column,
+                ))
 
         if trans_stmt.transaction is not None:
             for step in trans_stmt.transaction.steps:
@@ -428,6 +450,11 @@ def compile_workflow(
                 worker=stmt.worker,
                 requires=req_def,
                 transaction=txn_def,
+                derives=DerivesDefinition(
+                    task_type=stmt.derives.task_type,
+                    state=stmt.derives.state,
+                    artifact_type=stmt.derives.artifact_type,
+                ) if stmt.derives is not None else None,
                 default_for_scheduler=stmt.default_for_scheduler,
                 instructions=stmt.instructions,
             )

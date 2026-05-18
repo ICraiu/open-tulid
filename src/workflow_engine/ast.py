@@ -62,6 +62,14 @@ class TransactionPlan:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
+class DerivesSpec:
+    task_type: str
+    state: str
+    artifact_type: str
+    span: SourceSpan | None = None
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class ObsidianStateMapping:
     state: str
     board: str
@@ -160,6 +168,7 @@ class TransitionStatement(Statement):
     default_for_scheduler: bool = False
     requires: RequirementSet = dataclasses.field(default_factory=RequirementSet)
     transaction: TransactionPlan | None = None
+    derives: DerivesSpec | None = None
     field_spans: Mapping[str, SourceSpan] = dataclasses.field(default_factory=dict)
 
     def accept(self, visitor: AstVisitor) -> object:

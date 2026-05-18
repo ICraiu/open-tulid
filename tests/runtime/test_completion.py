@@ -12,6 +12,7 @@ from open_tulid.domain import (
     EventType,
     ExecutionJob,
     ArtifactTypeDefinition,
+    DerivesDefinition,
     ProjectSnapshot,
     RequirementDefinition,
     StateDefinition,
@@ -77,6 +78,9 @@ class FakeAdapter:
         ))
 
     def write_task(self, task: Task) -> WriteResult:
+        return WriteResult(path=task.path)
+
+    def create_task(self, task: Task) -> WriteResult:
         return WriteResult(path=task.path)
 
     def move_task(self, task_id: str, state: str) -> WriteResult:
@@ -251,6 +255,89 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
         "ReviewRequested",
         "ExecutionFinished",
     ]
+
+
+def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
+    store = _job_store(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "one.md").write_text(
+        "---\nlocal_id: one\n---\n# First child\n\nDo first.\n",
+        encoding="utf-8",
+    )
+    (output / "two.md").write_text(
+        "---\nlocal_id: two\ndependencies: [one]\n---\n# Second child\n\nDo second.\n",
+        encoding="utf-8",
+    )
+
+    class DeriveAdapter(FakeAdapter):
+        def __init__(self, task: Task):
+            super().__init__(task)
+            self.created: list[Task] = []
+            self.written_parent: Task | None = None
+
+        def create_task(self, task: Task) -> WriteResult:
+            self.created.append(task)
+            return WriteResult(path=task.path)
+
+        def write_task(self, task: Task) -> WriteResult:
+            self.written_parent = task
+            self.task = task
+            return WriteResult(path=task.path)
+
+    base = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=base.schema_version,
+        states=base.states,
+        task_types=MappingProxyType({
+            **dict(base.task_types),
+            "chunk": TaskTypeDefinition(id="chunk", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({
+            "child_task": ArtifactTypeDefinition(id="child_task"),
+        }),
+        validation_types=base.validation_types,
+        operation_types=base.operation_types,
+        workers=base.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+                derives=DerivesDefinition(task_type="chunk", state="Todo", artifact_type="child_task"),
+            ),
+        }),
+    )
+    adapter = DeriveAdapter(_task())
+    service = CompletionService(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(
+                ArtifactSubmission(type="child_task", path="one.md"),
+                ArtifactSubmission(type="child_task", path="two.md"),
+            ),
+        ),
+    )
+
+    assert result.accepted is True
+    assert len(adapter.created) == 2
+    assert adapter.created[0].parent_id == TASK_ID
+    assert adapter.created[1].dependencies == (adapter.created[0].id,)
+    assert adapter.written_parent is not None
+    assert "## Derived tasks" in adapter.written_parent.body
+    assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()].count("TaskDerived") == 2
 
 
 def test_completion_requires_changed_files_when_transition_demands_them(tmp_path: Path):

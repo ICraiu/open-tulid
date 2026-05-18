@@ -33,6 +33,13 @@ runtime directories, worker configuration, and the first end-to-end run, see:
 docs/startup-guide.md
 ```
 
+For workflow authoring — states, task types, transitions, built-in validations,
+and built-in operations — see:
+
+```text
+docs/workflow-guide.md
+```
+
 Example config:
 
 ```yaml
@@ -45,6 +52,8 @@ projects:
     repo_root: /path/to/code/repository
     main_branch: main
 ```
+
+A commented starter file also lives at `config.yaml.example`.
 
 ## Usage
 

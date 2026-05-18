@@ -64,7 +64,10 @@ class DeterministicVerifier:
         duplicate_artifact_types = _duplicates(artifact.type for artifact in submitted_artifacts)
         duplicate_artifact_paths = _duplicates(artifact.path for artifact in submitted_artifacts)
         duplicate_changed_files = _duplicates(submission.changed_files)
+        multi_artifact_type = transition.derives.artifact_type if transition.derives is not None else None
         for artifact_type in duplicate_artifact_types:
+            if artifact_type == multi_artifact_type:
+                continue
             errors.append(_error(
                 "completion.artifact_duplicate_type",
                 f"Artifact type was submitted more than once: {artifact_type}",
@@ -92,8 +95,18 @@ class DeterministicVerifier:
                     artifact,
                 ))
 
+        allowed_artifact_types = set(transition.requires.artifacts)
+        if multi_artifact_type is not None:
+            allowed_artifact_types.add(multi_artifact_type)
+            if multi_artifact_type not in artifact_types:
+                errors.append(_error(
+                    "completion.derived_task_missing",
+                    f"Deriving transition requires at least one {multi_artifact_type} artifact.",
+                    multi_artifact_type,
+                ))
+
         for artifact in submitted_artifacts:
-            if artifact.type not in transition.requires.artifacts:
+            if artifact.type not in allowed_artifact_types:
                 errors.append(_error(
                     "completion.artifact_unexpected",
                     f"Artifact type is not required by this transition: {artifact.type}",

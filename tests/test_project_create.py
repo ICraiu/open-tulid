@@ -58,6 +58,7 @@ class TestProjectCreation:
             assert (tmp_vault / "Engine" / dirname).is_dir()
             assert f"Engine/{dirname}" in result.created_dirs
         assert (tmp_vault / "Engine" / "workflow.yaml").is_file()
+        assert (tmp_vault / "Engine" / "workflow.yaml").read_text(encoding="utf-8") == ""
         assert (tmp_vault / "Engine" / "agents" / "default.agent.md").is_file()
 
     def test_project_fails_when_exists(self, valid_config: Config):
@@ -66,17 +67,33 @@ class TestProjectCreation:
             create_project(valid_config, "Engine")
         assert exc_info.value.code == 2
 
-    @pytest.mark.parametrize("name", ["", "Project/Subproject", "Project\\Sub", "../Engine", "/tmp/Engine", "Unknown"])
-    def test_project_rejects_invalid_or_unconfigured_names(self, valid_config: Config, name: str):
+    @pytest.mark.parametrize("name", ["", "Project/Subproject", "Project\\Sub", "../Engine", "/tmp/Engine"])
+    def test_project_rejects_invalid_names(self, valid_config: Config, name: str):
         with pytest.raises(SystemExit) as exc_info:
             create_project(valid_config, name)
         assert exc_info.value.code == 2
+
+    def test_project_adds_unconfigured_project_to_in_memory_config(self, tmp_vault: Path, valid_config: Config):
+        result = create_project(valid_config, "NewProject")
+        assert result.name == "NewProject"
+        assert valid_config.projects == ["Engine", "NewProject"]
+        assert valid_config.project_configs["NewProject"].tracker_path == "NewProject"
+        assert (tmp_vault / "NewProject" / "workflow.yaml").is_file()
 
     def test_project_cli_creates_structure(self, tmp_vault: Path, config_file: Path):
         result = runner.invoke(app, ["project", "Engine"])
         assert result.exit_code == 0
         assert "Project created: Engine" in result.output
         assert (tmp_vault / "Engine" / "workflow.yaml").is_file()
+
+    def test_project_cli_tracks_new_project_in_config(self, tmp_vault: Path, config_file: Path):
+        result = runner.invoke(app, ["project", "NewProject"])
+        assert result.exit_code == 0
+        assert "Project created: NewProject" in result.output
+        assert (tmp_vault / "NewProject" / "workflow.yaml").is_file()
+        reloaded = load_config()
+        assert reloaded.projects == ["Engine", "NewProject"]
+        assert reloaded.project_configs["NewProject"].tracker_path == "NewProject"
 
 
 class TestInitCommand:
@@ -89,6 +106,8 @@ class TestInitCommand:
         assert "tracker:" in text
         assert "projects:" in text
         assert "runtime:" in text
+        assert "# Tulid stores tracker projects" in text
+        assert "projects: {}" in text
         assert not (config_path.parent / "workflow.yaml").exists()
 
     def test_init_refuses_existing_config(self, tmp_path: Path):
@@ -147,7 +166,7 @@ class TestConfigLoading:
 
     @pytest.mark.parametrize("body", [
         "other: {foo: bar}\n",
-        "tracker: {type: obsidian, root: /tmp}\nprojects: {}\n",
+        "tracker: {type: obsidian, root: /tmp}\nprojects: []\n",
     ])
     def test_config_rejects_invalid_shape(self, tmp_path: Path, body: str):
         _write_config(tmp_path, tmp_path, body)

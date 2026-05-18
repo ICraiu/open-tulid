@@ -88,8 +88,8 @@ def _load_project_configs(
     config_dir: Path,
 ) -> dict[str, ProjectConfig]:
     raw_projects = data.get("projects")
-    if not isinstance(raw_projects, dict) or not raw_projects:
-        _fail("projects must be a non-empty mapping")
+    if not isinstance(raw_projects, dict):
+        _fail("projects must be a mapping")
 
     configs: dict[str, ProjectConfig] = {}
     abs_vault = vault_root.resolve()

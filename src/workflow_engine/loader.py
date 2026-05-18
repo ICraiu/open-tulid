@@ -20,6 +20,7 @@ from .ast import (
     TaskTypeStatement,
     TransactionPlan,
     TransitionStatement,
+    DerivesSpec,
     ValidationCall,
     ValidationTypeStatement,
     WorkerStatement,
@@ -706,6 +707,48 @@ def _build_transition(
         if txn is not None:
             transaction = txn
 
+    derives = None
+    derives_raw = raw.get("derives")
+    if derives_raw is not None:
+        d_path = f"{item_path}.derives"
+        if not isinstance(derives_raw, dict):
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "derives must be a mapping",
+                key_span(raw, "derives", d_path),
+            ))
+        else:
+            for key in derives_raw:
+                if key not in langdef.DERIVES_KEYS:
+                    diagnostics.append(_diag_from_span(
+                        "workflow.shape.unknown_key",
+                        f"unknown key {key!r} in derives",
+                        key_span(derives_raw, key, f"{d_path}.{key}"),
+                    ))
+            missing = langdef.DERIVES_KEYS - set(derives_raw)
+            for key in missing:
+                diagnostics.append(_diag_from_span(
+                    "workflow.shape.missing_required_field",
+                    f"derives missing required field: {key}",
+                    key_span(derives_raw, key, f"{d_path}.{key}"),
+                ))
+            if not missing:
+                values = {key: derives_raw[key] for key in langdef.DERIVES_KEYS}
+                for key, value in values.items():
+                    if not isinstance(value, str):
+                        diagnostics.append(_diag_from_span(
+                            "workflow.shape.wrong_type",
+                            f"derives.{key} must be a string",
+                            key_span(derives_raw, key, f"{d_path}.{key}"),
+                        ))
+                if not diagnostics:
+                    derives = DerivesSpec(
+                        task_type=values["task_type"],
+                        state=values["state"],
+                        artifact_type=values["artifact_type"],
+                        span=key_span(raw, "derives", d_path),
+                    )
+
     if diagnostics:
         return diagnostics, None
 
@@ -719,6 +762,7 @@ def _build_transition(
         default_for_scheduler=default_for_scheduler,
         requires=requires,
         transaction=transaction,
+        derives=derives,
         span=item_span,
         field_spans=dict(field_spans),
     )

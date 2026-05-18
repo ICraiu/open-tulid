@@ -340,3 +340,22 @@ class TestObsidianAdapterEffects:
         assert result.accepted is True
         event_path = project / "events" / "2026-05-09.jsonl"
         assert json.loads(event_path.read_text(encoding="utf-8")) == event
+
+    def test_creates_new_task_and_places_board_card(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        (project / "kanban" / "Work.md").write_text("## Todo\n", encoding="utf-8")
+        task = Task(
+            id=TASK_ID,
+            title="Derived child",
+            path="tasks/unused.md",
+            current_state="Todo",
+            task_type="task",
+            parent_id="01J00000000000000000000002",
+            body="Child body\n",
+        )
+
+        result = _adapter(project).create_task(task)
+
+        assert result.accepted is True
+        assert (project / "tasks" / f"{TASK_ID}-derived-child.md").is_file()
+        assert f"[[{TASK_ID}-derived-child]]" in (project / "kanban" / "Work.md").read_text(encoding="utf-8")

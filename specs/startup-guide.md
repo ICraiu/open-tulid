@@ -65,13 +65,13 @@ model_proxy:
 
 ## 3. Create a project
 
-First add the project to `projects:` in config, then run:
+Run:
 
 ```bash
 tulid project Agent
 ```
 
-Tulid creates the project under the tracker root:
+Tulid adds `Agent` to `projects:` in config and creates the project under the tracker root:
 
 ```text
 <tracker-root>/Agent/

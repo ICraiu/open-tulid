@@ -105,6 +105,7 @@ class ObsidianAdapter:
         AdapterCapability.LOAD_PROJECT,
         AdapterCapability.READ_TASK,
         AdapterCapability.WRITE_TASK,
+        AdapterCapability.CREATE_TASK,
         AdapterCapability.MOVE_TASK,
         AdapterCapability.APPEND_EVENT,
     })
@@ -139,28 +140,48 @@ class ObsidianAdapter:
         if task_path is None:
             task_path = self._tasks_root() / f"{task.id}-{_slugify(task.title)}.md"
 
-        frontmatter = dict(task.metadata)
-        frontmatter["id"] = task.id
-        frontmatter["type"] = task.task_type
-        if task.current_state:
-            frontmatter["state"] = task.current_state
-        if task.dependencies:
-            frontmatter["dependencies"] = list(task.dependencies)
-        if task.artifact_links:
-            frontmatter["artifact_links"] = list(task.artifact_links)
-        if task.parent_id is not None:
-            frontmatter["parent_id"] = task.parent_id
+        return self._write_text(task_path, _serialize_task(task))
 
-        title = task.title.strip()
-        body = task.body.strip("\n")
-        content_lines = [_serialize_frontmatter(frontmatter), ""]
-        if title:
-            content_lines.extend([f"# {title}", ""])
-        if body:
-            content_lines.append(body)
-            content_lines.append("")
-
-        return self._write_text(task_path, "\n".join(content_lines))
+    def create_task(self, task: Task) -> WriteResult:
+        loaded = self._load()
+        if loaded.errors:
+            return WriteResult(errors=tuple(loaded.errors))
+        if task.id in loaded.task_paths_by_id:
+            return WriteResult(errors=(_error(
+                "task.already_exists",
+                f"Task {task.id} already exists.",
+                task.id,
+            ),))
+        target = self._mapping_for_state(task.current_state)
+        if target is None:
+            return WriteResult(errors=(_error(
+                "state.unmapped",
+                f"State {task.current_state!r} is not mapped to an Obsidian board column.",
+                task.current_state,
+            ),))
+        board = loaded.boards_by_name.get(target.board)
+        if board is None:
+            return WriteResult(errors=(_error(
+                "board.not_found",
+                f"Board {target.board!r} was not loaded.",
+                target.board,
+            ),))
+        insert_at = _find_column_insert_index(list(board.lines), target.column)
+        if insert_at is None:
+            return WriteResult(errors=(_error(
+                "board.column_not_found",
+                f"Board {target.board!r} does not contain column {target.column!r}.",
+                target.column,
+            ),))
+        task_path = self._tasks_root() / f"{task.id}-{_slugify(task.title)}.md"
+        note_name = task_path.stem
+        task_content = _serialize_task(task)
+        board_lines = list(board.lines)
+        board_lines.insert(insert_at, f"- [ ] [[{note_name}]]")
+        return self._write_prepared([
+            _PreparedWrite(path=task_path, content=task_content),
+            _PreparedWrite(path=board.path, content="\n".join(board_lines) + "\n"),
+        ])
 
     def move_task(self, task_id: str, state: str) -> WriteResult:
         loaded = self._load()
@@ -652,6 +673,29 @@ def _serialize_frontmatter(values: Mapping[str, Any]) -> str:
     output = StringIO()
     _yaml().dump({key: values[key] for key in sorted(values)}, output)
     return "---\n" + output.getvalue().rstrip("\n") + "\n---"
+
+
+def _serialize_task(task: Task) -> str:
+    frontmatter = dict(task.metadata)
+    frontmatter["id"] = task.id
+    frontmatter["type"] = task.task_type
+    if task.current_state:
+        frontmatter["state"] = task.current_state
+    if task.dependencies:
+        frontmatter["dependencies"] = list(task.dependencies)
+    if task.artifact_links:
+        frontmatter["artifact_links"] = list(task.artifact_links)
+    if task.parent_id is not None:
+        frontmatter["parent_id"] = task.parent_id
+    title = task.title.strip()
+    body = task.body.strip("\n")
+    content_lines = [_serialize_frontmatter(frontmatter), ""]
+    if title:
+        content_lines.extend([f"# {title}", ""])
+    if body:
+        content_lines.append(body)
+        content_lines.append("")
+    return "\n".join(content_lines)
 
 
 def _extract_title(body: str) -> str | None:

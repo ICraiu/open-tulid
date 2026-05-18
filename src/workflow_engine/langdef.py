@@ -21,7 +21,7 @@ STATEMENT_KEYS: Final = {
     "operation_type": frozenset({"kind", "id", "args"}),
     "transition": frozenset({
         "kind", "id", "task_type", "from", "to", "worker", "default_for_scheduler",
-        "requires", "transaction", "instructions",
+        "requires", "transaction", "instructions", "derives",
     }),
 }
 
@@ -68,5 +68,6 @@ VALIDATION_CALL_KEYS: Final = frozenset({"type", "args"})
 OPERATION_CALL_KEYS: Final = frozenset({"op", "args"})
 
 TRANSACTION_PLAN_KEYS: Final = frozenset({"steps"})
+DERIVES_KEYS: Final = frozenset({"task_type", "state", "artifact_type"})
 
 SUPPORTED_SCHEMA_VERSIONS: Final = frozenset({1})

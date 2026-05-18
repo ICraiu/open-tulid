@@ -249,6 +249,7 @@ class TransitionDefinition:
     worker: str | None
     requires: "RequirementDefinition"
     transaction: "TransactionDefinition" | None
+    derives: "DerivesDefinition | None" = None
     default_for_scheduler: bool = False
     instructions: tuple[str, ...] = ()
 
@@ -275,3 +276,10 @@ class OperationCallDefinition:
 @dataclass(frozen=True)
 class TransactionDefinition:
     steps: tuple["OperationCallDefinition", ...]
+
+
+@dataclass(frozen=True)
+class DerivesDefinition:
+    task_type: str
+    state: str
+    artifact_type: str

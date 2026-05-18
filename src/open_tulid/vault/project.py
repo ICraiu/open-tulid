@@ -3,8 +3,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from open_tulid.models import Config, CreatedProject, Project
-from open_tulid.cli.init import default_workflow
+from open_tulid.models import Config, CreatedProject, Project, ProjectConfig
+from open_tulid.config import CONFIG_FILENAME
+from ruamel.yaml import YAML
 
 
 REQUIRED_DIRS = ["kanban", "docs", "tasks", "events", "agents"]
@@ -20,9 +21,6 @@ def create_project(config: Config, name: str) -> CreatedProject:
         _fail("Project name must not be empty")
 
     name = name.strip()
-    if name not in config.project_configs:
-        _fail(f"Project is not configured: {name}")
-
     # Validate name doesn't escape or contain path separators
     if "/" in name:
         _fail(f"Project name contains '/': {name}")
@@ -51,11 +49,7 @@ def create_project(config: Config, name: str) -> CreatedProject:
             dir_path = project_path / dir_name
             dir_path.mkdir(parents=True, exist_ok=True)
             created_dirs.append(f"{name}/{dir_name}")
-        (project_path / "workflow.yaml").write_text(
-            "# Project-owned workflow. Edit this to define states, workers, and transitions.\n"
-            + default_workflow(),
-            encoding="utf-8",
-        )
+        (project_path / "workflow.yaml").write_text("", encoding="utf-8")
         (project_path / "agents" / "default.agent.md").write_text(
             "# Default Agent Instructions\n\n"
             "Add project-wide coding standards and completion guidance here.\n",
@@ -64,7 +58,31 @@ def create_project(config: Config, name: str) -> CreatedProject:
     except OSError as e:
         _fail(f"Failed to create project directory: {e}")
 
+    if project_config is None:
+        _track_project(config, name)
+
     return CreatedProject(name=name, path=project_path, created_dirs=created_dirs)
+
+
+def _track_project(config: Config, name: str) -> None:
+    workflow_path = config.vault_root / name / "workflow.yaml"
+    config.projects.append(name)
+    config.project_configs[name] = ProjectConfig(
+        name=name,
+        tracker_path=name,
+        workflow_path=workflow_path,
+    )
+
+    if config.config_dir is None:
+        return
+
+    config_path = config.config_dir / CONFIG_FILENAME
+    yaml = YAML()
+    data = yaml.load(config_path.read_text(encoding="utf-8")) or {}
+    projects = data.setdefault("projects", {})
+    projects[name] = {"path": name}
+    with config_path.open("w", encoding="utf-8") as handle:
+        yaml.dump(data, handle)
 
 
 def iter_configured_projects(config: Config) -> list[Project]:

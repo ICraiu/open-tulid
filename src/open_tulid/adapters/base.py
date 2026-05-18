@@ -11,6 +11,7 @@ class AdapterCapability(str, Enum):
     LOAD_PROJECT = "load_project"
     READ_TASK = "read_task"
     WRITE_TASK = "write_task"
+    CREATE_TASK = "create_task"
     MOVE_TASK = "move_task"
     APPEND_EVENT = "append_event"
 
@@ -52,6 +53,9 @@ class StorageAdapter(Protocol):
 
     def write_task(self, task: Task) -> WriteResult:
         """Persist a domain task without deciding workflow transitions."""
+
+    def create_task(self, task: Task) -> WriteResult:
+        """Persist a new task and place it into its initial tracker state."""
 
     def move_task(self, task_id: str, state: str) -> WriteResult:
         """Apply an already-approved logical task move."""

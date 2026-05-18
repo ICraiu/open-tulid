@@ -4,6 +4,9 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+from io import StringIO
+
+from ruamel.yaml import YAML
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, WorkflowDefinition
@@ -203,6 +206,14 @@ class CompletionService:
             artifacts=normalize_artifacts(submission.artifacts),
             existing_task=self.adapter.read_task(job.task_id).task,
         )
+        derived_tasks, derivation_errors = _derived_task_plan(
+            output_dir=output_dir,
+            transition=transition,
+            artifacts=normalize_artifacts(submission.artifacts),
+            parent_id=job.task_id,
+        )
+        if derivation_errors:
+            return CompletionResult(False, verification=verification, errors=derivation_errors)
         events = (
             build_event(
                 project_id=job.project_id,
@@ -248,6 +259,24 @@ class CompletionService:
                 )
                 for item in promoted_artifacts
             ),
+            *(
+                build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="system", id="task-manager-runtime"),
+                    event_type=EventType.TaskDerived,
+                    correlation_id=job.job_id,
+                    task_id=item["task"].id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    submission_id=submission_id,
+                    data={
+                        "parent_id": job.task_id,
+                        "state": item["task"].current_state,
+                        "task_type": item["task"].task_type,
+                    },
+                )
+                for item in derived_tasks
+            ),
             build_event(
                 project_id=job.project_id,
                 actor=EventActor(type="system", id="task-manager-runtime"),
@@ -281,6 +310,20 @@ class CompletionService:
                     "link": item["link"],
                 }
                 for item in promoted_artifacts
+            ),
+            *(
+                {
+                    "type": "create_task",
+                    "task": _task_to_dict(item["task"]),
+                }
+                for item in derived_tasks
+            ),
+            *(
+                ({
+                    "type": "link_derived_tasks",
+                    "parent_id": job.task_id,
+                    "child_links": tuple(item["link"] for item in derived_tasks),
+                },) if derived_tasks else ()
             ),
             {"type": "move_task", "task_id": job.task_id, "to_state": transition.to_state},
         )
@@ -360,6 +403,23 @@ class CompletionService:
             to_state = str(effect.get("to_state", ""))
             moved = self.adapter.move_task(task_id, to_state)
             return _EffectApplyResult(moved.accepted, "task moved", moved.errors)
+        if effect_type == "create_task":
+            payload = effect.get("task")
+            if not isinstance(payload, Mapping):
+                return _EffectApplyResult(False, "derived task payload invalid", (_error(
+                    "task.derived_invalid", "Derived task payload is invalid.",
+                ),))
+            task = _task_from_mapping(payload)
+            created = self.adapter.create_task(task)
+            return _EffectApplyResult(created.accepted, "task created", created.errors)
+        if effect_type == "link_derived_tasks":
+            loaded = self.adapter.read_task(str(effect.get("parent_id", "")))
+            if not loaded.accepted or loaded.task is None:
+                return _EffectApplyResult(False, "parent task missing", loaded.errors)
+            links = tuple(str(link) for link in effect.get("child_links", ()))
+            updated = _task_with_derived_links(loaded.task, links)
+            written = self.adapter.write_task(updated)
+            return _EffectApplyResult(written.accepted, "parent linked", written.errors)
         if effect_type == "promote_artifact":
             source_path = Path(str(effect.get("source_path", "")))
             target_path = Path(str(effect.get("target_path", "")))
@@ -389,6 +449,11 @@ class CompletionService:
 
     def _compensate_effect(self, effect: Mapping[str, object]) -> _EffectApplyResult:
         effect_type = effect.get("type")
+        if effect_type not in {"promote_artifact", "create_task", "link_derived_tasks"}:
+            return _EffectApplyResult(True)
+        # Derived task creation and parent-linking compensation is intentionally
+        # conservative for now; journal recovery can safely replay idempotent
+        # accepted records, while adapters reject accidental duplicate IDs.
         if effect_type != "promote_artifact":
             return _EffectApplyResult(True)
         target_path = Path(str(effect.get("target_path", "")))
@@ -493,6 +558,139 @@ def _task_with_links(task: Task, links: tuple[str, ...]) -> Task:
     )
 
 
+def _task_with_derived_links(task: Task, child_links: tuple[str, ...]) -> Task:
+    body = task.body.rstrip()
+    section = "\n\n## Derived tasks\n" + "\n".join(f"- [[{link}]]" for link in child_links) + "\n"
+    return Task(
+        id=task.id,
+        title=task.title,
+        path=task.path,
+        current_state=task.current_state,
+        task_type=task.task_type,
+        dependencies=task.dependencies,
+        artifact_links=task.artifact_links,
+        parent_id=task.parent_id,
+        metadata=task.metadata,
+        body=body + section,
+    )
+
+
+def _task_to_dict(task: Task) -> Mapping[str, object]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "path": task.path,
+        "current_state": task.current_state,
+        "task_type": task.task_type,
+        "dependencies": tuple(task.dependencies),
+        "artifact_links": tuple(task.artifact_links),
+        "parent_id": task.parent_id,
+        "metadata": dict(task.metadata),
+        "body": task.body,
+    }
+
+
+def _task_from_mapping(payload: Mapping[str, object]) -> Task:
+    return Task(
+        id=str(payload["id"]),
+        title=str(payload["title"]),
+        path=str(payload["path"]),
+        current_state=str(payload["current_state"]),
+        task_type=str(payload.get("task_type", "task")),
+        dependencies=tuple(str(item) for item in payload.get("dependencies", ())),
+        artifact_links=tuple(str(item) for item in payload.get("artifact_links", ())),
+        parent_id=str(payload["parent_id"]) if payload.get("parent_id") is not None else None,
+        metadata=dict(payload.get("metadata", {})),
+        body=str(payload.get("body", "")),
+    )
+
+
+def _derived_task_plan(
+    *,
+    output_dir: Path,
+    transition,
+    artifacts: tuple[ArtifactSubmission, ...],
+    parent_id: str,
+) -> tuple[tuple[Mapping[str, object], ...], tuple[DomainError, ...]]:
+    if transition.derives is None:
+        return (), ()
+    selected = tuple(artifact for artifact in artifacts if artifact.type == transition.derives.artifact_type)
+    parsed: list[tuple[str, str, tuple[str, ...], str]] = []
+    errors: list[DomainError] = []
+    local_ids: set[str] = set()
+    for artifact in selected:
+        path = output_dir / artifact.path
+        try:
+            local_id, title, dependencies, body = _parse_derived_task_file(path)
+        except ValueError as exc:
+            errors.append(_error("task.derived_invalid", str(exc), artifact.path))
+            continue
+        if local_id in local_ids:
+            errors.append(_error("task.derived_duplicate_local_id", f"Duplicate derived task local_id: {local_id}", local_id))
+        local_ids.add(local_id)
+        parsed.append((local_id, title, dependencies, body))
+    if errors:
+        return (), tuple(errors)
+    ids = {local_id: new_ulid() for local_id, *_ in parsed}
+    planned: list[Mapping[str, object]] = []
+    for local_id, title, dependencies, body in parsed:
+        unknown = tuple(dep for dep in dependencies if dep not in ids)
+        if unknown:
+            errors.append(_error(
+                "task.derived_unknown_dependency",
+                f"Derived task {local_id!r} references unknown local dependencies: {', '.join(unknown)}",
+                local_id,
+            ))
+            continue
+        task_id = ids[local_id]
+        task = Task(
+            id=task_id,
+            title=title,
+            path=f"tasks/{task_id}.md",
+            current_state=transition.derives.state,
+            task_type=transition.derives.task_type,
+            dependencies=tuple(ids[dep] for dep in dependencies),
+            parent_id=parent_id,
+            body=body,
+        )
+        planned.append({"task": task, "link": f"{task_id}-{_slugify(title)}"})
+    return tuple(planned), tuple(errors)
+
+
+def _parse_derived_task_file(path: Path) -> tuple[str, str, tuple[str, ...], str]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError("Derived task artifact must start with YAML frontmatter.")
+    try:
+        _, raw_frontmatter, body = text.split("---", 2)
+        parsed = YAML(typ="safe").load(StringIO(raw_frontmatter)) or {}
+    except Exception as exc:
+        raise ValueError(f"Derived task frontmatter is invalid: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Derived task frontmatter must be a mapping.")
+    local_id = str(parsed.get("local_id", "")).strip()
+    if not local_id:
+        raise ValueError("Derived task frontmatter requires local_id.")
+    dependencies_raw = parsed.get("dependencies")
+    if dependencies_raw is None:
+        dependencies = ()
+    elif isinstance(dependencies_raw, str):
+        dependencies = (dependencies_raw,)
+    elif isinstance(dependencies_raw, list):
+        dependencies = tuple(str(item) for item in dependencies_raw)
+    else:
+        raise ValueError("Derived task dependencies must be a string or list.")
+    title = next((line[2:].strip() for line in body.splitlines() if line.startswith("# ")), "")
+    if not title:
+        raise ValueError("Derived task body requires a Markdown H1 title.")
+    return local_id, title, dependencies, body
+
+
+def _slugify(value: str) -> str:
+    import re
+    return re.sub(r"[^a-zA-Z0-9]+", "-", value.strip()).strip("-").lower() or "task"
+
+
 def _artifact_to_dict(artifact: ArtifactSubmission | str) -> Mapping[str, object]:
     if not isinstance(artifact, ArtifactSubmission):
         clean = str(artifact)
@@ -544,7 +742,7 @@ def recover_completion_transactions(
     existing_event_ids = {event.event_id for event in event_store.iter_events()}
     for record in journal_store.list_incomplete():
         effect_types = {effect.get("type") for effect in record.effects}
-        if not effect_types or not effect_types.issubset({"promote_artifact", "move_task"}):
+        if not effect_types or not effect_types.issubset({"promote_artifact", "move_task", "create_task", "link_derived_tasks"}):
             continue
         if record.task_id is None or record.transition_id is None:
             continue

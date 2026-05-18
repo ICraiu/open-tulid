@@ -115,6 +115,17 @@ def _build_statement_properties(kind: str, allowed: frozenset) -> dict:
             props[field_name] = _requirement_set_schema()
         elif field_name == "transaction":
             props[field_name] = _transaction_schema()
+    if "derives" in allowed:
+        props["derives"] = {
+            "type": "object",
+            "required": ["task_type", "state", "artifact_type"],
+            "additionalProperties": False,
+            "properties": {
+                "task_type": {"type": "string"},
+                "state": {"type": "string"},
+                "artifact_type": {"type": "string"},
+            },
+        }
 
     return props
 
