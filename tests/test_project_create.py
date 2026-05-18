@@ -154,14 +154,19 @@ class TestConfigLoading:
             "  shared_workspace_root: ../workspaces\n  completion_host: 127.0.0.1\n  completion_port: 8765\n"
             "  completion_container_host: host.test\n  container_volume_relabel: true\n"
             "  worker_images: {codex: 'registry.local/codex:dev'}\n  worker_args: {codex: [exec, '{prompt_packet}']}\n"
-            "  worker_resources: {codex: [remote-llm]}\n  worker_types: {codex: codex}\n  env: {OPEN_TULID_ENV: test}\n"
-            "model_proxy:\n  openai:\n    kind: openai\n    base_url: https://api.openai.com/v1\n    api_key_env: OPENAI_API_KEY\n"
+            "  worker_resources: {codex: [remote-llm]}\n  worker_types: {codex: codex}\n"
+            "  worker_model_env: {codex: {OPENAI_BASE_URL: '{endpoint}', OPENAI_API_KEY: '{token}'}}\n"
+            "  env: {OPEN_TULID_ENV: test}\n"
+            "model_proxy:\n  openai:\n    kind: openai\n    base_url: https://api.openai.com/v1\n"
+            "    api_key_file: secrets/openai.key\n"
             "resources:\n  remote-llm:\n    kind: model\n    capacity: 1\n    proxy: openai\n"
         ))
         config = load_config()
         assert config.runtime.docker_executable == "podman"
         assert config.runtime.shared_workspace_root == tmp_path / "workspaces"
         assert config.runtime.worker_args == {"codex": ("exec", "{prompt_packet}")}
+        assert config.runtime.worker_model_env["codex"]["OPENAI_BASE_URL"] == "{endpoint}"
+        assert config.model_proxy["openai"].api_key_file == tmp_path / ".tulid" / "secrets" / "openai.key"
         assert config.resources["remote-llm"].proxy == "openai"
 
     @pytest.mark.parametrize("body", [
@@ -173,6 +178,22 @@ class TestConfigLoading:
         with pytest.raises(SystemExit) as exc_info:
             load_config()
         assert exc_info.value.code == 2
+
+    def test_config_loads_subscription_model_backend(self, tmp_path: Path, tmp_vault: Path):
+        tmp_vault.mkdir()
+        _write_config(tmp_path, tmp_vault, (
+            f"tracker:\n  type: obsidian\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
+            "runtime:\n  worker_resources: {codex: [codex-subscription]}\n  worker_types: {codex: codex}\n"
+            "model_proxy:\n  chatgpt-codex:\n    kind: subscription\n    auth_home: ~/.codex\n"
+            "resources:\n  codex-subscription:\n    kind: model\n    capacity: 4\n    proxy: chatgpt-codex\n"
+        ))
+
+        config = load_config()
+
+        proxy = config.model_proxy["chatgpt-codex"]
+        assert proxy.kind == "subscription"
+        assert proxy.auth_home == tmp_path / ".codex"
+        assert proxy.container_auth_home == "/root/.codex"
 
     def test_config_rejects_tracker_path_escape(self, tmp_path: Path, tmp_vault: Path):
         tmp_vault.mkdir()

@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from open_tulid.domain import Task
+from open_tulid.runtime.context import LinkedContextResolver
+
+
+def _task(*, body: str = "", artifact_links: tuple[str, ...] = ()) -> Task:
+    return Task(
+        id="01J00000000000000000000001",
+        title="Task",
+        path="tasks/task.md",
+        current_state="Todo",
+        artifact_links=artifact_links,
+        body=body,
+    )
+
+
+def test_linked_context_includes_artifacts_and_recursive_wiki_links(tmp_path: Path):
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "artifacts" / "spec.md").write_text("Spec body. See [[follow-up]].\n", encoding="utf-8")
+    (tmp_path / "docs" / "follow-up.md").write_text("Follow-up body.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=("artifacts/spec.md",)),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == ["artifacts/spec.md", "follow-up"]
+    assert "Spec body" in result.packet.text
+    assert "Follow-up body" in result.packet.text
+
+
+def test_linked_context_dedupes_cycles(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("A -> [[b]]\n", encoding="utf-8")
+    (tmp_path / "docs" / "b.md").write_text("B -> [[a]]\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(_task(body="See [[a]]."))
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == ["a", "b"]
+
+
+def test_linked_context_rejects_missing_required_artifact_link(tmp_path: Path):
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=("artifacts/missing.md",)),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "context.link_not_found"
+
+
+def test_linked_context_rejects_artifact_path_escape(tmp_path: Path):
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=("../secret.md",)),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "context.link_not_found"

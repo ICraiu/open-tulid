@@ -8,14 +8,15 @@ from threading import Thread
 from typing import Mapping
 
 from open_tulid.adapters.base import StorageAdapter
-from open_tulid.containers.runtime import AgentRunResult, request_for_worker, run_agent_container
+from open_tulid.containers.runtime import AgentRunResult, ContainerMount, request_for_worker, run_agent_container
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
-from open_tulid.models import ProjectConfig, ResourceConfig, RuntimeConfig
+from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime.completion import CompletionService
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
 from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver
+from open_tulid.runtime.context import LinkedContextResolver
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
 from open_tulid.runtime.workspaces import WorkspacePreparer
@@ -49,6 +50,7 @@ class JobExecutor:
         artifact_root: Path | None = None,
         lease_store: FileResourceLeaseStore | None = None,
         resources: dict[str, ResourceConfig] | None = None,
+        model_proxies: dict[str, ModelProxyConfig] | None = None,
         model_proxy_sessions: ModelProxySessionStore | FileModelProxySessionStore | None = None,
         model_proxy_endpoint_base: str | None = None,
         validation_implementations: Mapping[str, object] | None = None,
@@ -64,6 +66,7 @@ class JobExecutor:
         self.artifact_root = artifact_root
         self.lease_store = lease_store
         self.resources = resources or {}
+        self.model_proxies = model_proxies or {}
         self.model_proxy_sessions = model_proxy_sessions
         self.model_proxy_endpoint_base = model_proxy_endpoint_base
         self.validation_implementations = validation_implementations
@@ -138,6 +141,16 @@ class JobExecutor:
             )
             project_root = _adapter_project_root(self.adapter)
             if project_root is not None:
+                context_result = LinkedContextResolver(project_root).build_context_packet(task_result.task)
+                if not context_result.accepted:
+                    endpoint.stop()
+                    return self._fail_before_run(
+                        job,
+                        context_result.errors[0],
+                    )
+                context_packet = context_result.packet
+                if context_packet is not None and context_packet.text:
+                    prompt_text = f"{prompt_text}\n\n{context_packet.text}"
                 prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
                     worker=worker,
                     task_type=task_type,
@@ -182,12 +195,13 @@ class JobExecutor:
             ))
 
             request = request_for_worker(
-                worker_id=job.worker_id,
+                worker_id=_execution_worker_id(worker, job.worker_id),
                 workspace=prepared.workspace,
                 runtime=self.runtime,
                 args=_worker_args(
                     runtime=self.runtime,
                     worker_id=job.worker_id,
+                    implementation_id=_execution_worker_id(worker, job.worker_id),
                     container_workspace=self.runtime.container_workspace,
                     completion_endpoint=endpoint.url,
                 ),
@@ -199,6 +213,7 @@ class JobExecutor:
                     "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
                     **self._model_proxy_env(job.job_id, job.worker_id, required_resources),
                 },
+                mounts=self._subscription_mounts(required_resources),
             )
             try:
                 result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
@@ -338,6 +353,9 @@ class JobExecutor:
             resource = self.resources.get(resource_id)
             if resource is None or resource.proxy is None:
                 continue
+            proxy = self.model_proxies.get(resource.proxy)
+            if proxy is not None and proxy.kind == "subscription":
+                continue
             session = self.model_proxy_sessions.issue(
                 job_id=job_id,
                 worker_id=worker_id,
@@ -360,7 +378,25 @@ class JobExecutor:
                 "OPEN_TULID_MODEL_SESSION_TOKEN": endpoint["token"],
                 "OPEN_TULID_MODEL_PROXY_ID": endpoint["proxy_id"],
             })
+            env.update(_render_worker_model_env(
+                self.runtime.worker_model_env.get(worker_id, {}),
+                endpoint,
+            ))
         return env
+
+    def _subscription_mounts(self, required_resources: tuple[str, ...]) -> tuple[ContainerMount, ...]:
+        mounts: list[ContainerMount] = []
+        for resource_id in required_resources:
+            resource = self.resources.get(resource_id)
+            if resource is None or resource.proxy is None:
+                continue
+            proxy = self.model_proxies.get(resource.proxy)
+            if proxy is None or proxy.kind != "subscription":
+                continue
+            assert proxy.auth_home is not None
+            assert proxy.container_auth_home is not None
+            mounts.append(ContainerMount(proxy.auth_home, proxy.container_auth_home))
+        return tuple(mounts)
 
 
 @dataclass(frozen=True)
@@ -387,6 +423,19 @@ def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
     (log_dir / "command.txt").write_text(" ".join(_redact_command_for_log(result.command)) + "\n", encoding="utf-8")
 
 
+def _render_worker_model_env(
+    templates: Mapping[str, str],
+    endpoint: Mapping[str, str],
+) -> dict[str, str]:
+    values = {
+        "endpoint": endpoint["endpoint"],
+        "token": endpoint["token"],
+        "proxy_id": endpoint["proxy_id"],
+        "resource_id": endpoint["resource_id"],
+    }
+    return {key: value.format_map(values) for key, value in templates.items()}
+
+
 _SCOPED_TOKEN_ENV_KEYS = frozenset({
     "OPEN_TULID_COMPLETION_TOKEN",
     "OPEN_TULID_MODEL_SESSION_TOKEN",
@@ -398,11 +447,21 @@ def _redact_command_for_log(command: tuple[str, ...]) -> tuple[str, ...]:
     redacted: list[str] = []
     for part in command:
         key, separator, _value = part.partition("=")
-        if separator and key in _SCOPED_TOKEN_ENV_KEYS:
+        if separator and _should_redact_env_key(key):
             redacted.append(f"{key}=<redacted>")
         else:
             redacted.append(part)
     return tuple(redacted)
+
+
+def _should_redact_env_key(key: str) -> bool:
+    normalized = key.upper()
+    return (
+        key in _SCOPED_TOKEN_ENV_KEYS
+        or "TOKEN" in normalized
+        or "SECRET" in normalized
+        or normalized.endswith("_KEY")
+    )
 
 
 def _write_prompt_packet(workspace: Path, text: str) -> str:
@@ -465,10 +524,11 @@ def _worker_args(
     *,
     runtime: RuntimeConfig,
     worker_id: str,
+    implementation_id: str,
     container_workspace: str,
     completion_endpoint: str,
 ) -> tuple[str, ...]:
-    args = runtime.worker_args.get(worker_id, ())
+    args = runtime.worker_args.get(worker_id, runtime.worker_args.get(implementation_id, ()))
     values = {
         "prompt_packet": f"{container_workspace}/.open-tulid/prompt-packet.md",
         "job_context": f"{container_workspace}/.open-tulid/job-context.json",
@@ -477,6 +537,11 @@ def _worker_args(
         "output_dir": f"{container_workspace}/output",
     }
     return tuple(arg.format(**values) for arg in args)
+
+
+def _execution_worker_id(worker, fallback: str) -> str:
+    implementation_id = getattr(worker, "implementation_id", None)
+    return str(implementation_id) if implementation_id else fallback
 
 
 def _adapter_project_root(adapter: StorageAdapter) -> Path | None:

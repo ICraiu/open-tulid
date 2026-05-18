@@ -55,6 +55,65 @@ projects:
 
 A commented starter file also lives at `config.yaml.example`.
 
+Workers can be pointed at Tulid's model proxy without receiving upstream
+credentials. A single-endpoint OpenAI-compatible worker can be configured like:
+
+```yaml
+runtime:
+  worker_resources:
+    codex_direction: [remote-openai]
+  worker_types:
+    codex_direction: codex
+  worker_model_env:
+    codex_direction:
+      OPENAI_BASE_URL: "{endpoint}"
+      OPENAI_API_KEY: "{token}"
+
+resources:
+  remote-openai:
+    kind: model
+    capacity: 4
+    proxy: openai
+
+model_proxy:
+  openai:
+    kind: openai
+    base_url: https://api.openai.com/v1
+    api_key_file: secrets/openai.key
+```
+
+The worker receives only a short-lived Tulid token; the real upstream key stays
+with the proxy. Local models use the same resource/lease path, so capacity `1`
+prevents two workers from degrading the same model at once.
+
+Codex subscription access is different: the Codex CLI must see the host Codex
+auth directory itself, so it uses a subscription backend instead of the HTTP
+proxy path:
+
+```yaml
+runtime:
+  worker_resources:
+    codex_direction: [codex-subscription]
+  worker_types:
+    codex_direction: codex
+
+resources:
+  codex-subscription:
+    kind: model
+    capacity: 4
+    proxy: chatgpt-codex
+
+model_proxy:
+  chatgpt-codex:
+    kind: subscription
+    auth_home: ~/.codex
+    container_auth_home: /root/.codex
+```
+
+That backend still participates in Tulid scheduling, but it intentionally does
+not emit proxy endpoint credentials because Codex talks through its own
+subscription login.
+
 ## Usage
 
 ```bash

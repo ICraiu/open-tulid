@@ -24,6 +24,7 @@ class RuntimeConfig:
     worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
     worker_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)
     worker_types: dict[str, str] = field(default_factory=dict)
+    worker_model_env: dict[str, dict[str, str]] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
     completion_host: str = "0.0.0.0"
     completion_port: int = 0
@@ -41,8 +42,11 @@ class ResourceConfig:
 @dataclass(frozen=True)
 class ModelProxyConfig:
     kind: str
-    base_url: str
+    base_url: str | None = None
     api_key_env: str | None = None
+    api_key_file: Path | None = None
+    auth_home: Path | None = None
+    container_auth_home: str | None = None
 
 
 @dataclass(frozen=True)

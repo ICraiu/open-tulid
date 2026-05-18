@@ -166,15 +166,41 @@ class TaskManager:
         return CommandResult(accepted=True, events=events, effects=effects)
 
     def create_execution_job(self, command: CreateExecutionJob) -> CommandResult:
-        transition_result = self.request_transition(RequestTransition(
-            project_id=command.project_id,
-            task_id=command.task_id,
-            transition_id=command.transition_id,
-            actor=command.actor,
-        ))
-        if not transition_result.accepted:
-            return transition_result
-        transition = self.workflow.transitions[command.transition_id]
+        loaded = self.adapter.load_project()
+        if not loaded.accepted:
+            return CommandResult(accepted=False, errors=loaded.errors)
+        snapshot = loaded.snapshot
+        if snapshot is None:
+            return CommandResult(accepted=False, errors=(_error(
+                "project.snapshot_missing",
+                "Adapter returned no project snapshot.",
+            ),))
+        task = snapshot.tasks.get(command.task_id)
+        if task is None:
+            return CommandResult(accepted=False, errors=(_error(
+                "task.not_found",
+                f"Task {command.task_id!r} was not found.",
+                command.task_id,
+            ),))
+        transition = self.workflow.transitions.get(command.transition_id)
+        if transition is None:
+            return CommandResult(accepted=False, errors=(_error(
+                "transition.not_found",
+                f"Transition {command.transition_id!r} is not defined.",
+                command.transition_id,
+            ),))
+        if transition.task_type != task.task_type:
+            return CommandResult(accepted=False, errors=(_error(
+                "transition.task_type_mismatch",
+                f"Transition {transition.id!r} expects task type {transition.task_type!r}.",
+                task.id,
+            ),))
+        if transition.from_state != task.current_state:
+            return CommandResult(accepted=False, errors=(_error(
+                "transition.state_mismatch",
+                f"Transition {transition.id!r} requires state {transition.from_state!r}.",
+                task.id,
+            ),))
         if transition.worker is None:
             return CommandResult(accepted=False, errors=(_error(
                 "transition.worker_missing",
@@ -206,7 +232,14 @@ class TaskManager:
             if saved.job is not None:
                 job = saved.job
         events = (
-            *(event for event in transition_result.events if event.event_type == EventType.TransitionAccepted),
+            _event(
+                project_id=command.project_id,
+                actor=command.actor,
+                event_type=EventType.TransitionAccepted,
+                task_id=task.id,
+                transition_id=transition.id,
+                data={"from": transition.from_state, "to": transition.to_state},
+            ),
             _event(
                 project_id=command.project_id,
                 actor=command.actor,

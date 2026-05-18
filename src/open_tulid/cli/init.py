@@ -35,7 +35,15 @@ runtime:
   worker_args: {}
   worker_resources: {}
   worker_types: {}
+  # Optional provider-compatible env vars rendered only for workers with exactly
+  # one leased model endpoint. Available placeholders:
+  # {endpoint}, {token}, {proxy_id}, {resource_id}
+  worker_model_env: {}
   env: {}
+
+# Model backends stay here. Local/OpenAI backends use the HTTP proxy; Codex
+# subscription backends mount host Codex auth into the worker instead.
+model_proxy: {}
 """
 
 

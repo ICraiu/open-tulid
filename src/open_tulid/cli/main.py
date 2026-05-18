@@ -582,6 +582,7 @@ def run_job(
         artifact_root=ctx["project_path"] / "artifacts",
         lease_store=ctx["lease_store"],
         resources=ctx["config"].resources,
+        model_proxies=ctx["config"].model_proxy,
         model_proxy_sessions=ctx["model_proxy_sessions"],
         model_proxy_endpoint_base=_model_proxy_endpoint_base(ctx["config"]),
         validation_implementations=VALIDATION_IMPLEMENTATIONS,

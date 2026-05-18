@@ -189,10 +189,8 @@ class OpenAIAdapter:
         self.env = env
 
     def forward(self, request: ProxyRequest) -> ProxyResponse:
-        assert self.config.api_key_env is not None
-        api_key = self.env.get(self.config.api_key_env)
-        if not api_key:
-            raise RuntimeError(f"Missing environment variable {self.config.api_key_env!r}")
+        api_key = _openai_api_key(self.config, self.env)
+        assert self.config.base_url is not None
         return _forward_http(self.config.base_url, request, {"authorization": f"Bearer {api_key}"})
 
 
@@ -212,18 +210,27 @@ def check_backend_readiness(
 ) -> tuple[BackendReadiness, ...]:
     results: list[BackendReadiness] = []
     for proxy_id, config in proxies.items():
+        if config.kind == "subscription":
+            ready = config.auth_home is not None and config.auth_home.is_dir()
+            results.append(BackendReadiness(
+                proxy_id=proxy_id,
+                ready=ready,
+                error=None if ready else f"subscription auth home is unavailable: {config.auth_home}",
+            ))
+            continue
         headers = {}
         if config.kind == "openai":
-            assert config.api_key_env is not None
-            api_key = env.get(config.api_key_env)
-            if not api_key:
+            try:
+                api_key = _openai_api_key(config, env)
+            except RuntimeError as exc:
                 results.append(BackendReadiness(
                     proxy_id=proxy_id,
                     ready=False,
-                    error=f"missing environment variable {config.api_key_env}",
+                    error=str(exc),
                 ))
                 continue
             headers["authorization"] = f"Bearer {api_key}"
+        assert config.base_url is not None
         request = urllib.request.Request(
             config.base_url.rstrip("/") + "/models",
             headers=headers,
@@ -238,6 +245,23 @@ def check_backend_readiness(
         except (URLError, OSError) as exc:
             results.append(BackendReadiness(proxy_id=proxy_id, ready=False, error=str(exc)))
     return tuple(results)
+
+
+def _openai_api_key(config: ModelProxyConfig, env: Mapping[str, str]) -> str:
+    if config.api_key_env is not None:
+        api_key = env.get(config.api_key_env)
+        if not api_key:
+            raise RuntimeError(f"missing environment variable {config.api_key_env}")
+        return api_key
+    if config.api_key_file is not None:
+        try:
+            api_key = config.api_key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read API key file {config.api_key_file}") from exc
+        if not api_key:
+            raise RuntimeError(f"API key file {config.api_key_file} is empty")
+        return api_key
+    raise RuntimeError("openai proxy is missing authentication config")
 
 
 class ModelProxyService:

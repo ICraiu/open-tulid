@@ -53,7 +53,7 @@ def load_config(path: Path | None = None) -> Config:
     validated_projects = list(project_configs)
     runtime = _load_runtime_config(data, config_dir)
     resources = _load_resources(data)
-    model_proxy = _load_model_proxy(data)
+    model_proxy = _load_model_proxy(data, config_dir)
     model_proxy_server = _load_model_proxy_server(data, config_dir)
     _validate_resource_proxy_refs(resources, model_proxy)
     _validate_worker_resource_compatibility(runtime, resources, model_proxy)
@@ -189,6 +189,9 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         raw.get("worker_resources", {}), "runtime.worker_resources",
     )
     worker_types = _runtime_string_map(raw.get("worker_types", {}), "runtime.worker_types")
+    worker_model_env = _runtime_string_map_map(
+        raw.get("worker_model_env", {}), "runtime.worker_model_env",
+    )
     env = _runtime_string_map(raw.get("env", {}), "runtime.env")
     completion_host = _runtime_string(
         raw, "completion_host", default="0.0.0.0", table="runtime",
@@ -215,6 +218,7 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         worker_args=worker_args,
         worker_resources=worker_resources,
         worker_types=worker_types,
+        worker_model_env=worker_model_env,
         env=env,
         completion_host=completion_host,
         completion_port=completion_port,
@@ -246,7 +250,7 @@ def _load_resources(data: dict) -> dict[str, ResourceConfig]:
     return resources
 
 
-def _load_model_proxy(data: dict) -> dict[str, ModelProxyConfig]:
+def _load_model_proxy(data: dict, config_dir: Path) -> dict[str, ModelProxyConfig]:
     raw = data.get("model_proxy", {})
     if raw is None:
         raw = {}
@@ -259,18 +263,38 @@ def _load_model_proxy(data: dict) -> dict[str, ModelProxyConfig]:
         if not isinstance(item, dict):
             _fail(f"model_proxy.{name} must be a table")
         kind = _required_table_string(item, "kind", f"model_proxy.{name}")
-        if kind not in {"local", "openai"}:
-            _fail(f"model_proxy.{name}.kind must be local or openai")
-        base_url = _required_table_string(item, "base_url", f"model_proxy.{name}")
+        if kind not in {"local", "openai", "subscription"}:
+            _fail(f"model_proxy.{name}.kind must be local, openai, or subscription")
+        base_url = None
+        if kind in {"local", "openai"}:
+            base_url = _required_table_string(item, "base_url", f"model_proxy.{name}")
         api_key_env = item.get("api_key_env")
         if api_key_env is not None and (not isinstance(api_key_env, str) or not api_key_env.strip()):
             _fail(f"model_proxy.{name}.api_key_env must be a non-empty string")
-        if kind == "openai" and api_key_env is None:
-            _fail(f"model_proxy.{name}.api_key_env is required for openai proxies")
+        api_key_file = item.get("api_key_file")
+        if api_key_file is not None:
+            if not isinstance(api_key_file, str) or not api_key_file.strip():
+                _fail(f"model_proxy.{name}.api_key_file must be a non-empty string")
+            api_key_file = _resolve_config_path(api_key_file, config_dir)
+        auth_home = item.get("auth_home")
+        container_auth_home = item.get("container_auth_home")
+        if kind == "openai" and (api_key_env is None) == (api_key_file is None):
+            _fail(f"model_proxy.{name} must configure exactly one of api_key_env or api_key_file")
+        if kind == "subscription":
+            if not isinstance(auth_home, str) or not auth_home.strip():
+                _fail(f"model_proxy.{name}.auth_home is required for subscription proxies")
+            auth_home = _resolve_config_path(auth_home, config_dir)
+            if container_auth_home is None:
+                container_auth_home = "/root/.codex"
+            if not isinstance(container_auth_home, str) or not container_auth_home.startswith("/"):
+                _fail(f"model_proxy.{name}.container_auth_home must be an absolute container path")
         proxies[name.strip()] = ModelProxyConfig(
             kind=kind,
             base_url=base_url,
             api_key_env=api_key_env.strip() if isinstance(api_key_env, str) else None,
+            api_key_file=api_key_file,
+            auth_home=auth_home if isinstance(auth_home, Path) else None,
+            container_auth_home=container_auth_home if isinstance(container_auth_home, str) else None,
         )
     return proxies
 
@@ -307,7 +331,7 @@ def _validate_worker_resource_compatibility(
     proxies: dict[str, ModelProxyConfig],
 ) -> None:
     allowed_proxy_kinds = {
-        "codex": {"openai"},
+        "codex": {"openai", "subscription"},
         "opencode": {"local", "openai"},
     }
     for worker_id, resource_ids in runtime.worker_resources.items():
@@ -381,6 +405,26 @@ def _runtime_string_map(value: object, table: str) -> dict[str, str]:
             )
         result[key.strip()] = item.strip()
     return result
+
+
+def _runtime_string_map_map(value: object, table: str) -> dict[str, dict[str, str]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        _fail(f"{table} must be a table")
+    result: dict[str, dict[str, str]] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            _fail(f"{table} keys must be non-empty strings")
+        result[key.strip()] = _runtime_string_map(item, f"{table}.{key}")
+    return result
+
+
+def _resolve_config_path(value: str, config_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    return path.resolve()
 
 
 def _runtime_string_sequence_map(value: object, table: str) -> dict[str, tuple[str, ...]]:

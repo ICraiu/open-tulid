@@ -70,6 +70,7 @@ def request_for_worker(
     runtime: RuntimeConfig,
     args: Sequence[str] = (),
     env: Mapping[str, str] | None = None,
+    mounts: Sequence[ContainerMount] = (),
 ) -> AgentRunRequest:
     return AgentRunRequest(
         agent_id=worker_id,
@@ -77,6 +78,7 @@ def request_for_worker(
         workspace=workspace,
         args=tuple(args),
         env={**runtime.env, **dict(env or {})},
+        mounts=tuple(mounts),
         extra_hosts=_runtime_extra_hosts(runtime),
         workdir=runtime.container_workspace,
         timeout_seconds=runtime.default_timeout_seconds,

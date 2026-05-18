@@ -11,6 +11,7 @@ from open_tulid.runtime import (
     ProxyResponse,
     serve_model_proxy,
 )
+from open_tulid.runtime.model_proxy import OpenAIAdapter
 from open_tulid.models import ModelProxyConfig
 from open_tulid.models import ResourceConfig
 from open_tulid.runtime import FileResourceLeaseStore
@@ -106,6 +107,46 @@ def test_backend_readiness_uses_models_endpoint_and_openai_auth():
     assert all(result.ready for result in results)
     assert "http://127.0.0.1:8080/v1/models" in seen
     assert seen["https://api.openai.com/v1/models"]["Authorization"] == "Bearer secret"
+
+
+def test_backend_readiness_accepts_existing_subscription_auth_home(tmp_path: Path):
+    auth_home = tmp_path / ".codex"
+    auth_home.mkdir()
+
+    results = check_backend_readiness(
+        {"chatgpt-codex": ModelProxyConfig(kind="subscription", auth_home=auth_home)},
+        env={},
+    )
+
+    assert results[0].ready is True
+
+
+def test_openai_adapter_can_read_api_key_from_file(tmp_path: Path, monkeypatch):
+    key_file = tmp_path / "openai.key"
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    seen = {}
+
+    def fake_forward(base_url, request, headers):
+        seen["base_url"] = base_url
+        seen["headers"] = headers
+        return ProxyResponse(status=200, headers={})
+
+    monkeypatch.setattr("open_tulid.runtime.model_proxy._forward_http", fake_forward)
+    adapter = OpenAIAdapter(
+        ModelProxyConfig(
+            kind="openai",
+            base_url="https://api.openai.com/v1",
+            api_key_file=key_file,
+        ),
+        {},
+    )
+
+    adapter.forward(ProxyRequest(method="POST", path="/responses", body=b"{}", headers={}))
+
+    assert seen == {
+        "base_url": "https://api.openai.com/v1",
+        "headers": {"authorization": "Bearer file-secret"},
+    }
 
 
 def test_model_proxy_rejects_session_without_live_resource_lease(tmp_path: Path):

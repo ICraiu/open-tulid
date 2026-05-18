@@ -216,6 +216,22 @@ def test_create_execution_job_uses_transition_worker_and_workspace(tmp_path: Pat
     assert result.effects[0]["type"] == "create_execution_job"
 
 
+def test_create_execution_job_defers_target_state_artifact_requirements_to_completion(tmp_path: Path):
+    manager = TaskManager(
+        workflow=_workflow_with_review_artifact_requirement(),
+        adapter=FakeAdapter(_snapshot()),
+    )
+
+    result = manager.handle(CreateExecutionJob(
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        workspace_root=tmp_path,
+    ))
+
+    assert result.accepted is True
+
+
 def _workflow_with_review_artifact_requirement() -> WorkflowDefinition:
     workflow = _workflow()
     return WorkflowDefinition(

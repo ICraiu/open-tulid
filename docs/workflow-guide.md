@@ -418,6 +418,14 @@ Tulid resolves refs from the project's `agents/` directory. For a scheduled tran
 - task-type instructions: standards for a category of work
 - transition instructions: what matters in this specific phase
 
+Tulid also injects linked project context into the same prompt packet:
+
+- every path listed in the task's `artifact_links`
+- every `[[wiki link]]` found in the task body
+- every further `[[wiki link]]` found inside those linked files
+
+Linked files are resolved inside the project only, deduplicated, cycle-safe, and size-limited before they are handed to the sandboxed worker. This lets a later stage consume earlier artifacts without granting the worker direct access to the tracker vault.
+
 ## A practical authoring recipe
 
 When designing a workflow, this order tends to stay sane:
