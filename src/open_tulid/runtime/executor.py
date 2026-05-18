@@ -384,7 +384,25 @@ def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
     (log_dir / "stderr.log").write_text(result.stderr, encoding="utf-8")
-    (log_dir / "command.txt").write_text(" ".join(result.command) + "\n", encoding="utf-8")
+    (log_dir / "command.txt").write_text(" ".join(_redact_command_for_log(result.command)) + "\n", encoding="utf-8")
+
+
+_SCOPED_TOKEN_ENV_KEYS = frozenset({
+    "OPEN_TULID_COMPLETION_TOKEN",
+    "OPEN_TULID_MODEL_SESSION_TOKEN",
+    "OPEN_TULID_MODEL_ENDPOINTS",
+})
+
+
+def _redact_command_for_log(command: tuple[str, ...]) -> tuple[str, ...]:
+    redacted: list[str] = []
+    for part in command:
+        key, separator, _value = part.partition("=")
+        if separator and key in _SCOPED_TOKEN_ENV_KEYS:
+            redacted.append(f"{key}=<redacted>")
+        else:
+            redacted.append(part)
+    return tuple(redacted)
 
 
 def _write_prompt_packet(workspace: Path, text: str) -> str:

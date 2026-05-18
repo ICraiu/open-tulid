@@ -18,7 +18,7 @@ def _write_config(root: Path) -> None:
     config_dir = root / CONFIG_DIRNAME
     config_dir.mkdir()
     (config_dir / CONFIG_FILENAME).write_text(
-        f'[vault]\nroot = "{root}"\nprojects = ["Agent"]\n',
+        f'tracker:\n  type: obsidian\n  root: {root}\nprojects:\n  Agent: {{}}\n',
         encoding="utf-8",
     )
 
@@ -27,10 +27,16 @@ def _with_cwd(path: Path):
     class Cwd:
         def __enter__(self):
             self.original = os.getcwd()
+            self.original_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(path)
             os.chdir(path)
 
         def __exit__(self, exc_type, exc, tb):
             os.chdir(self.original)
+            if self.original_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = self.original_home
 
     return Cwd()
 

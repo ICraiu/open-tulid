@@ -142,3 +142,18 @@ def test_file_model_proxy_session_store_never_overwrites_existing_token(tmp_path
     assert second.token == "fresh"
     assert store.get("duplicate").job_id == "job-1"
     assert store.get("fresh").job_id == "job-2"
+
+
+def test_model_proxy_session_stores_expire_issued_sessions(tmp_path: Path):
+    memory = ModelProxySessionStore(ttl_seconds=-1)
+    memory_session = memory.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
+    assert memory_session.issued_at is not None
+    assert memory_session.expires_at is not None
+    assert memory.get(memory_session.token) is None
+
+    files = FileModelProxySessionStore(tmp_path / "sessions", ttl_seconds=-1)
+    file_session = files.issue(job_id="job-2", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
+    assert file_session.issued_at is not None
+    assert file_session.expires_at is not None
+    assert files.get(file_session.token) is None
+    assert not (tmp_path / "sessions" / f"{file_session.token}.json").exists()

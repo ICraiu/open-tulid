@@ -114,3 +114,18 @@ def test_admit_releases_reservation_when_commit_result_is_rejected(tmp_path: Pat
     assert reserved.acquired is True
     assert committed is False
     assert store.leases_for("local-llm") == ()
+
+
+def test_release_inactive_reservations_keeps_only_active_jobs(tmp_path: Path):
+    store = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"local-llm": ResourceConfig(kind="model", capacity=3)},
+    )
+    assert store.try_acquire(("local-llm",), job_id="active", worker_id="opencode").acquired is True
+    assert store.try_acquire(("local-llm",), job_id="accepted", worker_id="opencode").acquired is True
+    assert store.try_acquire(("local-llm",), job_id="failed", worker_id="opencode").acquired is True
+
+    removed = store.release_inactive_reservations({"active"})
+
+    assert sorted(removed) == ["accepted", "failed"]
+    assert [lease.job_id for lease in store.leases_for("local-llm")] == ["active"]

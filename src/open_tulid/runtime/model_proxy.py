@@ -6,6 +6,7 @@ import secrets
 import tempfile
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,25 +25,43 @@ class ModelProxySession:
     worker_id: str
     proxy_id: str
     resource_id: str
+    issued_at: str | None = None
+    expires_at: str | None = None
+
+    def expired(self, now: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        try:
+            expiry = datetime.fromisoformat(self.expires_at)
+        except ValueError:
+            return True
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return (now or datetime.now(timezone.utc)) >= expiry
 
 
 class ModelProxySessionStore:
-    def __init__(self) -> None:
+    def __init__(self, *, ttl_seconds: int = 3600) -> None:
         self._sessions: dict[str, ModelProxySession] = {}
+        self.ttl_seconds = ttl_seconds
 
     def issue(self, *, job_id: str, worker_id: str, proxy_id: str, resource_id: str) -> ModelProxySession:
-        session = ModelProxySession(
-            token=secrets.token_urlsafe(32),
+        session = _new_session(
             job_id=job_id,
             worker_id=worker_id,
             proxy_id=proxy_id,
             resource_id=resource_id,
+            ttl_seconds=self.ttl_seconds,
         )
         self._sessions[session.token] = session
         return session
 
     def get(self, token: str) -> ModelProxySession | None:
-        return self._sessions.get(token)
+        session = self._sessions.get(token)
+        if session is not None and session.expired():
+            del self._sessions[token]
+            return None
+        return session
 
     def revoke_job(self, job_id: str) -> None:
         for token, session in tuple(self._sessions.items()):
@@ -51,18 +70,19 @@ class ModelProxySessionStore:
 
 
 class FileModelProxySessionStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, ttl_seconds: int = 3600) -> None:
         self.root = root
+        self.ttl_seconds = ttl_seconds
 
     def issue(self, *, job_id: str, worker_id: str, proxy_id: str, resource_id: str) -> ModelProxySession:
         with self._locked():
             while True:
-                session = ModelProxySession(
-                    token=secrets.token_urlsafe(32),
+                session = _new_session(
                     job_id=job_id,
                     worker_id=worker_id,
                     proxy_id=proxy_id,
                     resource_id=resource_id,
+                    ttl_seconds=self.ttl_seconds,
                 )
                 path = self.root / f"{session.token}.json"
                 if not path.exists():
@@ -85,7 +105,11 @@ class FileModelProxySessionStore:
         path = self.root / f"{token}.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return ModelProxySession(**payload)
+            session = ModelProxySession(**payload)
+            if session.expired():
+                path.unlink(missing_ok=True)
+                return None
+            return session
         except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
             return None
 
@@ -108,6 +132,26 @@ class FileModelProxySessionStore:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _new_session(
+    *,
+    job_id: str,
+    worker_id: str,
+    proxy_id: str,
+    resource_id: str,
+    ttl_seconds: int,
+) -> ModelProxySession:
+    now = datetime.now(timezone.utc)
+    return ModelProxySession(
+        token=secrets.token_urlsafe(32),
+        job_id=job_id,
+        worker_id=worker_id,
+        proxy_id=proxy_id,
+        resource_id=resource_id,
+        issued_at=now.isoformat(),
+        expires_at=(now + timedelta(seconds=ttl_seconds)).isoformat(),
+    )
 
 
 @dataclass(frozen=True)

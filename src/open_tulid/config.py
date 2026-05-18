@@ -4,10 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib
+from ruamel.yaml import YAML
 
 from open_tulid.models import (
     Config,
@@ -19,9 +16,8 @@ from open_tulid.models import (
 )
 
 
-CONFIG_DIRNAME = ".tuluid"
-CONFIG_FILENAME = "open-tulid.toml"
-LEGACY_CONFIG_FILENAME = ".open-tulid.toml"
+CONFIG_DIRNAME = ".tulid"
+CONFIG_FILENAME = "config.yaml"
 
 
 def _fail(message: str) -> None:
@@ -31,64 +27,30 @@ def _fail(message: str) -> None:
 
 def load_config(path: Path | None = None) -> Config:
     if path is None:
-        cwd_config = Path.cwd() / CONFIG_DIRNAME / CONFIG_FILENAME
-        if cwd_config.is_file():
-            path = cwd_config
-        else:
-            home_config = Path.home() / CONFIG_DIRNAME / CONFIG_FILENAME
-            if home_config.is_file():
-                path = home_config
-            else:
-                legacy_cwd_config = Path.cwd() / LEGACY_CONFIG_FILENAME
-                if legacy_cwd_config.is_file():
-                    path = legacy_cwd_config
-                else:
-                    legacy_home_config = Path.home() / LEGACY_CONFIG_FILENAME
-                    path = legacy_home_config if legacy_home_config.is_file() else home_config
+        path = Path.home() / CONFIG_DIRNAME / CONFIG_FILENAME
 
     if not path.is_file():
         _fail(f"Config file not found: {path}")
 
     config_dir = path.parent
-    raw = path.read_bytes()
-    data = tomllib.loads(raw.decode("utf-8"))
+    yaml = YAML(typ="safe")
+    data = yaml.load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        _fail("config must be a YAML mapping")
 
-    vault = data.get("vault")
-    if vault is None:
-        _fail("[vault] section is missing from config")
-    if not isinstance(vault, dict):
-        _fail("[vault] must be a table")
-
-    vault_root_str = vault.get("root")
-    if vault_root_str is None:
-        _fail("vault.root is missing from config")
-    if not isinstance(vault_root_str, str):
-        _fail("vault.root must be a string")
-
-    vault_root = Path(vault_root_str)
+    tracker = data.get("tracker")
+    if not isinstance(tracker, dict):
+        _fail("tracker section is missing from config")
+    tracker_type = _required_table_string(tracker, "type", "tracker")
+    if tracker_type not in {"obsidian", "text"}:
+        _fail("tracker.type must be obsidian or text")
+    tracker_root_str = _required_table_string(tracker, "root", "tracker")
+    vault_root = Path(tracker_root_str).expanduser()
     if not vault_root.is_dir():
-        _fail(f"vault.root does not point to an existing directory: {vault_root}")
+        _fail(f"tracker.root does not point to an existing directory: {vault_root}")
 
-    project_names = vault.get("projects")
-    if project_names is None:
-        _fail("vault.projects is missing from config")
-
-    if not isinstance(project_names, list):
-        _fail("vault.projects must be a list")
-
-    if len(project_names) == 0:
-        _fail("vault.projects must not be empty")
-
-    validated_projects: list[str] = []
-    for name in project_names:
-        if not isinstance(name, str):
-            _fail(f"Project name must be a string, got: {type(name).__name__}")
-        _validate_project_name(name)
-        validated_projects.append(name)
-
-    project_configs = _load_project_configs(data, vault_root, config_dir, validated_projects)
-
-    workflow_path = _load_workflow_path(data, config_dir)
+    project_configs = _load_project_configs(data, vault_root, config_dir)
+    validated_projects = list(project_configs)
     runtime = _load_runtime_config(data, config_dir)
     resources = _load_resources(data)
     model_proxy = _load_model_proxy(data)
@@ -99,8 +61,8 @@ def load_config(path: Path | None = None) -> Config:
     return Config(
         vault_root=vault_root,
         projects=validated_projects,
+        tracker_type=tracker_type,
         config_dir=config_dir,
-        workflow_path=workflow_path,
         project_configs=project_configs,
         runtime=runtime,
         resources=resources,
@@ -124,25 +86,20 @@ def _load_project_configs(
     data: dict,
     vault_root: Path,
     config_dir: Path,
-    project_names: list[str],
 ) -> dict[str, ProjectConfig]:
-    raw_projects = data.get("projects", {})
-    if raw_projects is None:
-        raw_projects = {}
-    if not isinstance(raw_projects, dict):
-        _fail("[projects] must be a table when present")
-
-    unknown = sorted(set(raw_projects) - set(project_names))
-    if unknown:
-        _fail(f"[projects] contains entries not listed in vault.projects: {', '.join(unknown)}")
+    raw_projects = data.get("projects")
+    if not isinstance(raw_projects, dict) or not raw_projects:
+        _fail("projects must be a non-empty mapping")
 
     configs: dict[str, ProjectConfig] = {}
     abs_vault = vault_root.resolve()
-    for name in project_names:
-        raw = raw_projects.get(name, {})
+    for name, raw in raw_projects.items():
+        if not isinstance(name, str):
+            _fail(f"Project name must be a string, got: {type(name).__name__}")
+        _validate_project_name(name)
         if not isinstance(raw, dict):
             _fail(f"[projects.{name}] must be a table")
-        tracker_path = _project_string(raw, "tracker_path", default=name, table=f"projects.{name}")
+        tracker_path = _project_string(raw, "path", default=name, table=f"projects.{name}")
         _validate_tracker_path(tracker_path)
         candidate = (abs_vault / tracker_path).resolve()
         if not str(candidate).startswith(str(abs_vault) + os.sep) and candidate != abs_vault:
@@ -158,6 +115,7 @@ def _load_project_configs(
             tracker_path=tracker_path,
             repo_root=repo_root,
             main_branch=main_branch,
+            workflow_path=candidate / "workflow.yaml",
         )
     return configs
 
@@ -195,23 +153,6 @@ def _validate_tracker_path(path: str) -> None:
         _fail(f"Project tracker_path contains unsafe path segments: {path}")
     if "\\" in path:
         _fail(f"Project tracker_path contains '\\': {path}")
-
-
-def _load_workflow_path(data: dict, config_dir: Path) -> Path | None:
-    workflow = data.get("workflow")
-    if workflow is None:
-        return None
-    if not isinstance(workflow, dict):
-        _fail("[workflow] must be a table")
-    raw_path = workflow.get("path")
-    if raw_path is None:
-        return None
-    if not isinstance(raw_path, str):
-        _fail("workflow.path must be a string")
-    workflow_path = Path(raw_path)
-    if not workflow_path.is_absolute():
-        workflow_path = config_dir / workflow_path
-    return workflow_path
 
 
 def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:

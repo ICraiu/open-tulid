@@ -3,25 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 
 from open_tulid.domain import WorkflowDefinition
+from open_tulid.adapters.obsidian import ObsidianAdapter, config_from_workflow
 from open_tulid.models import Config, Project, ValidationError, ValidationReport
+from open_tulid.runtime import TaskManager, ValidateProject
 from open_tulid.vault.links import validate_kanban_file
 from open_tulid.vault.project import iter_configured_projects
+from open_tulid.workflow.runtime import load_workflow_definition
 
 
-REQUIRED_DIRS = ["kanban", "docs", "tasks"]
+REQUIRED_DIRS = ["kanban", "docs", "tasks", "agents"]
 
 
 def validate_project(
     project: Project,
     workflow_definition: WorkflowDefinition | None = None,
 ) -> ValidationReport:
-    """Validate adapter-owned project structure.
-
-    The compiled workflow definition is threaded through this boundary so
-    future artifact/task validation can be driven by DSL semantics instead of
-    hardcoded domain policy.
-    """
-    _ = workflow_definition
+    """Validate project structure, then workflow semantics when available."""
     report = ValidationReport()
     report.checked_projects += 1
 
@@ -35,6 +32,12 @@ def validate_project(
                 line=None,
                 message=f"Project '{project.name}' is missing required directory: {dir_name}/",
             ))
+    if not (abs_project / "workflow.yaml").is_file():
+        report.errors.append(ValidationError(
+            path=project.path,
+            line=None,
+            message=f"Project '{project.name}' is missing required file: workflow.yaml",
+        ))
 
     # Validate kanban directory contents
     kanban_dir = abs_project / "kanban"
@@ -60,6 +63,33 @@ def validate_project(
                 report.checked_kanban_files += kanban_report.checked_kanban_files
                 report.checked_task_links += kanban_report.checked_task_links
 
+    if workflow_definition is not None:
+        try:
+            adapter = ObsidianAdapter(config_from_workflow(
+                project_id=project.name,
+                project_root=abs_project,
+                workflow=workflow_definition,
+            ))
+        except ValueError as exc:
+            report.errors.append(ValidationError(
+                path=project.path,
+                line=None,
+                message=f"workflow.runtime_unavailable: {exc}",
+            ))
+            return report
+        runtime_result = TaskManager(
+            workflow=workflow_definition,
+            adapter=adapter,
+        ).validate_project(ValidateProject(project_id=project.name))
+        report.errors.extend(
+            ValidationError(
+                path=project.path,
+                line=None,
+                message=f"{error.code}: {error.message}",
+            )
+            for error in runtime_result.errors
+        )
+
     return report
 
 
@@ -81,7 +111,24 @@ def validate_vault(
             report.checked_projects += 1
             continue
 
-        project_report = validate_project(project, workflow_definition)
+        selected_workflow = workflow_definition
+        if selected_workflow is None:
+            config_for_project = config.project_configs.get(project.name)
+            workflow_path = config_for_project.workflow_path if config_for_project is not None else None
+            if workflow_path is not None and workflow_path.is_file():
+                loaded_workflow = load_workflow_definition(workflow_path)
+                if loaded_workflow.valid:
+                    selected_workflow = loaded_workflow.definition
+                else:
+                    report.errors.extend(
+                        ValidationError(
+                            path=workflow_path,
+                            line=getattr(diagnostic, "line", None),
+                            message=f"{diagnostic.code}: {diagnostic.message}",
+                        )
+                        for diagnostic in loaded_workflow.diagnostics
+                    )
+        project_report = validate_project(project, selected_workflow)
         report.errors.extend(project_report.errors)
         report.checked_projects += project_report.checked_projects
         report.checked_kanban_files += project_report.checked_kanban_files

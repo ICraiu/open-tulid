@@ -6,16 +6,14 @@ from rich.console import Console
 from rich.panel import Panel
 
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
-from open_tulid.workflow.runtime import load_workflow_definition
 
 console = Console()
 
 
 def init() -> None:
-    """Create ~/.tuluid/open-tulid.toml configuration file."""
+    """Create ~/.tulid/config.yaml."""
     config_dir = Path.home() / CONFIG_DIRNAME
     config_path = config_dir / CONFIG_FILENAME
-    workflow_path = config_dir / "workflow.yaml"
 
     if config_path.exists():
         console.print(Panel(
@@ -23,89 +21,36 @@ def init() -> None:
             style="yellow",
         ))
         raise SystemExit(1)
-    if workflow_path.exists():
-        console.print(Panel(
-            f"Workflow already exists at {workflow_path}",
-            style="yellow",
-        ))
-        raise SystemExit(1)
-
     config_dir.mkdir(parents=True, exist_ok=True)
-    workflow_path.write_text(_default_workflow(), encoding="utf-8")
 
     content = (
-        "[vault]\n"
-        "root = \"/path/to/obsidian/vault\"\n"
-        "projects = [\"Agent\", \"Game\"]\n"
+        "tracker:\n"
+        "  type: obsidian\n"
+        "  root: /path/to/tracker/root\n"
         "\n"
-        "[projects.Agent]\n"
-        "tracker_path = \"Agent\"\n"
-        "repo_root = \"/path/to/code/repository\"\n"
-        "main_branch = \"main\"\n"
+        "projects:\n"
+        "  Agent:\n"
+        "    path: Agent\n"
+        "    repo_root: /path/to/code/repository\n"
+        "    main_branch: main\n"
         "\n"
-        "[projects.Game]\n"
-        "tracker_path = \"Game\"\n"
-        "repo_root = \"/path/to/another/code/repository\"\n"
-        "main_branch = \"main\"\n"
-        "\n"
-        "[workflow]\n"
-        "path = \"workflow.yaml\"\n"
-        "\n"
-        "[runtime]\n"
-        "docker_executable = \"docker\"\n"
-        "shared_workspace_root = \"workspaces\"\n"
-        "container_workspace = \"/workspace/project\"\n"
-        "image_tag_prefix = \"open-tulid/agent\"\n"
-        "default_timeout_seconds = 3600\n"
-        "completion_host = \"0.0.0.0\"\n"
-        "completion_port = 0\n"
-        "completion_container_host = \"host.docker.internal\"\n"
-        "container_volume_relabel = false\n"
-        "\n"
-        "[runtime.worker_images]\n"
-        "# codex = \"open-tulid/agent-codex:latest\"\n"
-        "# opencode = \"open-tulid/agent-opencode:latest\"\n"
-        "\n"
-        "[runtime.worker_args]\n"
-        "# codex = [\"exec\", \"--full-auto\", \"--\", \"Read {prompt_packet} and complete the job.\"]\n"
-        "# opencode = [\"run\", \"Read {prompt_packet} and complete the job.\"]\n"
-        "\n"
-        "[runtime.worker_resources]\n"
-        "# codex = [\"remote-llm\"]\n"
-        "# opencode = [\"local-llm\"]\n"
-        "\n"
-        "[runtime.worker_types]\n"
-        "# codex = \"codex\"\n"
-        "# opencode = \"opencode\"\n"
-        "\n"
-        "[runtime.env]\n"
-        "\n"
-        "[model_proxy.local]\n"
-        "kind = \"local\"\n"
-        "base_url = \"http://127.0.0.1:8080/v1\"\n"
-        "\n"
-        "[model_proxy.openai]\n"
-        "kind = \"openai\"\n"
-        "base_url = \"https://api.openai.com/v1\"\n"
-        "api_key_env = \"OPENAI_API_KEY\"\n"
-        "\n"
-        "[resources.local-llm]\n"
-        "kind = \"model\"\n"
-        "capacity = 1\n"
-        "proxy = \"local\"\n"
-        "\n"
-        "[resources.remote-llm]\n"
-        "kind = \"model\"\n"
-        "capacity = 1\n"
-        "proxy = \"openai\"\n"
+        "runtime:\n"
+        "  docker_executable: docker\n"
+        "  shared_workspace_root: workspaces\n"
+        "  container_workspace: /workspace/project\n"
+        "  image_tag_prefix: open-tulid/agent\n"
+        "  default_timeout_seconds: 3600\n"
+        "  completion_host: 0.0.0.0\n"
+        "  completion_port: 0\n"
+        "  completion_container_host: host.docker.internal\n"
+        "  container_volume_relabel: false\n"
+        "  worker_images: {}\n"
+        "  worker_args: {}\n"
+        "  worker_resources: {}\n"
+        "  worker_types: {}\n"
+        "  env: {}\n"
     )
     config_path.write_text(content, encoding="utf-8")
-    workflow_result = load_workflow_definition(workflow_path)
-    if not workflow_result.valid:
-        console.print(Panel("Default workflow validation failed.", style="red"))
-        for diagnostic in workflow_result.diagnostics:
-            console.print(f"{diagnostic.code}: {diagnostic.message}")
-        raise SystemExit(2)
 
     console.print(Panel(
         f"Config created at {config_path}",
@@ -113,7 +58,7 @@ def init() -> None:
     ))
 
 
-def _default_workflow() -> str:
+def default_workflow() -> str:
     return (
         "schema_version: 1\n"
         "storage:\n"
@@ -127,4 +72,6 @@ def _default_workflow() -> str:
         "statements:\n"
         "  - kind: state\n"
         "    id: Todo\n"
+        "  - kind: task_type\n"
+        "    id: task\n"
     )

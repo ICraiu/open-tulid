@@ -102,6 +102,7 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
         )
         with urllib.request.urlopen(http_request, timeout=5) as response:
             seen["status"] = response.status
+            seen["response"] = json.loads(response.read())
         return AgentRunResult(
             agent_id=request.agent_id,
             image=request.image,
@@ -131,6 +132,7 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
 
     assert result.accepted is True
     assert seen["status"] == 200
+    assert seen["response"] == {"accepted": True, "next_state": "CodeReview"}
     assert seen["args"] == ("exec", "/workspace/project/.open-tulid/prompt-packet.md")
     assert str(seen["endpoint"]).startswith("http://127.0.0.1:")
     assert seen["prompt"] == "/workspace/project/.open-tulid/prompt-packet.md"
@@ -185,6 +187,57 @@ def test_executor_releases_resource_lease_when_worker_fails(tmp_path: Path, monk
 
     assert result.accepted is True
     assert leases.leases_for("local-llm") == ()
+
+
+def test_executor_redacts_scoped_tokens_from_persisted_command_log(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "completion-secret"},
+    )).accepted is True
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.run_agent_container",
+        lambda request, *, docker_executable: AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=(
+                "docker",
+                "run",
+                "-e",
+                "OPEN_TULID_COMPLETION_TOKEN=completion-secret",
+                "-e",
+                "OPEN_TULID_MODEL_SESSION_TOKEN=model-secret",
+                "-e",
+                'OPEN_TULID_MODEL_ENDPOINTS=[{"token":"json-secret"}]',
+                "-e",
+                "KEEP_ME=visible",
+            ),
+            returncode=1,
+        ),
+    )
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    executor.run(JOB_ID)
+
+    command_log = (workspace / ".open-tulid" / "logs" / "command.txt").read_text(encoding="utf-8")
+    assert "completion-secret" not in command_log
+    assert "model-secret" not in command_log
+    assert "json-secret" not in command_log
+    assert "OPEN_TULID_COMPLETION_TOKEN=<redacted>" in command_log
+    assert "KEEP_ME=visible" in command_log
 
 
 def test_executor_marks_job_failed_when_internal_error_occurs_after_running(tmp_path: Path, monkeypatch):

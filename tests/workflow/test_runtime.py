@@ -63,3 +63,40 @@ def test_load_workflow_definition_uses_content_fingerprint_not_mtime(tmp_path: P
     assert second.definition is not None
     assert "Done" in second.definition.states
     assert "Todo" not in second.definition.states
+
+
+def test_load_workflow_definition_validates_instruction_refs_inside_project_agents(tmp_path: Path):
+    clear_workflow_cache()
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        "schema_version: 1\n"
+        "statements:\n"
+        "  - kind: worker\n"
+        "    id: codex\n"
+        "    instructions: [missing]\n",
+        encoding="utf-8",
+    )
+
+    result = load_workflow_definition(workflow)
+
+    assert result.valid is False
+    assert [diagnostic.code for diagnostic in result.diagnostics] == ["instructions.not_found"]
+
+
+def test_load_workflow_definition_accepts_existing_agent_instruction(tmp_path: Path):
+    clear_workflow_cache()
+    (tmp_path / "agents").mkdir()
+    (tmp_path / "agents" / "default.agent.md").write_text("Do good work.\n", encoding="utf-8")
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        "schema_version: 1\n"
+        "statements:\n"
+        "  - kind: worker\n"
+        "    id: codex\n"
+        "    instructions: [default]\n",
+        encoding="utf-8",
+    )
+
+    result = load_workflow_definition(workflow)
+
+    assert result.valid is True

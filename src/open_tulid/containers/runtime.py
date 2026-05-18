@@ -147,7 +147,7 @@ def run_agent_container(
 
 
 def default_shared_workspace_root(runtime: RuntimeConfig, fallback: Path) -> Path:
-    return runtime.shared_workspace_root or fallback / ".open-tulid" / "workspaces"
+    return runtime.shared_workspace_root or fallback / "workspaces"
 
 
 def _runtime_extra_hosts(runtime: RuntimeConfig) -> tuple[str, ...]:

@@ -188,6 +188,23 @@ class FileResourceLeaseStore:
             removed.extend(self._release_orphan_reservations_unlocked())
         return tuple(removed)
 
+    def release_inactive_reservations(self, active_job_ids: set[str]) -> tuple[str, ...]:
+        """Release leases for jobs the coordinator no longer considers active."""
+        removed: list[str] = []
+        with self._locked():
+            if not self.root.exists():
+                return ()
+            for path in self.root.glob("*/leases/*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                job_id = payload.get("job_id")
+                if isinstance(job_id, str) and job_id not in active_job_ids:
+                    path.unlink(missing_ok=True)
+                    removed.append(job_id)
+        return tuple(removed)
+
     def _release_orphan_reservations_unlocked(self) -> list[str]:
         removed: list[str] = []
         if not self.root.exists():

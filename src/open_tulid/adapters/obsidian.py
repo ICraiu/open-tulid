@@ -15,6 +15,7 @@ from ruamel.yaml import YAML
 
 from open_tulid.domain.schema import BoardPosition, DomainError, ProjectSnapshot, Task, WorkflowDefinition
 from open_tulid.vault.links import parse_task_row
+from open_tulid.runtime.events import new_ulid
 
 from .base import (
     AdapterCapability,
@@ -368,7 +369,15 @@ class ObsidianAdapter:
             return _error("task.invalid_frontmatter", str(exc), str(path))
         task_id = frontmatter.get("id")
         if not isinstance(task_id, str) or not task_id.strip():
-            return _error("task.missing_id", "Task file is missing required frontmatter field 'id'.", str(path))
+            task_id = new_ulid()
+            frontmatter["id"] = task_id
+            try:
+                normalized = _serialize_frontmatter(frontmatter) + "\n\n" + body.strip("\n")
+                if body.strip("\n"):
+                    normalized += "\n"
+                path.write_text(normalized, encoding="utf-8")
+            except OSError as exc:
+                return _error("task.id_assignment_failed", f"Cannot assign task ID: {exc}", str(path))
         task_id = task_id.strip()
         if ULID_RE.match(task_id) is None:
             return _error("task.invalid_id", "Task ID must be a 26-character Crockford Base32 ULID.", str(path))

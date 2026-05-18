@@ -61,7 +61,11 @@ def make_completion_handler(config: CompletionEndpointConfig) -> type[BaseHTTPRe
                 submission=submission_from_mapping(payload),
             )
             if result.accepted:
-                _write_json(self, 200, {"accepted": True})
+                payload: dict[str, object] = {"accepted": True}
+                next_state = _next_state_for_accepted(config.service, job_id)
+                if next_state is not None:
+                    payload["next_state"] = next_state
+                _write_json(self, 200, payload)
                 return
 
             status = _status_for_errors(result.errors)
@@ -120,3 +124,11 @@ def _domain_error_dict(error: DomainError) -> Mapping[str, object]:
 
 def _error_dict(code: str, message: str) -> Mapping[str, object]:
     return {"code": code, "message": message, "location": None}
+
+
+def _next_state_for_accepted(service: CompletionService, job_id: str) -> str | None:
+    loaded = service.job_store.get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        return None
+    transition = service.workflow.transitions.get(loaded.job.transition_id)
+    return transition.to_state if transition is not None else None

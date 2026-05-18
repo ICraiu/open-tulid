@@ -83,9 +83,14 @@ def load_workflow_definition(path: Path) -> WorkflowLoadResult:
         return result
 
     compiled = compile_workflow(ast.document)
+    instruction_diagnostics = (
+        _instruction_diagnostics(compiled.definition, workflow_path.parent)
+        if compiled.definition is not None
+        else ()
+    )
     result = WorkflowLoadResult(
         definition=compiled.definition,
-        diagnostics=compiled.diagnostics,
+        diagnostics=(*compiled.diagnostics, *instruction_diagnostics),
     )
     _CACHE[workflow_path] = _CachedWorkflow(fingerprint=fingerprint, result=result)
     return result
@@ -97,3 +102,33 @@ def clear_workflow_cache() -> None:
 
 def _has_error_diagnostic(diagnostics: tuple[object, ...]) -> bool:
     return any(getattr(diag, "severity", "error") == "error" for diag in diagnostics)
+
+
+def _instruction_diagnostics(
+    definition: WorkflowDefinition,
+    project_root: Path,
+) -> tuple[WorkflowCompileDiagnostic, ...]:
+    refs = {
+        ref
+        for owner in (*definition.workers.values(), *definition.task_types.values(), *definition.transitions.values())
+        for ref in owner.instructions
+    }
+    root = project_root / "agents"
+    diagnostics: list[WorkflowCompileDiagnostic] = []
+    for ref in sorted(refs):
+        path = Path(ref)
+        if path.is_absolute() or ".." in path.parts:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="instructions.invalid_ref",
+                message=f"Instruction reference must stay inside agents/: {ref}",
+                path=str(project_root / "workflow.yaml"),
+            ))
+            continue
+        candidates = [root / f"{ref}.agent.md", root / ref] if path.suffix != ".md" else [root / path]
+        if sum(candidate.is_file() for candidate in candidates) != 1:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="instructions.not_found",
+                message=f"Instruction reference must resolve to exactly one agents/*.agent.md file: {ref}",
+                path=str(project_root / "workflow.yaml"),
+            ))
+    return tuple(diagnostics)

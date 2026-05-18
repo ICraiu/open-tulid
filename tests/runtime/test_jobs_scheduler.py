@@ -165,6 +165,33 @@ def test_file_execution_job_store_rejects_duplicate_active_job(tmp_path: Path):
     assert duplicate.error.code == "job.active_exists"
 
 
+def test_file_execution_job_store_treats_stale_job_as_reschedule_blocker(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    stale = ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="stale",
+    )
+
+    assert store.create(stale).accepted is True
+    duplicate = store.create(ExecutionJob(
+        job_id="01J00000000000000000000J02",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work2"),
+    ))
+
+    assert duplicate.accepted is False
+    assert duplicate.error is not None
+    assert duplicate.error.code == "job.active_exists"
+
+
 def _create_same_active_job(root: str, suffix: str, queue) -> None:
     store = FileExecutionJobStore(Path(root))
     result = store.create(ExecutionJob(

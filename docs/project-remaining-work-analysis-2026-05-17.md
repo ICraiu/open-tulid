@@ -1,487 +1,703 @@
 # Remaining Work Analysis for open-tulid
 
-Date: 2026-05-17
+Date: 2026-05-17  
+Inputs reviewed:
+
+- repository at `/home/rawsteel/repo/open-tulid`
+- project/spec vault at `/home/rawsteel/repo/obsidian/Agent`
+- two independent repository/spec audits, then a comparison pass between the reviewers
 
 ## Executive Summary
 
-open-tulid has crossed the line from architectural sketch into credible prototype. The repository already contains a real workflow compiler, Obsidian adapter, event journal, scheduler, resource leases, execution jobs, Docker-backed workers, completion endpoint, artifact promotion, model proxy, operator commands, and a meaningful Docker-backed end-to-end path. The full suite currently passes (`451 passed`).
+open-tulid is no longer an architectural sketch. It already contains a real workflow DSL/compiler, an Obsidian adapter with meaningful invariant checks, file-backed jobs/events/journals, resource leases, Docker workers, a completion endpoint, artifact promotion, trusted validation hooks, model-proxy sessions, operator commands, and Docker-backed end-to-end coverage.
 
-The remaining work is no longer broad scaffolding. It is the harder second half of the project: making the system trustworthy under concurrency, crashes, hostile inputs, long runtimes, and ordinary operator use.
+The remaining work is therefore not “build the product.” It is the more exacting second half:
 
-The two independent reviews agreed on the same large gaps:
+```text
+make every transition honest,
+then make honest transitions survive the real world.
+```
 
-1. completion acceptance is still too trusting of worker claims;
-2. transaction and recovery semantics are incomplete;
-3. the security/isolation story is ahead of the implementation;
-4. runtime supervision is not yet strong enough for unattended operation;
-5. the product surface and docs are behind the architecture;
-6. the tests prove the paved road, but not enough of the broken-road cases.
+The two independent reviews converged on the same broad diagnosis:
 
-They disagreed mainly on sequencing. One reviewer put **runtime supervision** first because unattended execution is the most visible operational weakness. The other put **trusted verification** first because without it the system can move work forward on assertions that trusted code never actually checked. My synthesis is:
+1. the project’s **truth boundary is still unevenly enforced**;
+2. the runtime is **credible but not yet supervisor-grade**;
+3. recovery exists in pieces, but not yet as a **continuous operating discipline**;
+4. code promotion, security hardening, operator UX, and docs are still behind the architecture;
+5. the tests prove the paved road well, but not enough broken-road behavior.
 
-- **first harden what becomes true**: verification + completion transaction safety;
-- **then harden how long-running work survives**: supervision + recovery;
-- **then tighten isolation, product polish, and adversarial coverage around those stronger cores**.
+The most important synthesis point is one neither reviewer wanted lost beneath the runtime backlog:
 
-The project’s deepest promise is that agents may act, but trusted code decides what becomes true. The remaining roadmap should protect that promise above all else.
+> open-tulid only becomes a trustworthy system when every state transition—manual or automated—flows through one requirement-validating, transactional path owned by trusted code.
 
-## Current State: What Is Already Solid
+At the time of this analysis, the local suite passes:
 
-The project already has several well-shaped foundations:
+```text
+463 passed
+```
 
-- **Workflow language and compiler**: the DSL, loader, validation, registry, and compiled workflow runtime are implemented and heavily tested (`src/workflow_engine/*`, `src/open_tulid/workflow/*`, `tests/workflow_engine/*`, `tests/workflow/*`).
-- **File-backed project model**: Obsidian integration, project validation, domain artifact validation, and Kanban/task parsing exist (`src/open_tulid/adapters/obsidian.py`, `src/open_tulid/vault/*`, `src/open_tulid/domain/*`).
-- **Structured runtime records**: JSONL events, human logs, transaction journals, job persistence, and resource lease persistence are present (`src/open_tulid/runtime/events.py`, `jobs.py`, `resources.py`).
-- **Agent-runtime golden path**: scheduling, execution jobs, Docker worker invocation, completion endpoint, artifact promotion, and review transition all exist (`src/open_tulid/runtime/scheduler.py`, `executor.py`, `completion.py`).
-- **Credential direction**: a host-side model proxy with scoped sessions is already implemented, which is a strong architectural move (`src/open_tulid/runtime/model_proxy.py`).
-- **Meaningful test base**: the repository has broad unit coverage and Docker-backed end-to-end scenarios for success, retry-after-rejection, and no-completion failure (`tests/e2e/test_docker_mock_agent_runtime.py`).
+That is a strong foundation. It is not yet the same thing as operational maturity.
 
-This is important context: the right roadmap is not “build the product.” It is “finish the product so the present architecture becomes dependable.”
+## What Is Already Strong
+
+### 1. Workflow language and compiler
+
+This is the cleanest subsystem in the repository.
+
+- standalone DSL frontend with parser, AST, schema, diagnostics, and semantic validation in `src/workflow_engine/*`
+- separate compile layer in `src/open_tulid/workflow/*`
+- good architectural boundary tests in `tests/workflow/test_boundaries.py`
+- broad focused coverage in `tests/workflow_engine/*` and `tests/workflow/*`
+
+The project has already done the difficult early work of separating authored workflow intent from compiled runtime structures.
+
+### 2. Obsidian adapter and file-backed invariants
+
+The adapter is materially stronger than a thin Markdown parser. It enforces:
+
+- ULID identity checks
+- duplicate task detection
+- duplicate active-board card detection
+- board position as canonical state
+- missing active card detection
+
+Evidence lives mainly in `src/open_tulid/adapters/obsidian.py`.
+
+### 3. Runtime core
+
+The repo already has serious pieces:
+
+- JSONL structured events and human-readable logs
+- transaction journals
+- file-backed job persistence
+- resource lease persistence and capacity control
+- scheduler and execution jobs
+- Docker-backed worker launch
+- completion endpoint and deterministic verifier
+- artifact promotion and compensation/recovery work
+- model proxy sessions that keep provider credentials host-side
+
+Core modules:
+
+- `src/open_tulid/runtime/events.py`
+- `src/open_tulid/runtime/jobs.py`
+- `src/open_tulid/runtime/resources.py`
+- `src/open_tulid/runtime/scheduler.py`
+- `src/open_tulid/runtime/executor.py`
+- `src/open_tulid/runtime/completion.py`
+- `src/open_tulid/runtime/verifier.py`
+- `src/open_tulid/runtime/model_proxy.py`
+
+### 4. Completion path progress
+
+Several items that older backlog notes described as future work are now implemented:
+
+- payload-size cap and endpoint routing
+- replay/idempotency handling
+- terminal-job rejection
+- completion-token enforcement
+- duplicate artifact and changed-file detection
+- symlink/path traversal checks
+- trusted host-side validation hooks
+- changed-file diff comparison when a Git workspace is available
+- completion compensation and recovery
+- CLI transaction recovery commands
+
+That progress should be preserved in future docs; older assessments now understate the current code.
+
+### 5. Test base
+
+The test suite is not ornamental. It covers:
+
+- workflow loading/compilation
+- adapter behavior
+- scheduler/resources/jobs
+- completion/verifier/transactions
+- model proxy
+- Docker-backed E2E flows
+
+The next test leap should be about **failure models**, not basic coverage volume.
+
+## The Two Audits: Agreement and Useful Disagreement
+
+Both reviewers agreed that the largest remaining families are:
+
+- runtime supervision
+- crash recovery
+- scheduler durability
+- workspace/Git promotion
+- security/isolation hardening
+- docs/operator polish
+- adversarial tests
+
+They diverged usefully on emphasis:
+
+- One review foregrounded **runtime adulthood**: live supervision, stale detection, token leakage, durable logs, and operator control.
+- The other foregrounded **semantic adulthood**: manual transitions bypassing the command/effect boundary, state requirements not being universally enforced, and validation split-brain.
+
+After comparing notes, the joint view is:
+
+```text
+P0  unify the truth path
+P1  make that path durable under real failure
+P2  make the product legible, hardened, and pleasant to operate
+```
 
 ## Priority Map
 
 ```text
-P0  Truth and durability
-    - trusted verification
-    - completion transaction recovery
+P0  Truth boundary
+    - one lawful transition path
+    - authoritative requirements
+    - one authoritative validation path
 
-P1  Unattended operation
-    - managed runtime supervision
-    - scheduler durability / retries / reconciliation
+P1  Operational resilience
+    - managed supervision
+    - systemic recovery
+    - scheduler durability
+    - workspace / Git promotion
 
-P1  Trust boundaries
+P1  Trust boundary
+    - token hygiene
+    - session expiry / scope
     - isolation controls
-    - secret hygiene
-    - workspace / git promotion model
 
 P2  Product finish
-    - CLI contract parity
-    - operator ergonomics
-    - docs and install flow
-
-P2  Proof under stress
-    - adversarial and failure-mode tests
+    - CLI/API/spec coherence
+    - docs and install readiness
+    - adversarial/failure-mode tests
 ```
 
-## 1. Trusted Verification Is Not Yet Truly Trusted
+# P0 — Make Workflow Truth Actually Authoritative
+
+## 1. Manual transitions still bypass the intended architecture
 
 ### Spec intent
 
-The specs are explicit: transition requirements are authoritative, agents submit evidence, and trusted code decides whether work may move forward (`spec/19-completion-verifier.md`, `spec/24-core-invariants.md`, `spec/25-golden-path-todo-to-code-review.md`, `runtime-remaining-work-plan-2026-05-15.md` Phase 3).
+The foundational boundary in the specs is:
+
+```text
+Interface
+-> Task Manager Runtime
+-> Workflow Engine
+-> Command Result
+-> approved Effects
+-> Storage Adapter
+```
+
+Relevant specs:
+
+- `spec/03-interfaces.md`
+- `spec/09-command-result-model.md`
+- `spec/11-atomic-transition-plan.md`
+- `spec/29-cli-contract.md`
 
 ### Current implementation
 
-`DeterministicVerifier` currently checks:
+`TaskManager.request_transition()` validates basic transition shape, but returns no move effect and does not itself perform the transition mutation. The CLI `transition` command then directly calls `adapter.move_task()`.
 
-- required artifact types are present;
-- artifact paths stay inside the output directory;
-- artifacts exist, are non-empty, and optionally match a hash;
-- required validation-evidence keys are present and non-empty strings;
-- listed changed files exist in the workspace.
+Evidence:
 
-See `src/open_tulid/runtime/verifier.py`.
-
-### Why this is insufficient
-
-The verifier does **not** yet:
-
-- run host-side trusted validations such as tests, lint, or builds;
-- prove that `validation_evidence` corresponds to a command actually executed by trusted code;
-- verify `must_pass` semantics against actual command results;
-- require changed-file evidence when the flow says it is required;
-- compare `changed_files` against an actual diff;
-- reject duplicate artifacts or duplicate changed-file entries;
-- validate required markdown structure/fields inside promoted artifacts;
-- persist accepted and rejected completion snapshots with redaction.
-
-A worker can currently submit `tests_pass = "passed"` and satisfy the verifier without the host executing tests. That is a philosophical break in the system: the worker is still telling Tulid what is true.
-
-### Hidden schema drift
-
-The flow spec models richer requirements than the domain/runtime currently retain. In particular, `changed_files.required` exists in the specs, but the current domain requirements model only keeps artifacts and validations. This is not merely backlog; it is a widening seam between the language and the runtime.
-
-### Required work
-
-- Extend the flow/domain model so runtime requirements preserve all promised contract fields.
-- Add trusted host-run validation commands and bind their outputs to completion decisions.
-- Introduce diff-backed changed-file verification.
-- Add duplicate detection and stronger artifact-content validation.
-- Persist normalized completion snapshots for both accepted and rejected submissions.
-- Make verifier feedback structured enough for deterministic retry loops.
-
-### Acceptance target
-
-No task should enter review because a worker merely claimed that required evidence exists. The host must be able to inspect and prove the basis of acceptance.
-
-## 2. Transactions and Recovery Are Present, but Not Complete
-
-### Spec intent
-
-The atomic-transition plan and MVP contracts call for:
-
-- revision reads;
-- locking;
-- prepared journals;
-- atomic writes where available;
-- final reread and validation;
-- committed event append;
-- stale-lock recovery;
-- visible partial failures.
-
-See `spec/11-atomic-transition-plan.md` and `spec/26-mvp-contracts.md`.
-
-### Current implementation
-
-The repository already has:
-
-- `FileTransactionRuntime` with prepared journals and ordered effect application;
-- transaction-backed job creation;
-- recovery for incomplete job-creation journals;
-- adapter-local rollback for some multi-file writes.
-
-See `src/open_tulid/runtime/transactions.py`, `scheduler.py`, and `adapters/obsidian.py`.
-
-### Remaining gaps
-
-The current transaction layer does **not** yet provide:
-
-- project/task revision checks before mutation;
-- final trusted reread + validation after mutation;
-- generic recovery for completion transactions;
-- compensation for partially applied effects;
-- a complete policy when artifact promotion succeeds but the later task move or event append fails;
-- first-class operator commands to inspect and recover prepared/failed journals.
-
-The most concerning live path is completion acceptance: artifact promotion, task link updates, board moves, and event writes can partially succeed before a later step fails (`src/open_tulid/runtime/completion.py`).
-
-### Required work
-
-- Add project-level mutation locks and revision checks.
-- Make each trusted effect idempotent or compensable.
-- Add recovery for completion journals, not only job creation.
-- Add final reread/validation before a transaction becomes committed truth.
-- Surface incomplete transactions in validation and operator commands.
-- Define a strict reconciliation policy for every partial-effect boundary.
-
-### Acceptance target
-
-An interruption at any effect boundary should be inspectable and recoverable without hand-editing vault state.
-
-## 3. Runtime Supervision Is the Largest Operational Gap
-
-### Spec intent
-
-`runtime-supervision.md` and the remaining-work plan call for:
-
-- durable container identity;
-- live stdout/stderr streaming;
-- wrapper heartbeat;
-- startup, heartbeat, idle, total, and shutdown timeouts;
-- stale-runtime detection;
-- inspect/tail/stop/kill controls;
-- crash reconciliation after host failure.
-
-### Current implementation
-
-The executor still blocks on a `docker run`-style invocation and writes logs after the worker exits. Runtime commands exist (`runtime start/stop/status`, `jobs daemon`, `jobs logs`), but they do not amount to full supervision.
-
-See `src/open_tulid/runtime/executor.py`, `src/open_tulid/containers/runtime.py`, and `src/open_tulid/cli/main.py`.
-
-### Remaining gaps
-
-- no persisted container ID / image identity / supervisor PID on the job;
-- no live log streaming to durable storage;
-- no heartbeat distinct from worker output;
-- no startup-vs-idle-vs-total timeout model;
-- no stale detection for running job without container, container without matching job, dead endpoint, or stale heartbeat;
-- no durable detached-runtime recovery model after a host crash;
-- no live inspect / stop / kill operator path for a worker already in flight;
-- workspace logs can disappear with workspace cleanup.
-
-### Required work
-
-- Replace blocking worker execution with managed process/container supervision.
-- Persist runtime identity and health metadata on jobs.
-- Stream logs live and promote them before cleanup.
-- Implement heartbeat and timeout classes separately.
-- Reconcile leftover runtime state at startup and on periodic sweeps.
-- Add operator-grade inspect/tail/follow/stop/kill commands.
-
-### Acceptance target
-
-One worker attempt should be observable, controllable, and recoverable while it is still running, without spelunking through disposable workspace internals.
-
-## 4. Scheduler Durability Exists in Embryo, Not Yet in Product Form
-
-### Current strengths
-
-- one active job per task/transition is enforced in storage;
-- resource lease acquisition exists;
-- leases compose with worker resource declarations;
-- a detached daemon exists;
-- recovery exists for prepared job creation.
-
-See `src/open_tulid/runtime/scheduler.py`, `resources.py`, and the runtime tests.
-
-### Remaining work
-
-- project/job locking around scheduler decisions beyond the current local file lease path;
-- global and per-project concurrency policies as first-class configured limits;
-- retry policy with max attempts, retryable classes, backoff, and rejected-completion semantics separate from worker failure;
-- scheduling modes such as `--limit`, `--all`, and `--until-empty`;
-- durable structured scheduler skip/retry events rather than only console lines;
-- stale lease reconciliation beyond “owner file disappeared”;
-- clearer degraded-runtime behavior when scheduler or proxy processes die independently.
-
-### Acceptance target
-
-Multiple schedulers must not race the same work, and long-running unattended operation must continue sensibly through transient failures.
-
-## 5. Security and Isolation Need to Catch Up to the Architecture
-
-### What is already good
-
-- secret-like env names are rejected in config;
-- long-lived provider credentials remain host-side in the model proxy;
-- workers receive scoped model sessions rather than raw provider keys;
-- completion tokens are job-bound.
-
-### Current gaps
-
-The current worker invocation is still closer to “containerized execution” than “meaningful sandbox isolation”:
-
-- writable workspace mount;
-- no explicit network mode or allowlist;
-- no CPU / memory / PID limits;
-- no read-only root filesystem;
-- no non-root user requirement;
-- no `no-new-privileges` or capability minimization;
-- completion token appears in persisted command logs;
-- proxy body logging can retain sensitive content when configured to `full`.
-
-See `src/open_tulid/containers/runtime.py`, `src/open_tulid/runtime/model_proxy.py`, and `spec/15-sandboxed-worker.md`, `spec/17-http-proxy-endpoint-boundary.md`, `spec/31-secret-handling.md`.
-
-### Required work
-
-- Define the exact supported execution modes and their claims.
-- Add redaction before any command/env persistence.
-- Add configurable network modes and endpoint allowlisting.
-- Add Docker controls for user, rootfs, capabilities, CPU, memory, and PID count.
-- Separate completion auth and model-proxy auth cleanly in both implementation and docs.
-- Add request auditing with redaction and safe defaults.
-
-### Acceptance target
-
-The docs should be able to say precisely what is isolated, what is merely containerized, and which security claims are valid in each mode.
-
-## 6. Workspace and Git Promotion Model Is Still Unresolved
-
-### Current behavior
-
-`WorkspacePreparer` copies the repository into a disposable workspace. Completion promotion trusts artifact outputs, but accepted source-code changes do not yet have a fully defined trusted route back into the real repository.
-
-See `src/open_tulid/runtime/workspaces.py` and the remaining-work plan Phase 5.
+- `src/open_tulid/runtime/task_manager.py`
+- `src/open_tulid/cli/main.py`
 
 ### Why this matters
 
-A project that accepts implementation work but strands code changes in disposable workspaces has not finished the product loop. This is also where verification, recovery, and review all converge.
+That creates a privileged side road around the project’s own architecture:
 
-### Required decision
+- no single transaction path for all transitions
+- no uniform requirement enforcement
+- no single place to attach recovery logic
+- CLI code can mutate trusted state directly
+
+This is the clearest remaining violation of the project’s central promise.
+
+### Required work
+
+- Make manual and automated transitions use the same command/result/effect path.
+- Have trusted code produce an explicit `MoveKanbanCard`-style effect for accepted manual transitions.
+- Apply that effect through the transaction runtime, not ad hoc CLI mutation.
+- Keep CLI as orchestration/presentation only.
+
+### Acceptance target
+
+There should be exactly one lawful route by which canonical task state changes.
+
+## 2. Requirements are not yet authoritative across all paths
+
+### Spec intent
+
+The specs say:
+
+- transition requirements are authoritative;
+- a task may not enter a state unless state requirements pass;
+- proof/evidence requirements belong to trusted validation, not operator convention.
+
+See especially `spec/24-core-invariants.md`.
+
+### Current implementation
+
+The runtime now preserves and checks more requirement data than before, especially on the completion path. But the first-slice/manual path still checks mainly:
+
+- task exists
+- transition exists
+- task type matches
+- source state matches
+
+`_validate_snapshot_against_workflow()` currently checks unknown task types/states, not the full state requirement model.
+
+Evidence:
+
+- `src/open_tulid/runtime/task_manager.py`
+- `src/open_tulid/runtime/verifier.py`
+
+### Required work
+
+- Add one shared requirement evaluator.
+- Enforce target-state requirements for all transitions.
+- Enforce transition proof/evidence requirements in manual paths too.
+- Make project validation evaluate workflow-driven state invariants, not only parse shape.
+
+### Acceptance target
+
+If the DSL says a transition or target state requires something, no code path may enter the next state without trusted proof that the requirement is satisfied.
+
+## 3. Validation is split across two worlds
+
+### Current implementation
+
+There is a strong adapter/runtime validation path and a weaker public `vault validate` path.
+
+- `vault.validator.validate_project()` currently focuses on directory shape and Kanban syntax.
+- stronger invariants live separately in the adapter/runtime layer.
+- the compiled workflow definition is threaded through `validate_project()` but not materially used.
+
+Evidence:
+
+- `src/open_tulid/vault/validator.py`
+- `src/open_tulid/adapters/obsidian.py`
+- `src/open_tulid/runtime/task_manager.py`
+
+### Why this matters
+
+The public command named `validate` can give an operator less truth than the runtime actually depends on. That is a dangerous semantic split.
+
+### Required work
+
+- Decide the authoritative validation pipeline.
+- Make `tulid validate` call the same workflow-aware validation truth the runtime uses, or rename the current lighter validator so it does not imply more than it proves.
+- Add parity tests so public validation and runtime validation cannot drift silently.
+
+### Acceptance target
+
+When an operator sees “valid,” it should mean valid by the same invariants the runtime will rely on later.
+
+## 4. Canonicalize the spec era
+
+The docs currently contain two overlapping workflow stories:
+
+- older flow-schema language using `states`, `transitions`, and `storage.obsidian`
+- newer DSL/compiler language using `statements`
+
+The implementation follows the newer DSL. That may be the right path, but the documentation needs to say so unambiguously.
+
+### Required work
+
+- Mark superseded specs as historical or rewrite them to the current DSL.
+- Separate:
+  - current contract
+  - historical design note
+  - completed review brief
+  - obsolete material
+- Make the README and spec index point to one canonical present-day workflow model.
+
+# P1 — Make the Runtime Survive Reality
+
+## 5. Runtime supervision is still blocking rather than managed
+
+### Spec intent
+
+The supervision notes require:
+
+- durable container identity
+- live stdout/stderr streaming
+- wrapper heartbeat
+- startup/heartbeat/idle/total/shutdown timeout classes
+- stale-runtime detection
+- inspect/tail/stop/kill operator controls
+- crash reconciliation after host failure
+
+Relevant docs:
+
+- `runtime-supervision.md`
+- `runtime-remaining-work-plan-2026-05-15.md`
+
+### Current implementation
+
+The executor still blocks on a `docker run`-style call and writes captured logs after process exit.
+
+Evidence:
+
+- `src/open_tulid/containers/runtime.py`
+- `src/open_tulid/runtime/executor.py`
+
+### Required work
+
+- Replace blocking execution with managed supervision.
+- Persist container ID, image identity, start time, supervisor PID, and endpoint metadata on jobs.
+- Stream worker logs live into durable storage outside disposable workspaces.
+- Add independent heartbeat state.
+- Implement separate timeout classes.
+- Add live operator controls:
+  - inspect
+  - tail/follow
+  - stop
+  - kill
+- Detect:
+  - running job without container
+  - container without matching job
+  - dead completion endpoint
+  - stale heartbeat
+  - worker exit before accepted completion
+
+### Acceptance target
+
+One worker attempt should be observable, controllable, and recoverable while it is still running.
+
+## 6. Recovery exists, but not yet as a living system
+
+### Current strength
+
+The repo now has:
+
+- transaction journals
+- compensation support
+- completion recovery
+- job-creation recovery
+- CLI transaction recovery commands
+
+### Remaining gap
+
+Recovery is still mostly something a human invokes after noticing damage. It is not yet a continuous runtime discipline.
+
+Missing or weak:
+
+- startup reconciliation
+- host-restart detection
+- stale endpoint detection
+- stale lease reconciliation when owner files still exist but the runtime is dead
+- broad stale-lock policy
+- recovery-state visibility in normal operator flows
+
+### Required work
+
+- Add startup reconciliation across jobs, leases, containers, endpoints, and journals.
+- Distinguish prepared, failed, recoverable, orphaned, and operator-required states.
+- Add recovery tests at every effect boundary.
+- Surface unresolved recovery conditions in validation and status commands.
+
+## 7. Scheduler durability is still early
+
+### Current strengths
+
+- active-job checks exist
+- resource capacity leases exist
+- scheduler can create jobs transactionally
+- a daemon mode exists
+
+### Remaining gaps
+
+- no broad project-level lock around `load -> select -> create`
+- no retry/backoff policy
+- no richer scheduling modes such as `--limit`, `--all`, `--until-empty`
+- scheduler skips/retries are not yet a rich structured event story
+- stale-job semantics need review against the spec
+- lease cleanup does not yet cover all dead-runtime cases
+- detached runtime/process state is not yet robust enough for unattended use
+
+Evidence:
+
+- `src/open_tulid/runtime/scheduler.py`
+- `src/open_tulid/runtime/jobs.py`
+- `src/open_tulid/runtime/resources.py`
+- `src/open_tulid/cli/main.py`
+
+### Required work
+
+- Add scheduler locking around the whole decision path.
+- Formalize active/stale semantics.
+- Add retry policy:
+  - max attempts
+  - retryable failure classes
+  - exponential backoff
+  - separate treatment for completion rejection vs worker failure
+- Add structured scheduler events.
+- Add configurable global and per-project concurrency.
+- Reconcile stale jobs and leases automatically.
+
+## 8. Workspace / Git promotion model is unresolved
+
+### Current implementation
+
+- workspaces are copied snapshots
+- `.git` is excluded from the copied workspace
+- artifact promotion exists
+- code promotion does not yet have one complete trusted route into the canonical repo
+
+Evidence:
+
+- `src/open_tulid/runtime/workspaces.py`
+- `src/open_tulid/runtime/verifier.py`
+- `src/open_tulid/runtime/completion.py`
+
+### Why this matters
+
+A worker can produce accepted implementation work whose code remains stranded inside a disposable workspace. That is not merely a missing flourish; it leaves the product incomplete as a software-delivery system.
+
+### Required work
 
 Choose one product model and finish it:
 
-1. **Disposable workspace + trusted promotion**
-   - host computes diff;
-   - host validates changed files;
-   - host promotes an approved patch/artifact set.
+1. disposable workspace + trusted patch promotion, or
+2. branch-based workspace + trusted Git brokerage.
 
-2. **Branch-based workspace + trusted git brokerage**
-   - dirty-worktree checks;
-   - branch naming and cleanup;
-   - diff / patch capture;
-   - trusted merge or handoff rules.
+Then add:
+
+- dirty-tree checks
+- diff capture
+- trusted changed-file verification
+- branch/patch naming rules
+- cleanup rules
+- inspectable promotion records
 
 ### Acceptance target
 
-No successful task should leave meaningful accepted work stranded only in a disposable workspace.
+Accepted code must have a defined, auditable route into the real repository.
 
-## 7. CLI, Docs, and Operator Experience Need Reconciliation
+## 9. Transactions are improved, but not yet fully resistant to concurrent edits
 
-### Spec drift
+### Current strengths
 
-The CLI contract promises:
+- prepared journals
+- ordered effects
+- final validation hook
+- compensation support
+- adapter temp writes
 
-- JSON output for automation;
-- proof input for manual transitions;
-- state filtering for tasks;
-- clean exit-code semantics.
+### Remaining gaps
 
-The current CLI surface is richer in some places and thinner in others:
-
-- no general `--json` parity;
-- `transition` has no `--proof` path;
-- `tasks list` lacks the promised state filter;
-- README mostly describes the early product, not the runtime that now exists;
-- `transition` mutates storage directly instead of going through the same journaled trusted path used elsewhere.
-
-See `spec/29-cli-contract.md`, `README.md`, and `src/open_tulid/cli/main.py`.
-
-### Operator gaps
-
-- no “why is this task not runnable?” explanation surface;
-- no live-follow worker logs;
-- no generic recovery command family;
-- no unified readiness report that covers proxy, images, workspace permissions, endpoint reachability, and secret hygiene;
-- no polished guided flow from install → validate → run → inspect → recover.
+- no project/task revision hashes before mutation
+- no complete lost-update protection against human edits between read and write
+- no broad stale-lock policy
+- adapter durability semantics still need a hard pass around fsync/revision guarantees
+- manual transition path currently bypasses the strongest machinery
 
 ### Required work
 
-- bring CLI behavior back into explicit contract alignment;
-- add JSON output consistently where automation is expected;
-- route manual transitions through the trusted transaction path;
-- update README/help/docs to describe the product that now exists;
-- distinguish user workflow commands from operator/debug commands.
+- Add revision checks before mutation.
+- Validate final trusted state against the revision read.
+- Define stale-lock handling.
+- Make compensation/recovery policy explicit for every effect class.
 
-### Acceptance target
+# P1 — Tighten the Trust Boundary
 
-A new operator should be able to configure, inspect, and diagnose the system from docs and CLI output alone.
+## 10. Scoped credentials still leak into durable logs
 
-## 8. Tests Need More Hostile Scenarios, Not Merely More Volume
+The architecture has a good direction: long-lived provider secrets remain host-side and workers receive scoped sessions/tokens. But command logs currently serialize full Docker commands including scoped tokens.
 
-### What the suite proves well
+Evidence:
 
-The current tests show that the core composition works:
-
-- workflow parsing and validation;
-- domain and vault validation;
-- event and job persistence;
-- resource leasing;
-- successful completion;
-- rejected-then-fixed completion;
-- worker exit without completion;
-- model proxy session enforcement;
-- Docker-backed end-to-end flow.
-
-### What the suite does not yet prove
-
-- crash in the middle of completion effects;
-- restart after host death;
-- stale heartbeat / dead endpoint / orphan container detection;
-- lease expiry and reconciliation under process death;
-- duplicate submissions and concurrency races;
-- actual trusted verifier behavior against lying workers;
-- secret redaction guarantees;
-- network/isolation guarantees;
-- symlink / path / TOCTOU adversarial cases beyond the current containment checks;
-- diff-backed changed-file validation;
-- recovery commands and degraded runtime workflows.
-
-### Required work
-
-Build an adversarial test matrix around:
-
-- interruption points;
-- concurrency;
-- malicious payloads;
-- stale runtime artifacts;
-- verifier dishonesty cases;
-- operator recovery flows;
-- overnight-style mocked agent runs.
-
-### Acceptance target
-
-The suite should prove not only that the golden path works, but that the guardrails hold when timing, inputs, and workers are bad.
-
-## 9. Additional Findings Worth Addressing
-
-### 9.1 Manual transition semantics are muddy
-
-`TaskManager.request_transition()` can emit an accepted transition event before the stronger completion requirements are satisfied. That risks conflating “allowed to attempt” with “trusted state move approved.” The specs are more careful than the implementation here.
-
-### 9.2 Event contract drift
-
-The specs describe richer event envelopes and transition/request distinctions than the current implementation consistently emits. In particular, manual transitions and runtime transitions do not always carry the same contextual richness.
-
-### 9.3 Cross-board movement remains unsupported
-
-The Obsidian adapter explicitly rejects cross-board transitions. If that is a deliberate MVP constraint, keep it loudly documented; if not, it is a functional hole.
-
-### 9.4 Domain/CLI diagnostic polish still has loose ends
-
-`docs/spec_review.md` already notes one low-severity issue: duplicate section/field reader errors can be collapsed into generic messages. This is not central, but it is emblematic of the last-mile quality work still ahead.
-
-## Recommended Roadmap
-
-### Phase A — Truth before throughput
-
-1. finish trusted verifier semantics;
-2. preserve richer flow requirements in the domain/runtime model;
-3. add host-run validation and diff-backed changed-file verification;
-4. finish completion-transaction recovery and idempotent effect handling.
-
-### Phase B — Survival under unattended operation
-
-5. implement managed runtime supervision;
-6. add heartbeat, stale detection, lifecycle controls, and durable logs;
-7. add scheduler retry policy, concurrency, and reconciliation.
-
-### Phase C — Explicit trust boundaries
-
-8. choose and finish the workspace/git promotion model;
-9. harden isolation, network policy, resource limits, and redaction;
-10. make security-mode claims explicit and testable.
-
-### Phase D — Product finish
-
-11. bring CLI behavior into spec parity;
-12. add readiness, recovery, and diagnosis commands;
-13. update README/help/docs around the actual runtime.
-
-### Phase E — Adversarial proof
-
-14. expand E2E and fault-injection coverage around all the above;
-15. add long-run and crash-recovery acceptance scenarios.
-
-## What “Done Enough to Trust” Looks Like
-
-open-tulid becomes a solid product when all of the following are true:
-
-- a worker cannot move a task forward by merely claiming success;
-- a host crash leaves inspectable, recoverable state rather than ambiguity;
-- a running job can be observed and controlled while alive;
-- two schedulers cannot accidentally schedule the same scarce work;
-- accepted code has a defined route back into the canonical repo;
-- sandbox and credential claims are precise, enforced, and redacted;
-- operators can answer “what happened?”, “what is stuck?”, and “what should I do next?” from the CLI;
-- the test suite actively tries to break those promises.
-
-## Source Corpus Reviewed
-
-### Upstream Obsidian specifications and notes
-
-- `/home/rawsteel/repo/obsidian/Agent/spec/00-start-here.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/24-core-invariants.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/26-mvp-contracts.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/29-cli-contract.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/30-agent-instructions.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/31-secret-handling.md`
-- `/home/rawsteel/repo/obsidian/Agent/spec/33-workflow-engine-dsl.md`
-- `/home/rawsteel/repo/obsidian/Agent/runtime-remaining-work-plan-2026-05-15.md`
-- `/home/rawsteel/repo/obsidian/Agent/runtime-supervision.md`
-- `/home/rawsteel/repo/obsidian/Agent/model-http-proxy.md`
-
-### Repository docs and implementation
-
-- `README.md`
-- `docs/app-installation-spec.md`
-- `docs/domain-cli-integration-spec.md`
-- `docs/spec_review.md`
-- `src/open_tulid/cli/main.py`
-- `src/open_tulid/runtime/{scheduler,executor,completion,transactions,resources,model_proxy,verifier,workspaces}.py`
+- `src/open_tulid/runtime/executor.py`
 - `src/open_tulid/containers/runtime.py`
-- `tests/runtime/*`
-- `tests/e2e/test_docker_mock_agent_runtime.py`
+- E2E output shows `OPEN_TULID_COMPLETION_TOKEN=...` inside persisted `command.txt`
 
-## Closing Assessment
+### Required work
 
-The project is strong enough now that the most valuable work is not glamorous. It is the work that turns a clever runtime into a calm one: truth-preserving verification, boring recovery, explicit boundaries, and operators who never need to guess what happened.
+- Redact token-bearing env values from command logs.
+- Add regression tests that prove secrets/tokens never persist in command/event/human logs.
+- Treat scoped tokens as sensitive even if they are not long-lived provider credentials.
+
+## 11. Isolation is weaker than the architecture wants to claim
+
+Current container launch lacks an explicit policy for:
+
+- network mode / allowlist
+- non-root user
+- read-only root filesystem
+- CPU / memory / PID limits
+- capability minimization
+- no-new-privileges posture
+
+Evidence:
+
+- `src/open_tulid/containers/runtime.py`
+- `src/open_tulid/containers/agents/*.Dockerfile`
+
+### Required work
+
+- Be explicit about which guarantees apply to `trusted-local` vs `isolated-container`.
+- Add actual Docker hardening controls before making strong isolation claims.
+- Add tests for configured isolation policy.
+
+## 12. Model proxy/session policy still needs hardening
+
+Current strengths:
+
+- worker containers get scoped proxy sessions, not provider keys
+- proxy traffic can be gated by leases
+
+Remaining work:
+
+- expiry/revocation policy for sessions
+- route/method allowlisting
+- transcript redaction
+- safer body logging defaults and retention
+- auditing of proxy access decisions
+
+Evidence:
+
+- `src/open_tulid/runtime/model_proxy.py`
+
+# P2 — Product Finish
+
+## 13. CLI contract and API shape have drifted
+
+Examples:
+
+- the spec promises more JSON support than the CLI currently exposes
+- `--project`, task filtering, and proof handling are not yet consistently productized
+- completion API behavior differs in some places from the richer written contract
+- command vocabulary has grown faster than the docs
+
+Evidence:
+
+- `spec/29-cli-contract.md`
+- `spec/18-completion-endpoint.md`
+- `src/open_tulid/cli/main.py`
+- `src/open_tulid/runtime/completion_http.py`
+
+### Required work
+
+- Decide the current canonical CLI/API contract.
+- Add JSON output parity where automation needs it.
+- Finish proof handling for manual transitions.
+- Align accepted completion responses and evidence shapes with the decided contract.
+
+## 14. README and internal docs are stale relative to the code
+
+The README still describes a much smaller product than the actual CLI now provides. Some internal docs are implementation notes or historical review artifacts that read like present-tense contracts.
+
+### Required work
+
+- Rewrite README as an operator guide for the real system.
+- Add a current architecture overview.
+- Mark historical docs clearly.
+- Document:
+  - setup
+  - runtime modes
+  - supervision model
+  - failure/recovery playbooks
+  - security guarantees and non-guarantees
+  - what validation actually proves
+
+## 15. Install and packaging readiness remain prototype-grade
+
+Remaining polish:
+
+- editable-install-centric setup
+- relatively loose dependency reproducibility
+- agent image builds that still rely on moving upstream versions
+- no strong built-wheel smoke path
+- incomplete readiness validation for images, proxies, endpoints, permissions, and runtime config
+
+### Required work
+
+- add runtime readiness checks
+- add wheel-install smoke testing
+- make worker images reproducible
+- document supported install paths
+
+# P2 — Test the Broken Roads
+
+The next test frontier should be failure-oriented.
+
+## Highest-value additions
+
+1. manual transition goes through the lawful effect path
+2. state requirements block invalid entry
+3. public validation and runtime validation stay in parity
+4. concurrent scheduler race on the same task
+5. host restart while a worker is running
+6. running job with missing container
+7. orphan container with missing/mismatched job
+8. stale lease with living owner file but dead runtime
+9. interruption after each transaction boundary
+10. human edit between adapter read and write
+11. token absence from persisted logs
+12. transcript redaction
+13. workspace rerun contamination
+14. Git promotion/diff correctness once the product model is chosen
+15. real wheel-install smoke test
+
+## Test philosophy
+
+The current suite proves the system can work. The next suite should prove it refuses to lie when reality is untidy.
+
+# Joint Top-10 Remaining-Work List
+
+After comparing both independent reviews, this is the backlog both reviewers would endorse:
+
+1. **Restore one trusted transition path** for manual and automated work.
+2. **Make requirements truly authoritative** everywhere transitions or validation occur.
+3. **Unify validation** so public validation and runtime truth cannot diverge.
+4. **Replace blocking execution with managed supervision** and durable live logs.
+5. **Turn recovery into a continuous operational system**, not only repair commands.
+6. **Make scheduler semantics durable**: locks, retries, stale handling, concurrency, structured events.
+7. **Choose and finish the workspace/Git promotion model.**
+8. **Close concrete security gaps first**: token redaction, session expiry, transcript hygiene, then stronger isolation.
+9. **Bring CLI/API/docs/install behavior into one current product contract.**
+10. **Expand adversarial and interruption-focused tests.**
+
+# Recommended Execution Order
+
+```text
+1. Unify transition execution + requirement enforcement + validate
+2. Remove credential leakage from durable logs
+3. Build managed runtime supervision
+4. Add startup/runtime reconciliation and scheduler durability
+5. Choose and implement the Git/promotion model
+6. Finish revision-aware mutation safety
+7. Harden isolation/proxy policy
+8. Reconcile CLI/API/docs/install flows
+9. Add the broken-road test matrix
+```
+
+Why this order:
+
+- Step 1 protects correctness.
+- Step 2 closes an already concrete security defect.
+- Steps 3–6 turn the runtime from impressive to trustworthy.
+- Steps 7–9 make the product honest, operable, and resilient at scale.
+
+# Final Assessment
+
+open-tulid already has several unusually good architectural instincts:
+
+- agents do not own process truth
+- scarce resources are separate from worker identity
+- provider credentials belong behind a host-side broker
+- file-backed work still deserves journals, compensation, and audit records
+
+The project is close to a more interesting threshold than “feature complete.” It is close to becoming a system whose claims are actually enforced by its shape.
+
+The remaining work is not glamorous scaffolding. It is the work that turns a capable prototype into something calm under pressure:
+
+```text
+one truth path
+durable supervision
+recoverable failure
+honest security claims
+clear operator surfaces
+```
+
+That is the road from clever to solid.

@@ -16,7 +16,7 @@ from rich.panel import Panel
 
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
-from open_tulid.config import load_config
+from open_tulid.config import CONFIG_DIRNAME, load_config
 from open_tulid.containers import (
     build_agent_images,
     check_docker,
@@ -59,6 +59,7 @@ from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
 from open_tulid.workflow.runtime import load_workflow_definition
 from open_tulid.workflow.implementations import (
+    OperationResult,
     VALIDATION_IMPLEMENTATIONS,
     WorkflowExecutionContext,
 )
@@ -71,12 +72,14 @@ app = typer.Typer(
 console = Console()
 
 
-def _load_cli_context() -> tuple[Config, WorkflowDefinition | None]:
+def _load_cli_context(project: str | None = None) -> tuple[Config, WorkflowDefinition | None]:
     config = load_config()
-    if config.workflow_path is None:
+    if project is None:
         return config, None
-
-    workflow = load_workflow_definition(config.workflow_path)
+    project_config = config.project_configs.get(project)
+    if project_config is None or project_config.workflow_path is None:
+        return config, None
+    workflow = load_workflow_definition(project_config.workflow_path)
     if workflow.valid:
         return config, workflow.definition
 
@@ -1108,19 +1111,44 @@ def transition_task(
         _print_domain_errors(checked.errors)
         raise typer.Exit(1)
     transition = ctx["workflow"].transitions[transition_id]
-    moved = ctx["adapter"].move_task(task_id, transition.to_state)
-    if not moved.accepted:
-        _print_domain_errors(moved.errors)
-        raise typer.Exit(1)
-    ctx["event_store"].append(build_event(
+
+    def apply_effect(effect):
+        if effect.get("type") != "move_task":
+            return OperationResult(False, "effect.unknown", f"Unknown effect: {effect.get('type')}")
+        moved = ctx["adapter"].move_task(str(effect["task_id"]), str(effect["to_state"]))
+        return OperationResult(moved.accepted, "move_task", errors=moved.errors)
+
+    def compensate_effect(effect):
+        if effect.get("type") == "move_task":
+            moved = ctx["adapter"].move_task(str(effect["task_id"]), str(effect["from_state"]))
+            return OperationResult(moved.accepted, "move_task", errors=moved.errors)
+        return OperationResult(True, "noop")
+
+    def validate_final_state():
+        loaded = ctx["adapter"].read_task(task_id)
+        if not loaded.accepted or loaded.task is None:
+            return OperationResult(False, "read_task", errors=loaded.errors)
+        accepted = loaded.task.current_state == transition.to_state
+        return OperationResult(accepted, "validate_final_state", (
+            "" if accepted else f"Task ended in {loaded.task.current_state}, expected {transition.to_state}."
+        ))
+
+    applied = FileTransactionRuntime(
+        journals=ctx["journal_store"],
+        events=ctx["event_store"],
+        apply_effect=apply_effect,
+        compensate_effect=compensate_effect,
+        validate_final_state=validate_final_state,
+    ).apply(
         project_id=project,
-        actor=EventActor(type="user", id="cli"),
-        event_type=EventType.TaskMoved,
-        correlation_id=task_id,
         task_id=task_id,
         transition_id=transition_id,
-        data={"to_state": transition.to_state, "path": moved.path},
-    ))
+        effects=checked.effects,
+        events=checked.events,
+    )
+    if not applied.accepted:
+        _print_domain_errors((applied.error,))
+        raise typer.Exit(1)
     console.print(f"Moved {task_id} to {transition.to_state}.")
 
 
@@ -1158,9 +1186,9 @@ def _project_path(config: Config, name: str):
 
 
 def _runtime_project_context(project: str) -> dict[str, object]:
-    config, workflow = _load_cli_context()
+    config, workflow = _load_cli_context(project)
     if workflow is None:
-        console.print(Panel("workflow.path is required for runtime job commands.", style="red"))
+        console.print(Panel(f"workflow.yaml is required in project {project!r}.", style="red"))
         raise typer.Exit(2)
     project_path = _project_path(config, project)
     project_config = config.project_configs.get(project) or ProjectConfig(
@@ -1172,7 +1200,8 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         project_root=project_path,
         workflow=workflow,
     ))
-    job_store = FileExecutionJobStore(project_path / "jobs")
+    app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
+    job_store = FileExecutionJobStore(app_state / "jobs" / project)
     event_store = JsonlEventStore(project_path / "events")
     journal_store = TransactionJournalStore(project_path / "events" / "journals")
     recovered = recover_job_creation_transactions(
@@ -1205,6 +1234,29 @@ def _runtime_project_context(project: str) -> dict[str, object]:
             "COMPLETION_RECOVERED",
             f"project={project} journal={journal_id}",
         ))
+    lease_store = FileResourceLeaseStore(
+        app_state / "resource-leases",
+        config.resources,
+    )
+    listed_jobs = job_store.list()
+    if listed_jobs.accepted:
+        active_statuses = {
+            ExecutionJobStatus.PENDING.value,
+            ExecutionJobStatus.RUNNING.value,
+            ExecutionJobStatus.COMPLETION_REJECTED.value,
+            ExecutionJobStatus.STALE.value,
+        }
+        active_job_ids = {
+            job.job_id
+            for job in listed_jobs.jobs
+            if str(job.status.value if hasattr(job.status, "value") else job.status) in active_statuses
+        }
+        released = lease_store.release_inactive_reservations(active_job_ids)
+        for job_id in released:
+            console.print(_runtime_log_line(
+                "RESOURCE_LEASE_RELEASED",
+                f"project={project} job={job_id} reason=inactive_job",
+            ))
     return {
         "config": config,
         "workflow": workflow,
@@ -1214,11 +1266,8 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         "event_store": event_store,
         "journal_store": journal_store,
         "project_path": project_path,
-        "workspace_root": default_shared_workspace_root(config.runtime, project_path),
-        "lease_store": FileResourceLeaseStore(
-            (config.config_dir or project_path / ".open-tulid") / "resource-leases",
-            config.resources,
-        ),
+        "workspace_root": default_shared_workspace_root(config.runtime, app_state),
+        "lease_store": lease_store,
         "model_proxy_sessions": FileModelProxySessionStore(_model_proxy_session_root(config)),
     }
 
@@ -1348,7 +1397,7 @@ def _follow_human_logs(log_dir: Path, *, poll_interval: float = 0.2) -> None:
 
 
 def _runtime_state_path(config: Config, project: str) -> Path:
-    return _project_path(config, project) / ".open-tulid" / "runtime.json"
+    return (config.config_dir or Path.home() / CONFIG_DIRNAME) / "runtime" / f"{project}.json"
 
 
 def _proxy_state_path(config: Config) -> Path:

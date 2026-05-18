@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
+import fcntl
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import DomainError, EventEnvelope, ExecutionJob, ProjectSnapshot, Task, TransitionDefinition, WorkflowDefinition
@@ -53,6 +55,10 @@ class Scheduler:
         self.journal_store = journal_store
 
     def schedule_one(self, project_id: str) -> ScheduleResult:
+        with self._locked():
+            return self._schedule_one_locked(project_id)
+
+    def _schedule_one_locked(self, project_id: str) -> ScheduleResult:
         loaded = self.adapter.load_project()
         if not loaded.accepted:
             return ScheduleResult(scheduled=False, errors=loaded.errors)
@@ -145,6 +151,17 @@ class Scheduler:
             )
 
         return ScheduleResult(scheduled=False, skipped=tuple(skipped))
+
+    @contextmanager
+    def _locked(self):
+        lock_path = self.job_store.root.parent / ".scheduler.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @property
     def _transactional_creation_enabled(self) -> bool:

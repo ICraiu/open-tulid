@@ -210,6 +210,25 @@ class TestObsidianAdapterLoadProject:
         assert result.accepted is False
         assert result.errors[0].code == "task.invalid_frontmatter"
 
+    def test_assigns_missing_task_id_without_renaming_note_or_card(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        task_path = project / "tasks" / "Add healthz.md"
+        task_path.write_text("# Add healthz\n\n## Task\nAdd endpoint.\n", encoding="utf-8")
+        board_path = project / "kanban" / "Work.md"
+        original_board = "## Todo\n- [ ] [[Add healthz]]\n"
+        board_path.write_text(original_board, encoding="utf-8")
+
+        result = _adapter(project).load_project()
+
+        assert result.accepted is True
+        assert result.snapshot is not None
+        assert len(result.snapshot.tasks) == 1
+        task_id = next(iter(result.snapshot.tasks))
+        assert len(task_id) == 26
+        assert task_path.exists()
+        assert f"id: {task_id}" in task_path.read_text(encoding="utf-8")
+        assert board_path.read_text(encoding="utf-8") == original_board
+
 
 class TestObsidianAdapterEffects:
     def test_moves_task_by_id_and_preserves_card_text(self, tmp_path: Path):

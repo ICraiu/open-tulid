@@ -10,6 +10,7 @@ class ProjectConfig:
     tracker_path: str
     repo_root: Path | None = None
     main_branch: str = "main"
+    workflow_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -56,13 +57,17 @@ class ModelProxyServerConfig:
 class Config:
     vault_root: Path
     projects: list[str]
+    tracker_type: str = "obsidian"
     config_dir: Path | None = None
-    workflow_path: Path | None = None
     project_configs: dict[str, ProjectConfig] = field(default_factory=dict)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     resources: dict[str, ResourceConfig] = field(default_factory=dict)
     model_proxy: dict[str, ModelProxyConfig] = field(default_factory=dict)
     model_proxy_server: ModelProxyServerConfig = field(default_factory=ModelProxyServerConfig)
+
+    @property
+    def tracker_root(self) -> Path:
+        return self.vault_root
 
 
 @dataclass

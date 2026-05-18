@@ -10,17 +10,36 @@ from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.config import load_config
 from open_tulid.models import Config
-from open_tulid.vault.validator import validate_vault
+from open_tulid.domain import (
+    ObsidianStateMappingDefinition,
+    ObsidianStorageDefinition,
+    RequirementDefinition,
+    StateDefinition,
+    StorageDefinition,
+    TaskTypeDefinition,
+    WorkflowDefinition,
+)
+from types import MappingProxyType
+from open_tulid.vault.validator import validate_project, validate_vault
+from open_tulid.models import Project
+from open_tulid.cli.init import default_workflow
 
 runner = CliRunner()
+TASK_ID = "01J00000000000000000000001"
+
+
+@pytest.fixture(autouse=True)
+def _home_is_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
 
 
 def _make_config(vault_root: Path, projects: list[str]) -> Path:
     config_dir = vault_root / CONFIG_DIRNAME
     config_dir.mkdir(exist_ok=True)
     cfg = config_dir / CONFIG_FILENAME
+    project_lines = "".join(f"  {project}: {{}}\n" for project in projects)
     cfg.write_text(
-        f'[vault]\nroot = "{vault_root}"\nprojects = {projects!r}\n',
+        f'tracker:\n  type: obsidian\n  root: {vault_root}\nprojects:\n{project_lines}',
         encoding="utf-8",
     )
     return cfg
@@ -36,6 +55,9 @@ def _make_project(
     (project_dir / "kanban").mkdir(parents=True, exist_ok=True)
     (project_dir / "docs").mkdir(parents=True, exist_ok=True)
     (project_dir / "tasks").mkdir(parents=True, exist_ok=True)
+    (project_dir / "events").mkdir(parents=True, exist_ok=True)
+    (project_dir / "agents").mkdir(parents=True, exist_ok=True)
+    (project_dir / "workflow.yaml").write_text(default_workflow(), encoding="utf-8")
 
     if kanban_files:
         for fname, content in kanban_files.items():
@@ -536,7 +558,7 @@ class TestVaultValidateFailures:
             ),
         })
         _make_project(tmp_path, "Game", kanban_files={
-            "Board.md": "## Todo\n- [ ] [[Task 1]]\n",
+            "Work.md": "## Todo\n- [ ] [[Task 1]]\n",
         })
         _make_task(tmp_path, "Agent", "Task 1")
         _make_task(tmp_path, "Agent", "Task 2")
@@ -568,3 +590,38 @@ class TestVaultValidateFailures:
         finally:
             os.chdir(original)
 
+
+def test_project_validation_uses_runtime_workflow_semantics(tmp_path: Path):
+    project_dir = _make_project(tmp_path, "Agent", kanban_files={
+        "Work.md": f"## Review\n- [ ] [[{TASK_ID}-task]]\n",
+    })
+    (project_dir / "tasks" / f"{TASK_ID}-task.md").write_text(
+        f"---\nid: {TASK_ID}\ntype: task\nstate: Review\n---\n\n# Task\n",
+        encoding="utf-8",
+    )
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({"Review": StateDefinition(id="Review")}),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(
+                id="task",
+                requirements_by_state=MappingProxyType({
+                    "Review": RequirementDefinition(artifacts=("patch",)),
+                }),
+            ),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType({}),
+        storage=StorageDefinition(obsidian=ObsidianStorageDefinition(
+            boards=MappingProxyType({"work": "kanban/Work.md"}),
+            state_mappings=(ObsidianStateMappingDefinition("Review", "work", "Review"),),
+        )),
+    )
+
+    report = validate_project(Project(name="Agent", path=project_dir), workflow)
+
+    assert report.passed is False
+    assert any("task.required_artifact_missing" in error.message for error in report.errors)

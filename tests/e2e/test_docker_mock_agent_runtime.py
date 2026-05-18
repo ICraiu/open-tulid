@@ -153,7 +153,7 @@ def _make_e2e_project(
     vault = root / "vault"
     project = vault / "Agent"
     repo = root / "repo"
-    workflow = root / "workflow.yaml"
+    workflow = project / "workflow.yaml"
     fixture_project = FIXTURES / "project"
     shutil.copytree(fixture_project / "Agent", project)
     shutil.copytree(fixture_project / "repo", repo)
@@ -164,7 +164,7 @@ def _make_e2e_project(
         task_path.read_text(encoding="utf-8").format(task_body=task_body),
         encoding="utf-8",
     )
-    config_template = (fixture_project / "open-tulid.toml.template").read_text(encoding="utf-8")
+    config_template = (fixture_project / "config.yaml.template").read_text(encoding="utf-8")
     (root / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(
         config_template.format(
             vault_root=vault,
@@ -202,7 +202,7 @@ def _assert_artifacts_promoted(project: Path) -> None:
 
 
 def _assert_container_logs(project: Path, expected: str) -> None:
-    job_files = list((project / "jobs").glob("*/job.json"))
+    job_files = _job_files(project)
     assert len(job_files) == 1
     workspace = Path(json.loads(job_files[0].read_text(encoding="utf-8"))["workspace_path"])
     stdout = (workspace / ".open-tulid" / "logs" / "stdout.log").read_text(encoding="utf-8")
@@ -210,7 +210,7 @@ def _assert_container_logs(project: Path, expected: str) -> None:
 
 
 def _job_payload(project: Path) -> dict[str, object]:
-    job_files = list((project / "jobs").glob("*/job.json"))
+    job_files = _job_files(project)
     assert len(job_files) == 1
     return json.loads(job_files[0].read_text(encoding="utf-8"))
 
@@ -259,10 +259,10 @@ def _print_system_logs(project: Path, capsys: pytest.CaptureFixture[str]) -> Non
 
 def _system_log_paths(project: Path) -> tuple[Path, ...]:
     paths: list[Path] = []
-    paths.extend(sorted((project / "jobs").glob("*/job.json")))
+    paths.extend(_job_files(project))
     paths.extend(sorted((project / "events").glob("*.log")))
     paths.extend(sorted((project / "events").glob("*.jsonl")))
-    for job_path in sorted((project / "jobs").glob("*/job.json")):
+    for job_path in _job_files(project):
         workspace = Path(json.loads(job_path.read_text(encoding="utf-8"))["workspace_path"])
         log_dir = workspace / ".open-tulid" / "logs"
         paths.extend(path for path in (
@@ -271,6 +271,11 @@ def _system_log_paths(project: Path) -> tuple[Path, ...]:
             log_dir / "stderr.log",
         ) if path.exists())
     return tuple(paths)
+
+
+def _job_files(project: Path) -> list[Path]:
+    app_home = project.parents[1] / ".tulid"
+    return sorted((app_home / "jobs" / "Agent").glob("*/job.json"))
 
 
 def _print_trusted_task_state(project: Path) -> None:
@@ -311,10 +316,16 @@ class _cwd:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.original = Path.cwd()
+        self.original_home = os.environ.get("HOME")
 
     def __enter__(self) -> None:
         self.original = Path.cwd()
         os.chdir(self.path)
+        os.environ["HOME"] = str(self.path)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         os.chdir(self.original)
+        if self.original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.original_home

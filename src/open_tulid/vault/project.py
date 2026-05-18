@@ -4,9 +4,10 @@ import sys
 from pathlib import Path
 
 from open_tulid.models import Config, CreatedProject, Project
+from open_tulid.cli.init import default_workflow
 
 
-REQUIRED_DIRS = ["kanban", "docs", "tasks", "events"]
+REQUIRED_DIRS = ["kanban", "docs", "tasks", "events", "agents"]
 
 
 def _fail(message: str) -> None:
@@ -19,6 +20,8 @@ def create_project(config: Config, name: str) -> CreatedProject:
         _fail("Project name must not be empty")
 
     name = name.strip()
+    if name not in config.project_configs:
+        _fail(f"Project is not configured: {name}")
 
     # Validate name doesn't escape or contain path separators
     if "/" in name:
@@ -30,13 +33,15 @@ def create_project(config: Config, name: str) -> CreatedProject:
     if Path(name).is_absolute():
         _fail(f"Project name is an absolute path: {name}")
 
-    project_path = config.vault_root / name
+    project_config = config.project_configs.get(name)
+    tracker_path = project_config.tracker_path if project_config is not None else name
+    project_path = config.vault_root / tracker_path
 
     if project_path.exists():
         _fail(f"Project directory already exists: {project_path}")
 
     abs_vault = config.vault_root.resolve()
-    abs_project = (abs_vault / name).resolve()
+    abs_project = (abs_vault / tracker_path).resolve()
     if not str(abs_project).startswith(str(abs_vault) + "/") and abs_project != abs_vault:
         _fail(f"Project name would escape vault root: {name}")
 
@@ -46,6 +51,16 @@ def create_project(config: Config, name: str) -> CreatedProject:
             dir_path = project_path / dir_name
             dir_path.mkdir(parents=True, exist_ok=True)
             created_dirs.append(f"{name}/{dir_name}")
+        (project_path / "workflow.yaml").write_text(
+            "# Project-owned workflow. Edit this to define states, workers, and transitions.\n"
+            + default_workflow(),
+            encoding="utf-8",
+        )
+        (project_path / "agents" / "default.agent.md").write_text(
+            "# Default Agent Instructions\n\n"
+            "Add project-wide coding standards and completion guidance here.\n",
+            encoding="utf-8",
+        )
     except OSError as e:
         _fail(f"Failed to create project directory: {e}")
 

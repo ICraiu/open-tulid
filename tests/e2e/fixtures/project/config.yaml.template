@@ -1,0 +1,20 @@
+tracker:
+  type: obsidian
+  root: "{vault_root}"
+
+projects:
+  Agent:
+    path: Agent
+    repo_root: "{repo_root}"
+
+runtime:
+  completion_host: 0.0.0.0
+  completion_container_host: host.docker.internal
+  default_timeout_seconds: 30
+  container_volume_relabel: true
+  worker_images:
+    codex: "{mock_agent_image}"
+  worker_args:
+    codex: ["{prompt_packet}"]
+  env:
+    MOCK_AGENT_SCENARIO: "{mock_agent_scenario}"

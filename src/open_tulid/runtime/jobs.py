@@ -18,6 +18,9 @@ ACTIVE_JOB_STATUSES = frozenset({
     ExecutionJobStatus.PENDING.value,
     ExecutionJobStatus.RUNNING.value,
     ExecutionJobStatus.COMPLETION_REJECTED.value,
+    # A stale job needs explicit reconciliation before the same transition is
+    # admitted again; otherwise a dead runtime can silently fork work.
+    ExecutionJobStatus.STALE.value,
 })
 
 

@@ -139,6 +139,9 @@ class TaskManager:
                 f"Transition {transition.id!r} requires state {transition.from_state!r}.",
                 task.id,
             ),))
+        requirement_errors = _validate_task_state_requirements(task, transition.to_state, self.workflow)
+        if requirement_errors:
+            return CommandResult(accepted=False, errors=tuple(requirement_errors))
         events = (_event(
             project_id=command.project_id,
             actor=command.actor,
@@ -146,8 +149,21 @@ class TaskManager:
             task_id=task.id,
             transition_id=transition.id,
             data={"from": transition.from_state, "to": transition.to_state},
-        ),)
-        return CommandResult(accepted=True, events=events)
+        ), _event(
+            project_id=command.project_id,
+            actor=command.actor,
+            event_type=EventType.TaskMoved,
+            task_id=task.id,
+            transition_id=transition.id,
+            data={"from": transition.from_state, "to": transition.to_state},
+        ))
+        effects = ({
+            "type": "move_task",
+            "task_id": task.id,
+            "from_state": transition.from_state,
+            "to_state": transition.to_state,
+        },)
+        return CommandResult(accepted=True, events=events, effects=effects)
 
     def create_execution_job(self, command: CreateExecutionJob) -> CommandResult:
         transition_result = self.request_transition(RequestTransition(
@@ -190,7 +206,7 @@ class TaskManager:
             if saved.job is not None:
                 job = saved.job
         events = (
-            *transition_result.events,
+            *(event for event in transition_result.events if event.event_type == EventType.TransitionAccepted),
             _event(
                 project_id=command.project_id,
                 actor=command.actor,
@@ -233,7 +249,43 @@ def _validate_snapshot_against_workflow(
                 f"Task {task.id!r} is in unknown state {task.current_state!r}.",
                 task.id,
             ))
+        if task.task_type in workflow.task_types and task.current_state in workflow.states:
+            errors.extend(_validate_task_state_requirements(task, task.current_state, workflow))
     return errors
+
+
+def _validate_task_state_requirements(
+    task,
+    state: str,
+    workflow: WorkflowDefinition,
+) -> list[DomainError]:
+    """Validate requirements observable from a persisted Task snapshot.
+
+    Artifact links are the only requirement evidence currently carried by the
+    task model. Validation calls and changed-file evidence are execution-time
+    concepts, so this deliberately leaves them to the verifier.
+    """
+    task_type = workflow.task_types.get(task.task_type)
+    if task_type is None:
+        return []
+    requirements = task_type.requirements_by_state.get(state)
+    if requirements is None:
+        return []
+    errors: list[DomainError] = []
+    for artifact_type in requirements.artifacts:
+        if not _has_artifact_link(task.artifact_links, artifact_type):
+            errors.append(_error(
+                "task.required_artifact_missing",
+                f"Task {task.id!r} in state {state!r} requires artifact {artifact_type!r}.",
+                task.id,
+            ))
+    return errors
+
+
+def _has_artifact_link(links: tuple[str, ...], artifact_type: str) -> bool:
+    # Completion-promoted links are shaped like artifacts/<task>/<type>/<file>.
+    # Accept bare type links too, since adapters may preserve user-authored links.
+    return any(artifact_type in Path(link).parts or link == artifact_type for link in links)
 
 
 def _event(

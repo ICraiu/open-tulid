@@ -20,7 +20,7 @@ def _write_config(root: Path) -> None:
     config_dir = root / CONFIG_DIRNAME
     config_dir.mkdir()
     (config_dir / CONFIG_FILENAME).write_text(
-        f'[vault]\nroot = "{root}"\nprojects = ["Agent"]\n',
+        f'tracker:\n  type: obsidian\n  root: {root}\nprojects:\n  Agent: {{}}\n',
         encoding="utf-8",
     )
     (root / "Agent").mkdir()
@@ -30,10 +30,16 @@ def _with_cwd(path: Path):
     class Cwd:
         def __enter__(self):
             self.original = os.getcwd()
+            self.original_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(path)
             os.chdir(path)
 
         def __exit__(self, exc_type, exc, tb):
             os.chdir(self.original)
+            if self.original_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = self.original_home
 
     return Cwd()
 
@@ -80,7 +86,7 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start", "--interval", "5"])
 
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert result.exit_code == 0
     assert "MODEL_PROXY_STARTED pid=4321" in result.output
@@ -96,7 +102,7 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
 
 def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 9876, "project": "Agent", "interval": 5.0}', encoding="utf-8")
     seen = []
@@ -115,7 +121,7 @@ def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path
 
 def test_runtime_status_reports_running_processes(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 4321, "proxy_pid": 9876, "project": "Agent"}', encoding="utf-8")
     (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
@@ -130,7 +136,7 @@ def test_runtime_status_reports_running_processes(tmp_path: Path, monkeypatch):
 
 def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 4321, "proxy_pid": 9876, "project": "Agent"}', encoding="utf-8")
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
@@ -153,7 +159,7 @@ def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkey
 
 def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
@@ -181,7 +187,7 @@ def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, 
 
 def test_runtime_stop_refuses_to_claim_success_when_scheduler_does_not_exit(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
     (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
@@ -199,7 +205,7 @@ def test_runtime_stop_refuses_to_claim_success_when_scheduler_does_not_exit(tmp_
 
 def test_runtime_stop_refuses_to_claim_success_when_proxy_does_not_exit(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / "Agent" / ".open-tulid" / "runtime.json"
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
     state_path.parent.mkdir()
     state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
