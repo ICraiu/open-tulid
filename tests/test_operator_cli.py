@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -224,6 +225,48 @@ def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkey
     assert killed == [(4321, 15), (9876, 15)]
     assert not state_path.exists()
     assert not proxy_state.exists()
+
+
+def test_runtime_stop_fails_active_jobs_and_stops_worker_containers(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
+    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    job_store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert job_store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="task-1",
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "workspace"),
+    )).accepted is True
+    assert job_store.update_status("01J00000000000000000000JOB", "running").accepted is True
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
+    monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: True)
+    monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: None)
+    docker_calls: list[tuple[str, ...]] = []
+
+    def fake_run(args, *, check, capture_output, text, timeout):
+        docker_calls.append(tuple(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.run", fake_run)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "stop"])
+
+    loaded = job_store.get("01J00000000000000000000JOB")
+    assert result.exit_code == 0
+    assert "WORKER_CONTAINER_STOPPED job=01J00000000000000000000JOB" in result.output
+    assert "name=open-tulid-job-01j00000000000000000000job" in result.output
+    assert "JOB_ORPHANED project=Agent" in result.output
+    assert "job=01J00000000000000000000JOB prior_status=running" in result.output
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert docker_calls == [("docker", "rm", "-f", "open-tulid-job-01j00000000000000000000job")]
 
 
 def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, monkeypatch):

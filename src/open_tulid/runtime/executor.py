@@ -201,24 +201,36 @@ class JobExecutor:
                 data={"worker_id": job.worker_id, "workspace_path": str(prepared.workspace)},
             ))
 
+            implementation_id = _execution_worker_id(worker, job.worker_id)
+            model_proxy_env = self._model_proxy_env(job.job_id, job.worker_id, required_resources)
+            worker_args = _worker_args(
+                runtime=self.runtime,
+                worker_id=job.worker_id,
+                implementation_id=implementation_id,
+                container_workspace=self.runtime.container_workspace,
+                completion_endpoint=endpoint.url,
+            )
+            _write_opencode_model_config_if_needed(
+                workspace=prepared.workspace,
+                runtime=self.runtime,
+                worker_id=job.worker_id,
+                implementation_id=implementation_id,
+                args=worker_args,
+                env=model_proxy_env,
+            )
+
             request = request_for_worker(
                 worker_id=_execution_worker_id(worker, job.worker_id),
                 workspace=prepared.workspace,
                 runtime=self.runtime,
-                args=_worker_args(
-                    runtime=self.runtime,
-                    worker_id=job.worker_id,
-                    implementation_id=_execution_worker_id(worker, job.worker_id),
-                    container_workspace=self.runtime.container_workspace,
-                    completion_endpoint=endpoint.url,
-                ),
+                args=worker_args,
                 env={
                     "OPEN_TULID_JOB_ID": job.job_id,
                     "OPEN_TULID_COMPLETION_TOKEN": str(job.metadata.get("completion_token", "")),
                     "OPEN_TULID_OUTPUT_DIR": f"{self.runtime.container_workspace}/output",
                     "OPEN_TULID_COMPLETION_ENDPOINT": endpoint.url,
                     "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
-                    **self._model_proxy_env(job.job_id, job.worker_id, required_resources),
+                    **model_proxy_env,
                 },
                 mounts=self._subscription_mounts(required_resources),
             )
@@ -314,7 +326,7 @@ class JobExecutor:
         workspace: Path,
         token: str,
     ) -> bool:
-        if transition.requires.artifacts or transition.requires.validations or transition.derives is not None:
+        if transition.requires.artifacts or transition.derives is not None:
             return False
         changed_files = _git_changed_files(workspace)
         if changed_files is None:
@@ -335,12 +347,17 @@ class JobExecutor:
             validation_implementations=self.validation_implementations,
             validation_context_factory=self.validation_context_factory,
         )
+        validation_evidence = {
+            call.type: "Trusted validation inferred by Tulid implicit completion."
+            for call in transition.requires.validations
+        }
         result = service.submit(
             job_id=job_id,
             token=token,
             submission=CompletionSubmission(
                 summary="Worker exited successfully; completion evidence inferred by Tulid.",
                 changed_files=tuple(sorted(changed_files)),
+                validation_evidence=validation_evidence,
             ),
         )
         return result.accepted
@@ -646,6 +663,72 @@ def _worker_args(
         "output_dir": f"{container_workspace}/output",
     }
     return tuple(arg.format(**values) for arg in args)
+
+
+def _write_opencode_model_config_if_needed(
+    *,
+    workspace: Path,
+    runtime: RuntimeConfig,
+    worker_id: str,
+    implementation_id: str,
+    args: tuple[str, ...],
+    env: Mapping[str, str],
+) -> None:
+    worker_type = runtime.worker_types.get(worker_id, runtime.worker_types.get(implementation_id, implementation_id))
+    if worker_type != "opencode" and implementation_id != "opencode":
+        return
+    endpoint = env.get("OPEN_TULID_MODEL_ENDPOINT")
+    proxy_id = env.get("OPEN_TULID_MODEL_PROXY_ID")
+    if not endpoint or not proxy_id or "OPEN_TULID_MODEL_SESSION_TOKEN" not in env:
+        return
+    model_ref = _model_arg(args)
+    if model_ref is None or "/" not in model_ref:
+        return
+    provider_id, model_id = model_ref.split("/", 1)
+    expected_provider_id = f"tulid-{proxy_id}"
+    if provider_id != expected_provider_id or not model_id:
+        return
+
+    path = workspace / "opencode.json"
+    config: dict[str, object] = {}
+    try:
+        if path.is_file():
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+    except (OSError, json.JSONDecodeError):
+        config = {}
+
+    providers = config.get("provider")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers[provider_id] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": f"Tulid {proxy_id}",
+        "options": {
+            "baseURL": endpoint,
+            "apiKey": "{env:OPEN_TULID_MODEL_SESSION_TOKEN}",
+        },
+        "models": {
+            model_id: {
+                "name": model_id,
+            },
+        },
+    }
+    config["$schema"] = "https://opencode.ai/config.json"
+    config["provider"] = providers
+    config["model"] = model_ref
+    config["small_model"] = model_ref
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _model_arg(args: tuple[str, ...]) -> str | None:
+    for index, arg in enumerate(args):
+        if arg == "--model" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--model="):
+            return arg.removeprefix("--model=")
+    return None
 
 
 def _execution_worker_id(worker, fallback: str) -> str:

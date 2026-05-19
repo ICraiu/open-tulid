@@ -18,11 +18,13 @@ from open_tulid.domain import (
     Task,
     TaskTypeDefinition,
     TransitionDefinition,
+    ValidationCallDefinition,
     WorkerDefinition,
     WorkflowDefinition,
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
+from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -239,6 +241,85 @@ def test_executor_implicit_completion_can_diff_workspace_against_repo_root(
     assert result.accepted is True
     assert adapter.moved_to == "CodeReview"
     assert (repo_root / "src" / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+
+
+def test_executor_implicit_completion_can_run_trusted_validations(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "app.py").write_text("print('before')\n", encoding="utf-8")
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    adapter = FakeAdapter()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        (Path(request.workspace) / "app.py").write_text("print('after')\n", encoding="utf-8")
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            "Todo": StateDefinition(id="Todo"),
+            "CodeReview": StateDefinition(id="CodeReview"),
+        }),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(
+                    validations=(ValidationCallDefinition(
+                        type="tests_pass",
+                        args=MappingProxyType({"command": ("python", "-c", "import pathlib; pathlib.Path('app.py').read_text()")}),
+                    ),),
+                ),
+                transaction=None,
+            ),
+        }),
+    )
+
+    executor = JobExecutor(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent", repo_root=repo_root),
+        validation_implementations={"tests_pass": VALIDATION_IMPLEMENTATIONS["tests_pass"]},
+        validation_context_factory=lambda workspace, output_root: WorkflowExecutionContext(
+            project_root=workspace,
+            vault_root=output_root,
+        ),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert adapter.moved_to == "CodeReview"
+    assert (repo_root / "app.py").read_text(encoding="utf-8") == "print('after')\n"
 
 
 def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkeypatch):
@@ -619,6 +700,72 @@ def test_executor_passes_scoped_model_proxy_session_to_worker(tmp_path: Path, mo
     assert seen["OPENAI_BASE_URL"] == "http://host.docker.internal:8787/proxies/openai"
     assert seen["OPENAI_API_KEY"] == seen["OPEN_TULID_MODEL_SESSION_TOKEN"]
     assert sessions.get(seen["OPEN_TULID_MODEL_SESSION_TOKEN"]) is None
+
+
+def test_executor_writes_opencode_config_for_tulid_model_proxy(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="qwen_27b",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"qwen-local": ResourceConfig(kind="model", capacity=1, proxy="qwen")},
+    )
+    from open_tulid.runtime import ModelProxySessionStore
+    sessions = ModelProxySessionStore()
+    seen = {}
+
+    def fake_run(request, *, docker_executable):
+        seen["args"] = request.args
+        seen["config"] = json.loads((Path(request.workspace) / "opencode.json").read_text(encoding="utf-8"))
+        seen["env"] = request.env
+        return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=1)
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run)
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_args={
+                "qwen_27b": (
+                    "run",
+                    "--model",
+                    "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf",
+                ),
+            },
+            worker_resources={"qwen_27b": ("qwen-local",)},
+            worker_types={"qwen_27b": "opencode"},
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        lease_store=leases,
+        resources={"qwen-local": ResourceConfig(kind="model", capacity=1, proxy="qwen")},
+        model_proxy_sessions=sessions,
+        model_proxy_endpoint_base="http://host.docker.internal:8787",
+    )
+
+    executor.run(JOB_ID)
+
+    assert seen["args"] == ("run", "--model", "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf")
+    assert seen["config"]["model"] == "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf"
+    assert seen["config"]["small_model"] == "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf"
+    provider = seen["config"]["provider"]["tulid-qwen"]
+    assert provider["npm"] == "@ai-sdk/openai-compatible"
+    assert provider["options"] == {
+        "baseURL": "http://host.docker.internal:8787/proxies/qwen",
+        "apiKey": "{env:OPEN_TULID_MODEL_SESSION_TOKEN}",
+    }
+    assert "Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf" in provider["models"]
 
 
 def test_executor_passes_all_required_model_proxy_sessions(tmp_path: Path, monkeypatch):

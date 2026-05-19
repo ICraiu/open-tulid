@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from multiprocessing import get_context
 from types import MappingProxyType
@@ -279,6 +280,59 @@ def test_scheduler_skips_when_active_job_exists(tmp_path: Path):
     assert result.accepted is True
     assert result.scheduled is False
     assert result.skipped[0].code == "job.active_exists"
+
+
+def test_scheduler_backs_off_after_recent_failed_job(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": datetime.now(timezone.utc).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.recent_failure"
+
+
+def test_scheduler_retries_after_failed_job_backoff_expires(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.job_id != "01J00000000000000000000JOB"
 
 
 def test_scheduler_defers_task_when_required_resource_is_busy(tmp_path: Path):

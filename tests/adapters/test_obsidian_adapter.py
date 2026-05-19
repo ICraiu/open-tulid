@@ -224,10 +224,25 @@ class TestObsidianAdapterLoadProject:
         assert result.snapshot is not None
         assert len(result.snapshot.tasks) == 1
         task_id = next(iter(result.snapshot.tasks))
-        assert len(task_id) == 26
+        assert task_id == "1"
         assert task_path.exists()
-        assert f"id: {task_id}" in task_path.read_text(encoding="utf-8")
+        assert "id: '1'" in task_path.read_text(encoding="utf-8")
         assert board_path.read_text(encoding="utf-8") == original_board
+
+    def test_loads_numeric_task_ids(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        _write_task(project, "1-add-healthz", task_id="1", state="Todo")
+        (project / "kanban" / "Work.md").write_text(
+            "## Todo\n"
+            "- [ ] [[1-add-healthz]]\n",
+            encoding="utf-8",
+        )
+
+        result = _adapter(project).load_project()
+
+        assert result.accepted is True
+        assert result.snapshot is not None
+        assert result.snapshot.tasks["1"].title == "Add health-check endpoint"
 
 
 class TestObsidianAdapterEffects:
@@ -345,17 +360,17 @@ class TestObsidianAdapterEffects:
         project = _make_project(tmp_path)
         (project / "kanban" / "Work.md").write_text("## Todo\n", encoding="utf-8")
         task = Task(
-            id=TASK_ID,
+            id="2",
             title="Derived child",
             path="tasks/unused.md",
             current_state="Todo",
             task_type="task",
-            parent_id="01J00000000000000000000002",
+            parent_id="1",
             body="Child body\n",
         )
 
         result = _adapter(project).create_task(task)
 
         assert result.accepted is True
-        assert (project / "tasks" / f"{TASK_ID}-derived-child.md").is_file()
-        assert f"[[{TASK_ID}-derived-child]]" in (project / "kanban" / "Work.md").read_text(encoding="utf-8")
+        assert (project / "tasks" / "2-derived-child.md").is_file()
+        assert "[[2-derived-child]]" in (project / "kanban" / "Work.md").read_text(encoding="utf-8")

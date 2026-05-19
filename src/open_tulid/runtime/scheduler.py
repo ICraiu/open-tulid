@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import fcntl
 
 from open_tulid.adapters.base import StorageAdapter
-from open_tulid.domain import DomainError, EventEnvelope, ExecutionJob, ProjectSnapshot, Task, TransitionDefinition, WorkflowDefinition
+from open_tulid.domain import DomainError, EventEnvelope, ExecutionJob, ExecutionJobStatus, ProjectSnapshot, Task, TransitionDefinition, WorkflowDefinition
 
 from .events import new_ulid
 from .events import JsonlEventStore, TransactionJournalStore
-from .jobs import FileExecutionJobStore
+from .jobs import FileExecutionJobStore, JobStoreResult
 from .resources import FileResourceLeaseStore
 from .task_manager import CreateExecutionJob, TaskManager
 from .transactions import FileTransactionRuntime
+
+
+RECENT_FAILURE_BACKOFF_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,29 @@ class Scheduler:
                 skipped.append(_error(
                     "job.active_exists",
                     f"Task {task.id!r} already has an active job for transition {transition.id!r}.",
+                    task.id,
+                ))
+                continue
+
+            recent_failure = _find_recent_failed_job(
+                self.job_store,
+                project_id,
+                task.id,
+                transition.id,
+            )
+            if not recent_failure.accepted:
+                return ScheduleResult(
+                    scheduled=False,
+                    errors=(recent_failure.error or _error("job.read_failed", "Cannot inspect recent jobs."),),
+                    skipped=tuple(skipped),
+                )
+            if recent_failure.jobs:
+                skipped.append(_error(
+                    "job.recent_failure",
+                    (
+                        f"Task {task.id!r} recently failed transition {transition.id!r}; "
+                        f"waiting {RECENT_FAILURE_BACKOFF_SECONDS}s before retry."
+                    ),
                     task.id,
                 ))
                 continue
@@ -262,6 +289,55 @@ def _tasks_in_board_order(snapshot: ProjectSnapshot) -> tuple[Task, ...]:
             task.id,
         ),
     ))
+
+
+def _find_recent_failed_job(
+    job_store: FileExecutionJobStore,
+    project_id: str,
+    task_id: str,
+    transition_id: str,
+    *,
+    now: datetime | None = None,
+    backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
+) -> JobStoreResult:
+    listed = job_store.list()
+    if not listed.accepted:
+        return listed
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=backoff_seconds)
+    recent = tuple(
+        job for job in listed.jobs
+        if job.project_id == project_id
+        and job.task_id == task_id
+        and job.transition_id == transition_id
+        and _status_value(job.status) == ExecutionJobStatus.FAILED.value
+        and (updated_at := _job_timestamp(job)) is not None
+        and updated_at >= cutoff
+    )
+    if not recent:
+        return JobStoreResult(jobs=())
+    return JobStoreResult(jobs=(max(
+        recent,
+        key=lambda job: _job_timestamp(job) or datetime.min.replace(tzinfo=timezone.utc),
+    ),))
+
+
+def _job_timestamp(job: ExecutionJob) -> datetime | None:
+    for key in ("updated_at", "created_at"):
+        raw = job.metadata.get(key)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _status_value(status: ExecutionJobStatus | str) -> str:
+    return status.value if hasattr(status, "value") else str(status)
 
 
 def _dependency_error(

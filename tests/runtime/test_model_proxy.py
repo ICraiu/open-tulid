@@ -1,5 +1,8 @@
 from pathlib import Path
+from io import BytesIO
 from threading import Thread
+from urllib.error import HTTPError, URLError
+from email.message import Message
 import urllib.request
 
 from open_tulid.runtime import (
@@ -12,6 +15,7 @@ from open_tulid.runtime import (
     serve_model_proxy,
 )
 from open_tulid.runtime.model_proxy import OpenAIAdapter
+from open_tulid.runtime.model_proxy import _forward_http
 from open_tulid.models import ModelProxyConfig
 from open_tulid.models import ResourceConfig
 from open_tulid.runtime import FileResourceLeaseStore
@@ -147,6 +151,48 @@ def test_openai_adapter_can_read_api_key_from_file(tmp_path: Path, monkeypatch):
         "base_url": "https://api.openai.com/v1",
         "headers": {"authorization": "Bearer file-secret"},
     }
+
+
+def test_forward_http_preserves_backend_error_response(monkeypatch):
+    headers = Message()
+    headers["content-type"] = "application/json"
+
+    def opener(request):
+        raise HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            headers,
+            BytesIO(b'{"error":{"message":"unsupported path"}}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", opener)
+
+    response = _forward_http(
+        "http://backend/v1",
+        ProxyRequest(method="POST", path="/responses", body=b"{}", headers={}),
+        {},
+    )
+
+    assert response.status == 400
+    assert response.headers["content-type"] == "application/json"
+    assert response.body == b'{"error":{"message":"unsupported path"}}'
+
+
+def test_forward_http_returns_502_when_backend_is_unreachable(monkeypatch):
+    def opener(request):
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", opener)
+
+    response = _forward_http(
+        "http://backend/v1",
+        ProxyRequest(method="POST", path="/chat/completions", body=b"{}", headers={}),
+        {},
+    )
+
+    assert response.status == 502
+    assert b"backend_unavailable" in response.body
 
 
 def test_model_proxy_rejects_session_without_live_resource_lease(tmp_path: Path):

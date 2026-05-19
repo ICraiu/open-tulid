@@ -802,6 +802,13 @@ def runtime_stop(
                     f"project={project_name} pid={pid}",
                 ))
                 raise typer.Exit(1)
+    _reconcile_active_runtime_jobs(
+        config,
+        project_name,
+        reason="runtime stop requested",
+        actor_id="runtime-stop",
+        stop_worker_containers=True,
+    )
     state_path.unlink(missing_ok=True)
     if not _any_scheduler_running(config):
         proxy_state_path = _proxy_state_path(config)
@@ -1483,6 +1490,23 @@ def _any_scheduler_running(config: Config) -> bool:
 
 
 def _fail_orphaned_runtime_jobs(config: Config, project: str) -> None:
+    _reconcile_active_runtime_jobs(
+        config,
+        project,
+        reason="orphaned after detached scheduler was not running at runtime start",
+        actor_id="runtime-start",
+        stop_worker_containers=False,
+    )
+
+
+def _reconcile_active_runtime_jobs(
+    config: Config,
+    project: str,
+    *,
+    reason: str,
+    actor_id: str,
+    stop_worker_containers: bool,
+) -> None:
     app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
     job_store = FileExecutionJobStore(app_state / "jobs" / project)
     event_store = JsonlEventStore(_project_path(config, project) / "events")
@@ -1500,10 +1524,12 @@ def _fail_orphaned_runtime_jobs(config: Config, project: str) -> None:
         status = job.status.value if hasattr(job.status, "value") else str(job.status)
         if status not in orphanable:
             continue
+        if stop_worker_containers:
+            _stop_worker_container(config.runtime.docker_executable, job.job_id)
         updated = job_store.update_status(
             job.job_id,
             ExecutionJobStatus.FAILED,
-            metadata={"status_reason": "orphaned after detached scheduler was not running at runtime start"},
+            metadata={"status_reason": reason},
         )
         if not updated.accepted:
             continue
@@ -1511,18 +1537,53 @@ def _fail_orphaned_runtime_jobs(config: Config, project: str) -> None:
         model_proxy_sessions.revoke_job(job.job_id)
         event_store.append(build_event(
             project_id=job.project_id,
-            actor=EventActor(type="system", id="runtime-start"),
+            actor=EventActor(type="system", id=actor_id),
             event_type=EventType.ExecutionFailed,
             correlation_id=job.job_id,
             task_id=job.task_id,
             job_id=job.job_id,
             transition_id=job.transition_id,
-            data={"reason": "orphaned_after_scheduler_exit"},
+            data={"reason": reason.replace(" ", "_")},
         ))
         console.print(_runtime_log_line(
             "JOB_ORPHANED",
             f"project={project} job={job.job_id} prior_status={status}",
         ))
+
+
+def _stop_worker_container(docker_executable: str, job_id: str) -> None:
+    name = _worker_container_name(job_id)
+    try:
+        result = subprocess.run(
+            (docker_executable, "rm", "-f", name),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        console.print(_runtime_log_line(
+            "WORKER_CONTAINER_STOP_FAILED",
+            f"job={job_id} name={name} error={exc}",
+        ))
+        return
+    if result.returncode == 0:
+        console.print(_runtime_log_line(
+            "WORKER_CONTAINER_STOPPED",
+            f"job={job_id} name={name}",
+        ))
+        return
+    stderr = (result.stderr or "").strip().lower()
+    if "no such container" in stderr:
+        return
+    console.print(_runtime_log_line(
+        "WORKER_CONTAINER_STOP_FAILED",
+        f"job={job_id} name={name} exit_code={result.returncode}",
+    ))
+
+
+def _worker_container_name(job_id: str) -> str:
+    return f"open-tulid-job-{job_id.lower()}"
 
 
 def _pid_is_running(value: object) -> bool:

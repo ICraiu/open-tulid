@@ -405,7 +405,25 @@ def _forward_http(base_url: str, request: ProxyRequest, extra_headers: Mapping[s
     headers = {key: value for key, value in request.headers.items() if key.lower() != "authorization"}
     headers.update(extra_headers)
     raw = urllib.request.Request(url, data=request.body or None, headers=headers, method=request.method)
-    response = urllib.request.urlopen(raw)
+    try:
+        response = urllib.request.urlopen(raw)
+    except HTTPError as exc:
+        return ProxyResponse(
+            status=exc.code,
+            headers=dict(exc.headers.items()),
+            body=exc.read(),
+        )
+    except (URLError, OSError) as exc:
+        return ProxyResponse(
+            status=502,
+            headers={"content-type": "application/json"},
+            body=json.dumps({
+                "error": {
+                    "message": f"model proxy backend request failed: {exc}",
+                    "type": "backend_unavailable",
+                },
+            }).encode("utf-8"),
+        )
 
     def chunks():
         try:

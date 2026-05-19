@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -57,6 +59,7 @@ class CompletionService:
         journal_store: TransactionJournalStore | None = None,
         artifact_root: Path | None = None,
         repo_root: Path | None = None,
+        repo_command_runner: object | None = None,
         verifier: DeterministicVerifier | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
@@ -68,6 +71,7 @@ class CompletionService:
         self.journal_store = journal_store
         self.artifact_root = artifact_root
         self.repo_root = repo_root
+        self.repo_command_runner = repo_command_runner
         self.verifier = verifier or DeterministicVerifier(
             artifact_templates={
                 artifact_id: artifact.template
@@ -213,11 +217,20 @@ class CompletionService:
             workspace=Path(job.workspace_path),
             changed_files=submission.changed_files,
         )
+        commit_effect = _commit_plan(
+            repo_root=self.repo_root,
+            changed_files=promoted_files,
+            task=self.adapter.read_task(job.task_id).task,
+        )
+        existing_task_ids, existing_task_errors = self._existing_task_ids(job.task_id) if transition.derives is not None else ((), ())
+        if existing_task_errors:
+            return CompletionResult(False, verification=verification, errors=existing_task_errors)
         derived_tasks, derivation_errors = _derived_task_plan(
             output_dir=output_dir,
             transition=transition,
             artifacts=normalize_artifacts(submission.artifacts),
             parent_id=job.task_id,
+            existing_task_ids=existing_task_ids,
         )
         if derivation_errors:
             return CompletionResult(False, verification=verification, errors=derivation_errors)
@@ -316,6 +329,7 @@ class CompletionService:
                 }
                 for item in promoted_files
             ),
+            *((commit_effect,) if commit_effect is not None else ()),
             *(
                 {
                     "type": "promote_artifact",
@@ -373,6 +387,14 @@ class CompletionService:
             },
         )
         return CompletionResult(True, verification=verification)
+
+    def _existing_task_ids(self, task_id: str) -> tuple[tuple[str, ...], tuple[DomainError, ...]]:
+        loaded = self.adapter.load_project()
+        if not loaded.accepted:
+            return (), loaded.errors
+        if loaded.snapshot is None:
+            return (), (_error("project.snapshot_missing", "Adapter returned no project snapshot.", task_id),)
+        return tuple(loaded.snapshot.tasks.keys()), ()
 
     def _apply_acceptance(
         self,
@@ -469,6 +491,25 @@ class CompletionService:
                     "changed_file.promotion_failed",
                     f"Cannot promote changed file: {exc}",
                     str(target_path),
+                ),))
+            return _EffectApplyResult(True)
+        if effect_type == "commit_repo_changes":
+            if self.repo_root is None:
+                return _EffectApplyResult(True)
+            message = str(effect.get("message", "")).strip()
+            paths = tuple(str(path) for path in effect.get("paths", ()))
+            committed = _commit_repo_changes(
+                repo_root=self.repo_root,
+                message=message,
+                paths=paths,
+                runner=self.repo_command_runner,
+            )
+            if committed.returncode != 0:
+                stderr = (committed.stderr or committed.stdout or "").strip()
+                return _EffectApplyResult(False, f"repo commit failed: {stderr}", (_error(
+                    "repo.commit_failed",
+                    f"Cannot commit accepted changes: {stderr or 'git commit failed'}",
+                    str(self.repo_root),
                 ),))
             return _EffectApplyResult(True)
         return _EffectApplyResult(False, f"unknown effect: {effect_type}", (_error(
@@ -594,6 +635,64 @@ def _changed_file_plan(
     return tuple(planned)
 
 
+def _commit_plan(
+    *,
+    repo_root: Path | None,
+    changed_files: tuple[Mapping[str, object], ...],
+    task: Task | None,
+) -> Mapping[str, object] | None:
+    if repo_root is None or task is None or not changed_files:
+        return None
+    if not (repo_root / ".git").exists():
+        return None
+    paths: list[str] = []
+    repository_root = repo_root.resolve()
+    for item in changed_files:
+        target = Path(str(item["target_path"])).resolve()
+        try:
+            paths.append(str(target.relative_to(repository_root)))
+        except ValueError:
+            continue
+    if not paths:
+        return None
+    return {
+        "type": "commit_repo_changes",
+        "message": _commit_message(task),
+        "paths": tuple(paths),
+    }
+
+
+def _commit_message(task: Task) -> str:
+    title = " ".join(task.title.split()).strip()
+    if task.id and title:
+        return f"{task.id}: {title}"
+    return title or f"Task {task.id}"
+
+
+def _commit_repo_changes(
+    *,
+    repo_root: Path,
+    message: str,
+    paths: tuple[str, ...],
+    runner,
+) -> subprocess.CompletedProcess[str]:
+    command_runner = runner or _run_repo_command
+    added = command_runner(("git", "add", "--", *paths), repo_root)
+    if added.returncode != 0:
+        return added
+    return command_runner(("git", "commit", "-m", message, "--", *paths), repo_root)
+
+
+def _run_repo_command(command: tuple[str, ...], repo_root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _artifact_link(artifact_root: Path, target: Path) -> str:
     try:
         return str(target.relative_to(artifact_root.parent))
@@ -669,6 +768,7 @@ def _derived_task_plan(
     transition,
     artifacts: tuple[ArtifactSubmission, ...],
     parent_id: str,
+    existing_task_ids: tuple[str, ...] = (),
 ) -> tuple[tuple[Mapping[str, object], ...], tuple[DomainError, ...]]:
     if transition.derives is None:
         return (), ()
@@ -689,7 +789,7 @@ def _derived_task_plan(
         parsed.append((local_id, title, dependencies, body))
     if errors:
         return (), tuple(errors)
-    ids = {local_id: new_ulid() for local_id, *_ in parsed}
+    ids = _allocate_numeric_task_ids(tuple(local_id for local_id, *_ in parsed), existing_task_ids)
     planned: list[Mapping[str, object]] = []
     for local_id, title, dependencies, body in parsed:
         unknown = tuple(dep for dep in dependencies if dep not in ids)
@@ -713,6 +813,20 @@ def _derived_task_plan(
         )
         planned.append({"task": task, "link": f"{task_id}-{_slugify(title)}"})
     return tuple(planned), tuple(errors)
+
+
+NUMERIC_TASK_ID_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+def _allocate_numeric_task_ids(local_ids: tuple[str, ...], existing_task_ids: tuple[str, ...]) -> dict[str, str]:
+    highest = 0
+    for task_id in existing_task_ids:
+        if NUMERIC_TASK_ID_RE.match(task_id):
+            highest = max(highest, int(task_id))
+    return {
+        local_id: str(next_id)
+        for local_id, next_id in zip(local_ids, range(highest + 1, highest + 1 + len(local_ids)))
+    }
 
 
 def _parse_derived_task_file(path: Path) -> tuple[str, str, tuple[str, ...], str]:

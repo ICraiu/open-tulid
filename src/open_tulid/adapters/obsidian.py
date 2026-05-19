@@ -15,7 +15,6 @@ from ruamel.yaml import YAML
 
 from open_tulid.domain.schema import BoardPosition, DomainError, ProjectSnapshot, Task, WorkflowDefinition
 from open_tulid.vault.links import parse_task_row
-from open_tulid.runtime.events import new_ulid
 
 from .base import (
     AdapterCapability,
@@ -26,6 +25,7 @@ from .base import (
 
 
 ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+NUMERIC_TASK_ID_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 def _yaml() -> YAML:
@@ -389,8 +389,11 @@ class ObsidianAdapter:
         except ValueError as exc:
             return _error("task.invalid_frontmatter", str(exc), str(path))
         task_id = frontmatter.get("id")
+        if isinstance(task_id, int):
+            task_id = str(task_id)
+            frontmatter["id"] = task_id
         if not isinstance(task_id, str) or not task_id.strip():
-            task_id = new_ulid()
+            task_id = _next_numeric_task_id(self._tasks_root())
             frontmatter["id"] = task_id
             try:
                 normalized = _serialize_frontmatter(frontmatter) + "\n\n" + body.strip("\n")
@@ -400,8 +403,8 @@ class ObsidianAdapter:
             except OSError as exc:
                 return _error("task.id_assignment_failed", f"Cannot assign task ID: {exc}", str(path))
         task_id = task_id.strip()
-        if ULID_RE.match(task_id) is None:
-            return _error("task.invalid_id", "Task ID must be a 26-character Crockford Base32 ULID.", str(path))
+        if not _is_valid_task_id(task_id):
+            return _error("task.invalid_id", "Task ID must be a positive integer or legacy 26-character Crockford Base32 ULID.", str(path))
 
         title = _extract_title(body) or path.stem
         metadata = {k: v for k, v in frontmatter.items() if k not in {
@@ -721,6 +724,26 @@ def _optional_string(value: Any) -> str | None:
         return None
     value_str = str(value).strip()
     return value_str or None
+
+
+def _is_valid_task_id(value: str) -> bool:
+    return NUMERIC_TASK_ID_RE.match(value) is not None or ULID_RE.match(value) is not None
+
+
+def _next_numeric_task_id(tasks_root: Path) -> str:
+    highest = 0
+    for path in tasks_root.glob("*.md"):
+        try:
+            frontmatter, _body = _split_frontmatter(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        task_id = frontmatter.get("id")
+        if isinstance(task_id, int):
+            highest = max(highest, task_id)
+            continue
+        if isinstance(task_id, str) and NUMERIC_TASK_ID_RE.match(task_id.strip()) is not None:
+            highest = max(highest, int(task_id.strip()))
+    return str(highest + 1)
 
 
 def _slugify(value: str) -> str:

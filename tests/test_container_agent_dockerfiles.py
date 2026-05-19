@@ -218,8 +218,9 @@ def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
         image="open-tulid/agent-codex:latest",
         workspace=tmp_path,
         args=("run", "task"),
-        env={"TOKEN": "x"},
+        env={"OPEN_TULID_JOB_ID": "JOB-123", "TOKEN": "x"},
         timeout_seconds=30,
+        container_name="open-tulid-job-job-123",
     )
 
     result = run_agent_container(request, docker_executable="podman", runner=fake_runner)
@@ -230,10 +231,14 @@ def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
         "podman",
         "run",
         "--rm",
+        "--name",
+        "open-tulid-job-job-123",
         "-v",
         f"{tmp_path.resolve()}:/workspace/project:rw",
         "-w",
         "/workspace/project",
+        "-e",
+        "OPEN_TULID_JOB_ID=JOB-123",
         "-e",
         "TOKEN=x",
         "open-tulid/agent-codex:latest",
@@ -253,11 +258,12 @@ def test_request_for_worker_uses_runtime_worker_image_override(tmp_path: Path):
         workspace=tmp_path,
         runtime=runtime,
         args=("hello",),
-        env={"LOCAL": "2"},
+        env={"OPEN_TULID_JOB_ID": "ABC123", "LOCAL": "2"},
     )
 
     assert request.image == "registry.local/codex:dev"
-    assert request.env == {"GLOBAL": "1", "LOCAL": "2"}
+    assert request.env == {"GLOBAL": "1", "OPEN_TULID_JOB_ID": "ABC123", "LOCAL": "2"}
+    assert request.container_name == "open-tulid-job-abc123"
     assert request.args == ("hello",)
 
 
