@@ -76,3 +76,48 @@ def test_linked_context_includes_parent_links(tmp_path: Path):
     assert result.accepted is True
     assert result.packet is not None
     assert [doc.ref for doc in result.packet.documents] == ["parent-context"]
+
+
+def test_linked_context_skips_parent_implementation_task_files(tmp_path: Path):
+    (tmp_path / "artifacts" / "parent" / "ImplementationTaskFile").mkdir(parents=True)
+    (tmp_path / "artifacts" / "parent" / "ImplementationSpec").mkdir(parents=True)
+    task_file = "artifacts/parent/ImplementationTaskFile/01-project-shell.md"
+    spec_file = "artifacts/parent/ImplementationSpec/implementation-spec.md"
+    (tmp_path / task_file).write_text("Sibling task content.\n", encoding="utf-8")
+    (tmp_path / spec_file).write_text("Implementation spec content.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(body="Child body."),
+        parent_tasks=(_task(artifact_links=(task_file, spec_file), task_id="parent"),),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == [spec_file]
+    assert "Sibling task content" not in result.packet.text
+
+
+def test_linked_context_skips_direct_implementation_task_file_links(tmp_path: Path):
+    (tmp_path / "artifacts" / "parent" / "ImplementationTaskFile").mkdir(parents=True)
+    task_file = "artifacts/parent/ImplementationTaskFile/01-project-shell.md"
+    (tmp_path / task_file).write_text("Task file content.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=(task_file,)),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert result.packet.documents == ()
+
+
+def test_linked_context_dedupes_equal_content(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("Same content.\n", encoding="utf-8")
+    (tmp_path / "docs" / "b.md").write_text("Same content.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(_task(body="See [[a]] and [[b]]."))
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == ["a"]

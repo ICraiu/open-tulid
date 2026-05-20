@@ -376,6 +376,7 @@ def schedule_job(
         workspace_root=ctx["workspace_root"],
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
+        serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -415,6 +416,7 @@ def create_job(
         workspace_root=ctx["workspace_root"],
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
+        serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -611,6 +613,7 @@ def run_one_job(
         workspace_root=ctx["workspace_root"],
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
+        serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -644,6 +647,7 @@ def jobs_daemon(
             workspace_root=ctx["workspace_root"],
             lease_store=ctx["lease_store"],
             worker_resources=ctx["config"].runtime.worker_resources,
+            serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
         )

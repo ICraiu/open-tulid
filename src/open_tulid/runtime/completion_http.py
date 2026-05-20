@@ -34,19 +34,14 @@ def make_completion_handler(config: CompletionEndpointConfig) -> type[BaseHTTPRe
                 _write_json(self, 403, {"errors": [_error_dict("completion.job_not_bound", "Endpoint is not bound to this job.")]})
                 return
 
-            content_length = self.headers.get("content-length")
-            try:
-                length = int(content_length or "0")
-            except ValueError:
-                _write_json(self, 400, {"errors": [_error_dict("completion.content_length_invalid", "Content-Length must be an integer.")]})
-                return
-            if length > config.max_payload_bytes:
-                _write_json(self, 413, {"errors": [_error_dict("completion.payload_too_large", "Completion payload exceeds 1 MiB.")]})
+            body_result = _read_request_body(self, max_bytes=config.max_payload_bytes)
+            if body_result.error is not None:
+                status = 413 if body_result.error["code"] == "completion.payload_too_large" else 400
+                _write_json(self, status, {"errors": [body_result.error]})
                 return
 
-            raw = self.rfile.read(length)
             try:
-                payload = json.loads(raw.decode("utf-8") if raw else "{}")
+                payload = json.loads(body_result.body.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 _write_json(self, 400, {"errors": [_error_dict("completion.json_malformed", "Completion payload must be valid JSON.")]})
                 return
@@ -89,6 +84,86 @@ def serve_completion_endpoint(
 ) -> ThreadingHTTPServer:
     server = server_factory((host, port), make_completion_handler(config))
     return server
+
+
+@dataclass(frozen=True)
+class _BodyReadResult:
+    body: bytes
+    error: Mapping[str, object] | None = None
+
+
+def _read_request_body(handler: BaseHTTPRequestHandler, *, max_bytes: int) -> _BodyReadResult:
+    transfer_encoding = handler.headers.get("transfer-encoding", "")
+    encodings = {
+        encoding.strip().lower()
+        for encoding in transfer_encoding.split(",")
+        if encoding.strip()
+    }
+    if "chunked" in encodings:
+        return _read_chunked_body(handler, max_bytes=max_bytes)
+
+    content_length = handler.headers.get("content-length")
+    if content_length is None:
+        return _BodyReadResult(b"", _error_dict(
+            "completion.content_length_missing",
+            "Completion payload requires Content-Length or Transfer-Encoding: chunked.",
+        ))
+    try:
+        length = int(content_length)
+    except ValueError:
+        return _BodyReadResult(b"", _error_dict(
+            "completion.content_length_invalid",
+            "Content-Length must be an integer.",
+        ))
+    if length > max_bytes:
+        return _BodyReadResult(b"", _error_dict(
+            "completion.payload_too_large",
+            "Completion payload exceeds 1 MiB.",
+        ))
+    return _BodyReadResult(handler.rfile.read(length))
+
+
+def _read_chunked_body(handler: BaseHTTPRequestHandler, *, max_bytes: int) -> _BodyReadResult:
+    body = bytearray()
+    while True:
+        size_line = handler.rfile.readline(1024)
+        if not size_line:
+            return _BodyReadResult(b"", _error_dict(
+                "completion.chunked_malformed",
+                "Chunked completion payload ended before the final chunk.",
+            ))
+        try:
+            chunk_size = int(size_line.split(b";", 1)[0].strip(), 16)
+        except ValueError:
+            return _BodyReadResult(b"", _error_dict(
+                "completion.chunked_malformed",
+                "Chunked completion payload has an invalid chunk size.",
+            ))
+        if chunk_size == 0:
+            # Consume optional trailer headers.
+            while True:
+                trailer_line = handler.rfile.readline(1024)
+                if trailer_line in {b"\r\n", b"\n", b""}:
+                    break
+            return _BodyReadResult(bytes(body))
+        if len(body) + chunk_size > max_bytes:
+            return _BodyReadResult(b"", _error_dict(
+                "completion.payload_too_large",
+                "Completion payload exceeds 1 MiB.",
+            ))
+        chunk = handler.rfile.read(chunk_size)
+        if len(chunk) != chunk_size:
+            return _BodyReadResult(b"", _error_dict(
+                "completion.chunked_malformed",
+                "Chunked completion payload ended inside a chunk.",
+            ))
+        body.extend(chunk)
+        crlf = handler.rfile.read(2)
+        if crlf != b"\r\n":
+            return _BodyReadResult(b"", _error_dict(
+                "completion.chunked_malformed",
+                "Chunked completion payload is missing a chunk terminator.",
+            ))
 
 
 def _job_id_from_path(path: str) -> str | None:

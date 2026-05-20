@@ -57,7 +57,7 @@ class FakeAdapter:
         return WriteResult(path="events/test.jsonl")
 
 
-def _workflow(*, ambiguous: bool = False) -> WorkflowDefinition:
+def _workflow(*, ambiguous: bool = False, review: bool = False) -> WorkflowDefinition:
     transitions = {
         "implement": TransitionDefinition(
             id="implement",
@@ -70,6 +70,17 @@ def _workflow(*, ambiguous: bool = False) -> WorkflowDefinition:
             default_for_scheduler=True,
         ),
     }
+    if review:
+        transitions["review"] = TransitionDefinition(
+            id="review",
+            task_type="task",
+            from_state="Review",
+            to_state="Done",
+            worker="codex",
+            requires=RequirementDefinition(),
+            transaction=None,
+            default_for_scheduler=True,
+        )
     if ambiguous:
         transitions["document"] = TransitionDefinition(
             id="document",
@@ -279,7 +290,7 @@ def test_scheduler_skips_when_active_job_exists(tmp_path: Path):
 
     assert result.accepted is True
     assert result.scheduled is False
-    assert result.skipped[0].code == "job.active_exists"
+    assert result.skipped[0].code == "repo_lane.active_job_exists"
 
 
 def test_scheduler_backs_off_after_recent_failed_job(tmp_path: Path):
@@ -333,6 +344,127 @@ def test_scheduler_retries_after_failed_job_backoff_expires(tmp_path: Path):
     assert result.scheduled is True
     assert result.job is not None
     assert result.job.job_id != "01J00000000000000000000JOB"
+
+
+def test_scheduler_keeps_started_task_on_serial_repo_lane(tmp_path: Path):
+    started = Task(
+        id=TASK_ID,
+        title="Started",
+        path="tasks/started.md",
+        current_state="Review",
+        task_type="task",
+    )
+    next_task = Task(
+        id="01J00000000000000000000002",
+        title="Next",
+        path="tasks/next.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="accepted",
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(started, next_task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == TASK_ID
+    assert result.transition_id == "review"
+
+
+def test_scheduler_does_not_advance_or_switch_tasks_while_serial_lane_has_active_job(tmp_path: Path):
+    started = Task(
+        id=TASK_ID,
+        title="Started",
+        path="tasks/started.md",
+        current_state="Review",
+        task_type="task",
+    )
+    next_task = Task(
+        id="01J00000000000000000000002",
+        title="Next",
+        path="tasks/next.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="running",
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(started, next_task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.task_id == TASK_ID
+    assert result.skipped[0].code == "repo_lane.active_job_exists"
+
+
+def test_scheduler_can_opt_out_of_serial_repo_lane(tmp_path: Path):
+    started = Task(
+        id=TASK_ID,
+        title="Started",
+        path="tasks/started.md",
+        current_state="Review",
+        task_type="task",
+    )
+    next_task = Task(
+        id="01J00000000000000000000002",
+        title="Next",
+        path="tasks/next.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="running",
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(started, next_task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        serial_repo_execution=False,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == TASK_ID
+    assert result.transition_id == "review"
 
 
 def test_scheduler_defers_task_when_required_resource_is_busy(tmp_path: Path):

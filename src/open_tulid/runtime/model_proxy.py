@@ -375,7 +375,11 @@ def make_model_proxy_handler(service: ModelProxyService) -> type[BaseHTTPRequest
                 ),
             )
             self.send_response(response.status)
-            for key, value in response.headers.items():
+            response_headers = _proxy_response_headers(
+                response.headers,
+                body_length=None if response.chunks is not None else len(response.body),
+            )
+            for key, value in response_headers.items():
                 self.send_header(key, value)
             self.end_headers()
             if response.chunks is not None:
@@ -440,6 +444,30 @@ def _forward_http(base_url: str, request: ProxyRequest, extra_headers: Mapping[s
         headers=dict(response.headers.items()),
         chunks=chunks(),
     )
+
+
+_HOP_BY_HOP_RESPONSE_HEADERS = frozenset({
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+def _proxy_response_headers(headers: Mapping[str, str], *, body_length: int | None) -> dict[str, str]:
+    sanitized = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _HOP_BY_HOP_RESPONSE_HEADERS
+    }
+    if body_length is not None:
+        sanitized["content-length"] = str(body_length)
+    return sanitized
 
 
 def _fsync_directory(path: Path) -> None:

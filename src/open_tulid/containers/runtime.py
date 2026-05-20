@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,7 @@ class AgentRunRequest:
     remove: bool = True
     volume_relabel: bool = False
     container_name: str | None = None
+    container_user: str | None = None
 
 
 @dataclass(frozen=True)
@@ -74,18 +76,27 @@ def request_for_worker(
     mounts: Sequence[ContainerMount] = (),
 ) -> AgentRunRequest:
     merged_env = {**runtime.env, **dict(env or {})}
+    image = image_for_agent(worker_id, runtime)
+    worker_mounts = tuple(mounts)
+    container_user = None
+    if _is_opencode_worker(worker_id, runtime, image=image):
+        debug_mounts, debug_env = _opencode_debug_config(workspace, runtime.container_workspace)
+        worker_mounts = (*worker_mounts, *debug_mounts)
+        merged_env = {**debug_env, **merged_env}
+        container_user = _host_container_user()
     return AgentRunRequest(
         agent_id=worker_id,
-        image=image_for_agent(worker_id, runtime),
+        image=image,
         workspace=workspace,
         args=tuple(args),
         env=merged_env,
-        mounts=tuple(mounts),
+        mounts=worker_mounts,
         extra_hosts=_runtime_extra_hosts(runtime),
         workdir=runtime.container_workspace,
         timeout_seconds=runtime.default_timeout_seconds,
         volume_relabel=runtime.container_volume_relabel,
         container_name=_job_container_name(merged_env),
+        container_user=container_user,
     )
 
 
@@ -102,6 +113,8 @@ def run_agent_container(
         command.append("--rm")
     if request.container_name:
         command.extend(["--name", request.container_name])
+    if request.container_user:
+        command.extend(["--user", request.container_user])
     for mount in mounts:
         mode = "ro" if mount.readonly else "rw"
         if request.volume_relabel:
@@ -168,3 +181,40 @@ def _job_container_name(env: Mapping[str, str]) -> str | None:
     if not job_id:
         return None
     return f"open-tulid-job-{job_id.lower()}"
+
+
+def _opencode_debug_config(workspace: Path, container_workspace: str) -> tuple[tuple[ContainerMount, ...], dict[str, str]]:
+    context_root = workspace / ".open-tulid"
+    data_root = workspace / ".open-tulid" / "opencode-data"
+    home_root = workspace / ".open-tulid" / "home"
+    data_root.mkdir(parents=True, exist_ok=True)
+    share_root = home_root / ".local" / "share"
+    share_root.mkdir(parents=True, exist_ok=True)
+    link = share_root / "opencode"
+    if not link.exists():
+        try:
+            link.symlink_to(f"{container_workspace}/.open-tulid/opencode-data")
+        except OSError:
+            pass
+    container_context = f"{container_workspace}/.open-tulid"
+    return (
+        (),
+        {
+            "HOME": f"{container_context}/home",
+            "OPENCODE_LOG_LEVEL": "debug",
+            "XDG_DATA_HOME": f"{container_context}/home/.local/share",
+        },
+    )
+
+
+def _is_opencode_worker(worker_id: str, runtime: RuntimeConfig, *, image: str | None = None) -> bool:
+    if worker_id == "opencode" or runtime.worker_types.get(worker_id) == "opencode":
+        return True
+    resolved_image = image if image is not None else image_for_agent(worker_id, runtime)
+    return "opencode" in Path(resolved_image).name
+
+
+def _host_container_user() -> str | None:
+    if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        return None
+    return f"{os.getuid()}:{os.getgid()}"

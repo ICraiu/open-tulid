@@ -171,6 +171,12 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
     if not container_workspace.startswith("/"):
         _fail("runtime.container_workspace must be an absolute container path")
 
+    repo_execution_mode = _runtime_string(
+        raw, "repo_execution_mode", default="serial", table="runtime",
+    )
+    if repo_execution_mode not in {"serial", "parallel"}:
+        _fail("runtime.repo_execution_mode must be either 'serial' or 'parallel'")
+
     image_tag_prefix = _runtime_string(
         raw, "image_tag_prefix", default="open-tulid/agent", table="runtime",
     )
@@ -212,6 +218,7 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         docker_executable=docker_executable,
         shared_workspace_root=shared_root,
         container_workspace=container_workspace,
+        repo_execution_mode=repo_execution_mode,
         image_tag_prefix=image_tag_prefix,
         default_timeout_seconds=timeout,
         worker_images=worker_images,

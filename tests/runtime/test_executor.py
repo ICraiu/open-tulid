@@ -146,7 +146,7 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     assert loaded.job.status == "accepted"
 
 
-def test_executor_implicitly_completes_successful_jobs_without_explicit_evidence(
+def test_executor_fails_successful_worker_without_explicit_completion_evidence(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -175,7 +175,6 @@ def test_executor_implicitly_completes_successful_jobs_without_explicit_evidence
         )
 
     monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
-    monkeypatch.setattr("open_tulid.runtime.executor._git_changed_files", lambda workspace: {"src/app.py"})
 
     executor = JobExecutor(
         workflow=workflow,
@@ -189,14 +188,14 @@ def test_executor_implicitly_completes_successful_jobs_without_explicit_evidence
     result = executor.run(JOB_ID)
 
     assert result.accepted is True
-    assert adapter.moved_to == "CodeReview"
+    assert adapter.moved_to is None
     loaded = store.get(JOB_ID)
     assert loaded.job is not None
-    assert loaded.job.status == "accepted"
-    assert loaded.job.metadata["promoted_files"] == []
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
 
 
-def test_executor_implicit_completion_can_diff_workspace_against_repo_root(
+def test_executor_requires_explicit_completion_call_even_when_workspace_changes(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -239,11 +238,15 @@ def test_executor_implicit_completion_can_diff_workspace_against_repo_root(
     result = executor.run(JOB_ID)
 
     assert result.accepted is True
-    assert adapter.moved_to == "CodeReview"
-    assert (repo_root / "src" / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+    assert adapter.moved_to is None
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
+    assert (repo_root / "src" / "app.py").read_text(encoding="utf-8") == "print('before')\n"
 
 
-def test_executor_implicit_completion_can_run_trusted_validations(tmp_path: Path, monkeypatch):
+def test_executor_does_not_run_trusted_validations_without_completion_call(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace"
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -318,8 +321,12 @@ def test_executor_implicit_completion_can_run_trusted_validations(tmp_path: Path
     result = executor.run(JOB_ID)
 
     assert result.accepted is True
-    assert adapter.moved_to == "CodeReview"
-    assert (repo_root / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+    assert adapter.moved_to is None
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
+    assert (repo_root / "app.py").read_text(encoding="utf-8") == "print('before')\n"
 
 
 def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkeypatch):

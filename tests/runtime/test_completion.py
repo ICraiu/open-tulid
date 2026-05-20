@@ -327,6 +327,95 @@ def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path
     ]
 
 
+def test_completion_skips_commit_when_changed_files_match_repo_root(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    calls: list[tuple[tuple[str, ...], Path | None]] = []
+    (repo / ".git").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+
+    def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        calls.append((command, cwd))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        repo_command_runner=runner,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is True
+    assert calls == []
+    loaded = store.get("01J00000000000000000000JOB")
+    assert loaded.job is not None
+    assert loaded.job.metadata["promoted_files"] == []
+
+
+def test_completion_treats_git_nothing_to_commit_as_success(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    calls: list[tuple[tuple[str, ...], Path | None]] = []
+    (repo / ".git").mkdir(parents=True)
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+
+    def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        calls.append((command, cwd))
+        if command[:2] == ("git", "commit"):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "On branch master\nnothing to commit, working tree clean\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        repo_command_runner=runner,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is True
+    assert calls == [
+        (("git", "add", "--", "src/main.ts"), repo),
+        (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
+    ]
+
+
 def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
     store = _job_store(tmp_path)
     output = tmp_path / "workspace" / "output"

@@ -628,11 +628,20 @@ def _changed_file_plan(
         if target != repository_root and repository_root not in target.parents:
             continue
         if source.is_file():
+            if target.is_file() and _same_file_content(source, target):
+                continue
             planned.append({
                 "source_path": str(source),
                 "target_path": str(target),
             })
     return tuple(planned)
+
+
+def _same_file_content(left: Path, right: Path) -> bool:
+    try:
+        return left.read_bytes() == right.read_bytes()
+    except OSError:
+        return False
 
 
 def _commit_plan(
@@ -680,7 +689,15 @@ def _commit_repo_changes(
     added = command_runner(("git", "add", "--", *paths), repo_root)
     if added.returncode != 0:
         return added
-    return command_runner(("git", "commit", "-m", message, "--", *paths), repo_root)
+    committed = command_runner(("git", "commit", "-m", message, "--", *paths), repo_root)
+    if committed.returncode != 0 and _git_nothing_to_commit(committed):
+        return subprocess.CompletedProcess(committed.args, 0, committed.stdout, committed.stderr)
+    return committed
+
+
+def _git_nothing_to_commit(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    return "nothing to commit" in output and "working tree clean" in output
 
 
 def _run_repo_command(command: tuple[str, ...], repo_root: Path) -> subprocess.CompletedProcess[str]:

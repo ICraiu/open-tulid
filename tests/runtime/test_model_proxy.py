@@ -16,6 +16,7 @@ from open_tulid.runtime import (
 )
 from open_tulid.runtime.model_proxy import OpenAIAdapter
 from open_tulid.runtime.model_proxy import _forward_http
+from open_tulid.runtime.model_proxy import _proxy_response_headers
 from open_tulid.models import ModelProxyConfig
 from open_tulid.models import ResourceConfig
 from open_tulid.runtime import FileResourceLeaseStore
@@ -193,6 +194,35 @@ def test_forward_http_returns_502_when_backend_is_unreachable(monkeypatch):
 
     assert response.status == 502
     assert b"backend_unavailable" in response.body
+
+
+def test_proxy_response_headers_strip_hop_by_hop_headers_for_streaming_response():
+    headers = _proxy_response_headers(
+        {
+            "content-type": "text/event-stream",
+            "transfer-encoding": "chunked",
+            "connection": "keep-alive",
+            "content-length": "999",
+        },
+        body_length=None,
+    )
+
+    assert headers == {"content-type": "text/event-stream"}
+
+
+def test_proxy_response_headers_set_content_length_for_buffered_response():
+    headers = _proxy_response_headers(
+        {
+            "content-type": "application/json",
+            "transfer-encoding": "chunked",
+        },
+        body_length=12,
+    )
+
+    assert headers == {
+        "content-type": "application/json",
+        "content-length": "12",
+    }
 
 
 def test_model_proxy_rejects_session_without_live_resource_lease(tmp_path: Path):

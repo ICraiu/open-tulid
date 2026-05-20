@@ -46,6 +46,7 @@ class Scheduler:
         workspace_root: Path,
         lease_store: FileResourceLeaseStore | None = None,
         worker_resources: dict[str, tuple[str, ...]] | None = None,
+        serial_repo_execution: bool = True,
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
     ) -> None:
@@ -55,6 +56,7 @@ class Scheduler:
         self.workspace_root = workspace_root
         self.lease_store = lease_store
         self.worker_resources = worker_resources or {}
+        self.serial_repo_execution = serial_repo_execution
         self.event_store = event_store
         self.journal_store = journal_store
 
@@ -73,7 +75,34 @@ class Scheduler:
             ),))
 
         skipped: list[DomainError] = []
-        for task in _tasks_in_board_order(loaded.snapshot):
+        tasks = _tasks_in_board_order(loaded.snapshot)
+        if self.serial_repo_execution:
+            focused = _serial_repo_lane_focus(
+                project_id,
+                loaded.snapshot,
+                self.workflow,
+                self.job_store,
+            )
+            if isinstance(focused, DomainError):
+                return ScheduleResult(scheduled=False, errors=(focused,))
+            if focused is not None:
+                if focused.active_jobs:
+                    skipped.append(_error(
+                        "repo_lane.active_job_exists",
+                        (
+                            f"Repo lane is held by task {focused.task.id!r}; "
+                            f"active job {focused.active_jobs[0].job_id!r} is still running."
+                        ),
+                        focused.task.id,
+                    ))
+                    return ScheduleResult(
+                        scheduled=False,
+                        task_id=focused.task.id,
+                        skipped=tuple(skipped),
+                    )
+                tasks = (focused.task,)
+
+        for task in tasks:
             dependency_error = _dependency_error(task, loaded.snapshot, self.workflow)
             if dependency_error is not None:
                 skipped.append(dependency_error)
@@ -291,6 +320,46 @@ def _tasks_in_board_order(snapshot: ProjectSnapshot) -> tuple[Task, ...]:
     ))
 
 
+@dataclass(frozen=True)
+class _SerialRepoLaneFocus:
+    task: Task
+    active_jobs: tuple[ExecutionJob, ...] = ()
+
+
+def _serial_repo_lane_focus(
+    project_id: str,
+    snapshot: ProjectSnapshot,
+    workflow: WorkflowDefinition,
+    job_store: FileExecutionJobStore,
+) -> _SerialRepoLaneFocus | DomainError | None:
+    listed = job_store.list()
+    if not listed.accepted:
+        return listed.error or _error("job.read_failed", "Cannot inspect execution jobs.")
+
+    tasks = _tasks_in_board_order(snapshot)
+    task_ids = {task.id for task in tasks}
+    project_jobs = tuple(
+        job for job in listed.jobs
+        if job.project_id == project_id and job.task_id in task_ids
+    )
+    active_jobs_by_task: dict[str, list[ExecutionJob]] = {}
+    jobs_by_task: dict[str, list[ExecutionJob]] = {}
+    for job in project_jobs:
+        jobs_by_task.setdefault(job.task_id, []).append(job)
+        if _status_value(job.status) in _ACTIVE_REPO_LANE_JOB_STATUSES:
+            active_jobs_by_task.setdefault(job.task_id, []).append(job)
+
+    for task in tasks:
+        active_jobs = tuple(active_jobs_by_task.get(task.id, ()))
+        if active_jobs:
+            return _SerialRepoLaneFocus(task=task, active_jobs=active_jobs)
+
+    for task in tasks:
+        if task.id in jobs_by_task and _has_scheduler_eligible_transition(task, workflow):
+            return _SerialRepoLaneFocus(task=task)
+    return None
+
+
 def _find_recent_failed_job(
     job_store: FileExecutionJobStore,
     project_id: str,
@@ -365,6 +434,23 @@ def _dependency_error(
 def _has_outgoing_transition(task: Task, workflow: WorkflowDefinition) -> bool:
     return any(
         transition.task_type == task.task_type and transition.from_state == task.current_state
+        for transition in workflow.transitions.values()
+    )
+
+
+_ACTIVE_REPO_LANE_JOB_STATUSES = frozenset({
+    ExecutionJobStatus.PENDING.value,
+    ExecutionJobStatus.RUNNING.value,
+    ExecutionJobStatus.COMPLETION_REJECTED.value,
+    ExecutionJobStatus.STALE.value,
+})
+
+
+def _has_scheduler_eligible_transition(task: Task, workflow: WorkflowDefinition) -> bool:
+    return any(
+        transition.task_type == task.task_type
+        and transition.from_state == task.current_state
+        and transition.worker is not None
         for transition in workflow.transitions.values()
     )
 

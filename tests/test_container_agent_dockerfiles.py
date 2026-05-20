@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -31,6 +32,7 @@ def test_codex_agent_dockerfile_packages_codex_cli():
     content = (AGENT_DOCKERFILES / "codex.Dockerfile").read_text(encoding="utf-8")
 
     assert "FROM node:24-bookworm-slim" in content
+    assert "curl" in content
     assert "npm install -g @openai/codex" in content
     assert 'ENTRYPOINT ["codex"]' in content
     assert "WORKDIR /workspace/project" in content
@@ -40,6 +42,7 @@ def test_opencode_agent_dockerfile_packages_opencode_cli():
     content = (AGENT_DOCKERFILES / "opencode.Dockerfile").read_text(encoding="utf-8")
 
     assert "FROM node:24-bookworm-slim" in content
+    assert "curl" in content
     assert "npm install -g opencode-ai" in content
     assert 'ENTRYPOINT ["opencode"]' in content
     assert "WORKDIR /workspace/project" in content
@@ -221,6 +224,7 @@ def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
         env={"OPEN_TULID_JOB_ID": "JOB-123", "TOKEN": "x"},
         timeout_seconds=30,
         container_name="open-tulid-job-job-123",
+        container_user="1000:1000",
     )
 
     result = run_agent_container(request, docker_executable="podman", runner=fake_runner)
@@ -233,6 +237,8 @@ def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
         "--rm",
         "--name",
         "open-tulid-job-job-123",
+        "--user",
+        "1000:1000",
         "-v",
         f"{tmp_path.resolve()}:/workspace/project:rw",
         "-w",
@@ -265,6 +271,51 @@ def test_request_for_worker_uses_runtime_worker_image_override(tmp_path: Path):
     assert request.env == {"GLOBAL": "1", "OPEN_TULID_JOB_ID": "ABC123", "LOCAL": "2"}
     assert request.container_name == "open-tulid-job-abc123"
     assert request.args == ("hello",)
+
+
+def test_request_for_opencode_mounts_debug_data_in_workspace(tmp_path: Path):
+    request = request_for_worker(
+        worker_id="opencode",
+        workspace=tmp_path,
+        runtime=RuntimeConfig(),
+        env={"OPEN_TULID_JOB_ID": "ABC123"},
+    )
+
+    assert (tmp_path / ".open-tulid" / "opencode-data").is_dir()
+    assert (tmp_path / ".open-tulid" / "home" / ".local" / "share" / "opencode").is_symlink()
+    assert request.container_user == f"{os.getuid()}:{os.getgid()}"
+    assert request.env["HOME"] == "/workspace/project/.open-tulid/home"
+    assert request.env["OPENCODE_LOG_LEVEL"] == "debug"
+    assert request.env["XDG_DATA_HOME"] == "/workspace/project/.open-tulid/home/.local/share"
+    assert request.mounts == ()
+
+
+def test_request_for_typed_opencode_worker_mounts_debug_data_in_workspace(tmp_path: Path):
+    request = request_for_worker(
+        worker_id="qwen_27b",
+        workspace=tmp_path,
+        runtime=RuntimeConfig(worker_types={"qwen_27b": "opencode"}),
+        env={"OPEN_TULID_JOB_ID": "ABC123"},
+    )
+
+    assert (tmp_path / ".open-tulid" / "opencode-data").is_dir()
+    assert request.container_user == f"{os.getuid()}:{os.getgid()}"
+    assert request.env["OPENCODE_LOG_LEVEL"] == "debug"
+    assert request.mounts == ()
+
+
+def test_request_for_opencode_image_alias_mounts_debug_data_in_workspace(tmp_path: Path):
+    request = request_for_worker(
+        worker_id="local_llm",
+        workspace=tmp_path,
+        runtime=RuntimeConfig(worker_images={"local_llm": "open-tulid/agent-opencode:latest"}),
+        env={"OPEN_TULID_JOB_ID": "ABC123"},
+    )
+
+    assert (tmp_path / ".open-tulid" / "opencode-data").is_dir()
+    assert request.container_user == f"{os.getuid()}:{os.getgid()}"
+    assert request.env["OPENCODE_LOG_LEVEL"] == "debug"
+    assert request.mounts == ()
 
 
 def test_image_for_agent_defaults_to_tag_prefix():

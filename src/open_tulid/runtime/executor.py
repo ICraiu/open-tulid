@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
@@ -20,7 +19,6 @@ from open_tulid.runtime.instructions import AgentInstructionResolver
 from open_tulid.runtime.context import LinkedContextResolver
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
-from open_tulid.runtime.verifier import CompletionSubmission
 from open_tulid.runtime.workspaces import WorkspacePreparer
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -251,13 +249,6 @@ class JobExecutor:
             )
             if status_after_run == ExecutionJobStatus.ACCEPTED.value:
                 return ExecutorRunResult(True, run=result)
-            if result.succeeded and self._try_implicit_completion(
-                job_id=job.job_id,
-                transition=transition,
-                workspace=Path(job.workspace_path),
-                token=str(job.metadata.get("completion_token", "")),
-            ):
-                return ExecutorRunResult(True, run=result)
             if not result.succeeded:
                 self.job_store.update_status(
                     job.job_id,
@@ -317,50 +308,6 @@ class JobExecutor:
                 self.lease_store.release_job(job.job_id)
             if self.model_proxy_sessions is not None:
                 self.model_proxy_sessions.revoke_job(job.job_id)
-
-    def _try_implicit_completion(
-        self,
-        *,
-        job_id: str,
-        transition,
-        workspace: Path,
-        token: str,
-    ) -> bool:
-        if transition.requires.artifacts or transition.derives is not None:
-            return False
-        changed_files = _git_changed_files(workspace)
-        if changed_files is None:
-            changed_files = _workspace_changed_files(
-                workspace=workspace,
-                repo_root=self.project_config.repo_root,
-            )
-        if changed_files is None:
-            return False
-        service = CompletionService(
-            workflow=self.workflow,
-            adapter=self.adapter,
-            job_store=self.job_store,
-            event_store=self.event_store,
-            journal_store=self.journal_store,
-            artifact_root=self.artifact_root,
-            repo_root=self.project_config.repo_root,
-            validation_implementations=self.validation_implementations,
-            validation_context_factory=self.validation_context_factory,
-        )
-        validation_evidence = {
-            call.type: "Trusted validation inferred by Tulid implicit completion."
-            for call in transition.requires.validations
-        }
-        result = service.submit(
-            job_id=job_id,
-            token=token,
-            submission=CompletionSubmission(
-                summary="Worker exited successfully; completion evidence inferred by Tulid.",
-                changed_files=tuple(sorted(changed_files)),
-                validation_evidence=validation_evidence,
-            ),
-        )
-        return result.accepted
 
     def _start_completion_endpoint(self, job_id: str) -> "_ManagedCompletionEndpoint":
         service = CompletionService(
@@ -492,61 +439,6 @@ def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
     (log_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
     (log_dir / "stderr.log").write_text(result.stderr, encoding="utf-8")
     (log_dir / "command.txt").write_text(" ".join(_redact_command_for_log(result.command)) + "\n", encoding="utf-8")
-
-
-def _git_changed_files(workspace: Path) -> set[str] | None:
-    if not (workspace / ".git").exists():
-        return None
-    completed = subprocess.run(
-        ["git", "-C", str(workspace), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return None
-    changed_files: set[str] = set()
-    for line in completed.stdout.splitlines():
-        if len(line) < 4:
-            continue
-        path = line[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        changed_files.add(path)
-    return changed_files
-
-
-_WORKSPACE_DIFF_IGNORES = frozenset({
-    ".git",
-    ".open-tulid",
-    "output",
-    "node_modules",
-    "dist",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-})
-
-
-def _workspace_changed_files(*, workspace: Path, repo_root: Path | None) -> set[str] | None:
-    if repo_root is None or not repo_root.is_dir():
-        return None
-    changed_files: set[str] = set()
-    for path in workspace.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(workspace)
-        if any(part in _WORKSPACE_DIFF_IGNORES for part in relative.parts):
-            continue
-        repo_path = repo_root / relative
-        if not repo_path.is_file() or _sha256(path) != _sha256(repo_path):
-            changed_files.add(str(relative))
-    return changed_files
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _render_worker_model_env(
@@ -743,17 +635,13 @@ def _adapter_project_root(adapter: StorageAdapter) -> Path | None:
 
 
 def _load_parent_tasks(adapter: StorageAdapter, task: Task) -> tuple[Task, ...]:
-    parents: list[Task] = []
-    seen: set[str] = {task.id}
     parent_id = task.parent_id
-    while parent_id and parent_id not in seen:
-        seen.add(parent_id)
-        loaded = adapter.read_task(parent_id)
-        if not loaded.accepted or loaded.task is None:
-            break
-        parents.append(loaded.task)
-        parent_id = loaded.task.parent_id
-    return tuple(parents)
+    if not parent_id or parent_id == task.id:
+        return ()
+    loaded = adapter.read_task(parent_id)
+    if not loaded.accepted or loaded.task is None:
+        return ()
+    return (loaded.task,)
 
 
 def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> str:

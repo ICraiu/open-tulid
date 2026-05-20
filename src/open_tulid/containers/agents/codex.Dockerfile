@@ -9,6 +9,7 @@ ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         git \
         openssh-client \
         ripgrep \

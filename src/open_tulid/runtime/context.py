@@ -47,15 +47,23 @@ class LinkedContextResolver:
         docs: list[ContextDocument] = []
         errors: list[DomainError] = []
         seen: set[Path] = set()
+        seen_hashes: set[str] = set()
         total_bytes = 0
 
-        seed_tasks = (task, *parent_tasks)
         queue: list[tuple[str, int, bool]] = []
-        for seed_task in seed_tasks:
-            queue.extend((link, 0, True) for link in seed_task.artifact_links)
-            queue.extend((link, 0, False) for link in _wiki_links(seed_task.body))
+        queue.extend((link, 0, True) for link in task.artifact_links)
+        queue.extend((link, 0, False) for link in _wiki_links(task.body))
+        for parent_task in parent_tasks:
+            queue.extend(
+                (link, 0, True)
+                for link in parent_task.artifact_links
+                if not _is_implementation_task_file_link(link)
+            )
+            queue.extend((link, 0, False) for link in _wiki_links(parent_task.body))
         while queue:
             ref, depth, required = queue.pop(0)
+            if _is_implementation_task_file_link(ref):
+                continue
             if depth > self.max_depth:
                 continue
             path = self._resolve(ref)
@@ -85,6 +93,10 @@ class LinkedContextResolver:
                     ref,
                 ))
                 continue
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if content_hash in seen_hashes:
+                seen.add(path)
+                continue
             content_size = len(content.encode("utf-8"))
             if total_bytes + content_size > self.max_bytes:
                 errors.append(DomainError(
@@ -94,12 +106,13 @@ class LinkedContextResolver:
                 ))
                 break
             seen.add(path)
+            seen_hashes.add(content_hash)
             total_bytes += content_size
             docs.append(ContextDocument(
                 ref=ref,
                 path=path,
                 content=content,
-                sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                sha256=content_hash,
             ))
             queue.extend((link, depth + 1, False) for link in _wiki_links(content))
 
@@ -148,3 +161,7 @@ def _clean_ref(ref: str) -> str:
 
 def _wiki_links(text: str) -> tuple[str, ...]:
     return tuple(match.group(1).strip() for match in WIKI_LINK_RE.finditer(text))
+
+
+def _is_implementation_task_file_link(ref: str) -> bool:
+    return "ImplementationTaskFile" in Path(_clean_ref(ref)).parts
