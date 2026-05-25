@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,8 +98,8 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     assert result.exit_code == 0
     assert "MODEL_PROXY_STARTED pid=4321" in result.output
     assert "SCHEDULER_STARTED project=Agent pid=9876 interval=5.0" in result.output
-    assert seen["calls"][0][0][-2:] == ["model-proxy", "serve"]
-    assert seen["calls"][1][0][-5:] == ["jobs", "daemon", "Agent", "--interval", "5.0"]
+    assert seen["calls"][0][0][-4:] == [sys.executable, "-m", "open_tulid", "model-proxy", "serve"][-4:]
+    assert seen["calls"][1][0][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "5.0"][-7:]
     assert state["scheduler_pid"] == 9876
     proxy_state = json.loads((tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").read_text(encoding="utf-8"))
     assert proxy_state["proxy_pid"] == 4321

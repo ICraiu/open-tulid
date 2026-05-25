@@ -16,7 +16,7 @@ endpoint = os.environ["OPEN_TULID_COMPLETION_ENDPOINT"]
 token = os.environ["OPEN_TULID_COMPLETION_TOKEN"]
 output = pathlib.Path(os.environ["OPEN_TULID_OUTPUT_DIR"])
 
-print(f"mock agent scenario={scenario}")
+print(f"scripted worker scenario={scenario}")
 print(f"job={context['job_id']} task={context['task_id']}")
 print(f"prompt-bytes={len(prompt.encode('utf-8'))}")
 
@@ -56,21 +56,33 @@ if scenario == "reject_then_fix":
         "validation_evidence": {"tests_pass": "not run"},
     })
 
+if scenario == "missing_artifact_then_fix":
+    submit({
+        "submission_id": "missing-artifact",
+        "attempt": 1,
+        "summary": "submitted before artifact file existed",
+        "artifacts": [
+            {"type": "ImplementationSummary", "path": "implementation-summary.md"},
+        ],
+        "changed_files": [],
+        "validation_evidence": {"tests_pass": "passed"},
+    })
+
 output.mkdir(parents=True, exist_ok=True)
 (output / "implementation-summary.md").write_text(
-    "# Implementation Summary\n\nDocker mock agent completed the task.\n",
+    "# Implementation Summary\n\nScripted docker worker completed the task.\n",
     encoding="utf-8",
 )
 (output / "test-result.md").write_text(
-    "# Test Result\n\npytest passed in docker mock agent.\n",
+    "# Test Result\n\npytest passed in scripted docker worker.\n",
     encoding="utf-8",
 )
 (workspace / "app.py").write_text("def healthz():\n    return 'ok'\n", encoding="utf-8")
 
 status = submit({
     "submission_id": "accepted",
-    "attempt": 2 if scenario == "reject_then_fix" else 1,
-    "summary": "implemented by docker mock agent",
+    "attempt": 2 if scenario in {"reject_then_fix", "missing_artifact_then_fix"} else 1,
+    "summary": "implemented by scripted docker worker",
     "artifacts": [
         {"type": "ImplementationSummary", "path": "implementation-summary.md"},
         {"type": "TestResult", "path": "test-result.md"},

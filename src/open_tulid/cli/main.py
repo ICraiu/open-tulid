@@ -36,6 +36,7 @@ from open_tulid.runtime import (
     FileExecutionJobStore,
     FileModelProxySessionStore,
     FileResourceLeaseStore,
+    FileTransactionRuntime,
     JobExecutor,
     JsonlEventStore,
     LocalModelAdapter,
@@ -737,7 +738,7 @@ def runtime_start(
         proxy_process = _spawn_runtime_process(
             config,
             "model-proxy",
-            [sys.argv[0], "model-proxy", "serve"],
+            _self_cli_command("model-proxy", "serve"),
         )
         if not _process_survived_startup(proxy_process):
             console.print(_runtime_log_line("MODEL_PROXY_START_FAILED", f"pid={proxy_process.pid}"))
@@ -763,7 +764,7 @@ def runtime_start(
         scheduler_process = _spawn_runtime_process(
             config,
             f"scheduler-{project_name}",
-            [sys.argv[0], "jobs", "daemon", project_name, "--interval", str(interval)],
+            _self_cli_command("jobs", "daemon", project_name, "--interval", str(interval)),
         )
         if not _process_survived_startup(scheduler_process):
             console.print(_runtime_log_line("SCHEDULER_START_FAILED", f"project={project_name} pid={scheduler_process.pid}"))
@@ -1452,6 +1453,10 @@ def _spawn_runtime_process(config: Config, name: str, args: list[str]) -> subpro
         stderr=stderr,
         start_new_session=True,
     )
+
+
+def _self_cli_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", "open_tulid", *args]
 
 
 def _process_survived_startup(process: subprocess.Popen, *, delay: float = 0.1) -> bool:

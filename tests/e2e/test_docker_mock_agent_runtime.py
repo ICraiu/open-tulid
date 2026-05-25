@@ -56,7 +56,7 @@ def docker_mock_agent_image(tmp_path_factory: pytest.TempPathFactory) -> str:
     subprocess.run(("docker", "rmi", "-f", tag), check=False, capture_output=True, text=True)
 
 
-def test_run_one_with_docker_mock_agent_accepts_and_moves_task(
+def test_run_one_with_scripted_docker_worker_accepts_and_moves_task(
     tmp_path: Path,
     docker_mock_agent_image: str,
     capsys: pytest.CaptureFixture[str],
@@ -76,7 +76,7 @@ def test_run_one_with_docker_mock_agent_accepts_and_moves_task(
     _assert_task_moved_to_code_review(project.project)
     _assert_job_accepted(project.project)
     _assert_artifacts_promoted(project.project)
-    _assert_container_logs(project.project, "mock agent scenario=accept_first_try")
+    _assert_container_logs(project.project, "scripted worker scenario=accept_first_try")
     assert [event.event_type for event in JsonlEventStore(project.project / "events").iter_events()] == [
         "TransitionAccepted",
         "ExecutionJobCreated",
@@ -92,7 +92,7 @@ def test_run_one_with_docker_mock_agent_accepts_and_moves_task(
     _print_system_logs(project.project, capsys)
 
 
-def test_run_one_with_docker_mock_agent_fixes_rejected_completion(
+def test_run_one_with_scripted_docker_worker_fixes_rejected_completion(
     tmp_path: Path,
     docker_mock_agent_image: str,
     capsys: pytest.CaptureFixture[str],
@@ -140,6 +140,33 @@ def test_run_one_with_docker_mock_agent_fails_when_agent_never_completes(
     board = (project.project / "kanban" / "Work.md").read_text(encoding="utf-8")
     assert f"## Todo\n- [ ] [[{TASK_ID}-healthz]]" in board
     assert [event.event_type for event in JsonlEventStore(project.project / "events").iter_events()][-1] == "ExecutionFailed"
+    _print_system_logs(project.project, capsys)
+
+
+def test_run_one_with_scripted_docker_worker_fixes_missing_artifact_submission(
+    tmp_path: Path,
+    docker_mock_agent_image: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = _make_e2e_project(
+        tmp_path,
+        image=docker_mock_agent_image,
+        scenario="missing_artifact_then_fix",
+        task_body="Submit an artifact reference before the file exists, then fix it.",
+    )
+
+    with _cwd(project.root):
+        result = runner.invoke(app, ["jobs", "run-one", "Agent"])
+
+    assert result.exit_code == 0, result.output
+    _assert_task_moved_to_code_review(project.project)
+    _assert_job_accepted(project.project)
+    _assert_artifacts_promoted(project.project)
+    _assert_container_logs(project.project, "completion status=400")
+    _assert_container_logs(project.project, "completion status=200")
+    event_types = [event.event_type for event in JsonlEventStore(project.project / "events").iter_events()]
+    assert "ExecutionCompletionRejected" in event_types
+    assert event_types[-1] == "ExecutionFinished"
     _print_system_logs(project.project, capsys)
 
 

@@ -1,0 +1,17 @@
+tracker:
+  type: {tracker_type}
+  root: "{vault_root}"
+
+projects:
+  Agent:
+    path: Agent
+    repo_root: "{repo_root}"
+
+runtime:
+  completion_host: 0.0.0.0
+  completion_container_host: host.docker.internal
+  default_timeout_seconds: 30
+  container_volume_relabel: true
+  worker_images:
+    codex: "{worker_image}"
+    local_llm: "{worker_image}"
