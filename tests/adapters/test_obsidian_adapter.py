@@ -7,20 +7,18 @@ from pathlib import Path
 import pytest
 
 import open_tulid.adapters.obsidian as obsidian_module
-from open_tulid.adapters import (
-    ObsidianAdapter,
-    ObsidianAdapterConfig,
-    ObsidianStateMapping,
-    config_from_workflow,
-)
 from open_tulid.domain import (
-    ObsidianStateMappingDefinition,
-    ObsidianStorageDefinition,
     ProjectSnapshot,
     StateDefinition,
     StorageDefinition,
     Task,
     WorkflowDefinition,
+)
+from open_tulid.adapters.obsidian import (
+    ObsidianAdapter,
+    ObsidianAdapterConfig,
+    ObsidianStateMapping,
+    config_from_workflow,
 )
 
 
@@ -57,12 +55,14 @@ def _workflow_with_obsidian_storage() -> WorkflowDefinition:
         operation_types={},
         workers={},
         transitions={},
-        storage=StorageDefinition(obsidian=ObsidianStorageDefinition(
-            boards={"Work": "kanban/Work.md"},
-            state_mappings=(
-                ObsidianStateMappingDefinition(state="Todo", board="Work", column="Todo"),
-            ),
-        )),
+        storage=StorageDefinition(
+            config={
+                "boards": {"Work": "kanban/Work.md"},
+                "state_mappings": (
+                    {"state": "Todo", "board": "Work", "column": "Todo"},
+                ),
+            },
+        ),
     )
 
 

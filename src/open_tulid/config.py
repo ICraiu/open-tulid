@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ruamel.yaml import YAML
 
+from open_tulid.adapters import supported_adapter_types
 from open_tulid.models import (
     Config,
     ModelProxyConfig,
@@ -42,8 +43,10 @@ def load_config(path: Path | None = None) -> Config:
     if not isinstance(tracker, dict):
         _fail("tracker section is missing from config")
     tracker_type = _required_table_string(tracker, "type", "tracker")
-    if tracker_type not in {"obsidian", "text"}:
-        _fail("tracker.type must be obsidian or text")
+    supported_types = supported_adapter_types()
+    if tracker_type not in supported_types:
+        supported = ", ".join(supported_types)
+        _fail(f"tracker.type must be one of: {supported}")
     tracker_root_str = _required_table_string(tracker, "root", "tracker")
     vault_root = Path(tracker_root_str).expanduser()
     if not vault_root.is_dir():

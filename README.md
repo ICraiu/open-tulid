@@ -1,6 +1,6 @@
 # open-tulid
 
-A CLI application which coordinates coding agents using Obsidian.
+A CLI application which coordinates coding agents through a tracker adapter.
 
 ## Requirements
 
@@ -44,7 +44,7 @@ Example config:
 
 ```yaml
 tracker:
-  type: obsidian
+  type: <adapter-id>
   root: /path/to/tracker/root
 projects:
   Agent:

@@ -1,27 +1,25 @@
 from .base import (
+    AdapterBuildRequest,
     AdapterCapability,
     AdapterResult,
     LoadProjectResult,
     ReadTaskResult,
+    StorageAdapterFactory,
     StorageAdapter,
     WriteResult,
 )
-from .obsidian import (
-    ObsidianAdapter,
-    ObsidianAdapterConfig,
-    ObsidianStateMapping,
-    config_from_workflow,
-)
+from .factory import build_storage_adapter, default_adapter_type, supported_adapter_types
 
 __all__ = [
+    "AdapterBuildRequest",
     "AdapterCapability",
     "AdapterResult",
     "LoadProjectResult",
     "ReadTaskResult",
     "WriteResult",
     "StorageAdapter",
-    "ObsidianAdapter",
-    "ObsidianAdapterConfig",
-    "ObsidianStateMapping",
-    "config_from_workflow",
+    "StorageAdapterFactory",
+    "build_storage_adapter",
+    "default_adapter_type",
+    "supported_adapter_types",
 ]

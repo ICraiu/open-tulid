@@ -14,16 +14,15 @@ A useful workflow is not merely valid YAML. It should make the work legible: wha
 schema_version: 1
 
 storage:
-  obsidian:
-    boards:
-      Work: kanban/Work.md
-    state_mappings:
-      - state: Todo
-        board: Work
-        column: Todo
-      - state: CodeReview
-        board: Work
-        column: Code review
+  boards:
+    Work: kanban/Work.md
+  state_mappings:
+    - state: Todo
+      board: Work
+      column: Todo
+    - state: CodeReview
+      board: Work
+      column: Code review
 
 statements:
   - kind: state
@@ -90,17 +89,16 @@ Required. Today the only supported value is `1`.
 
 ### `storage`
 
-Optional. This maps workflow states onto the external tracker. The implemented adapter is Obsidian:
+Optional. This maps workflow states onto the external tracker used by the configured adapter:
 
 ```yaml
 storage:
-  obsidian:
-    boards:
-      Work: kanban/Work.md
-    state_mappings:
-      - state: Todo
-        board: Work
-        column: Todo
+  boards:
+    Work: kanban/Work.md
+  state_mappings:
+    - state: Todo
+      board: Work
+      column: Todo
 ```
 
 Each `state_mappings` entry must reference:

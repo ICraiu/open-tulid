@@ -184,20 +184,7 @@ class WorkflowDefinition:
 
 @dataclass(frozen=True)
 class StorageDefinition:
-    obsidian: "ObsidianStorageDefinition | None" = None
-
-
-@dataclass(frozen=True)
-class ObsidianStorageDefinition:
-    boards: Mapping[str, str]
-    state_mappings: tuple["ObsidianStateMappingDefinition", ...]
-
-
-@dataclass(frozen=True)
-class ObsidianStateMappingDefinition:
-    state: str
-    board: str
-    column: str
+    config: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

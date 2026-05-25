@@ -1,7 +1,7 @@
 # Tulid stores tracker projects and machine-local runtime settings here.
 tracker:
-  # Tracker adapter to use. "obsidian" is the implemented adapter today.
-  type: obsidian
+  # Tracker adapter to use.
+  type: <adapter-id>
   # Root directory containing Tulid-managed tracker projects.
   root: /path/to/tracker/root
 

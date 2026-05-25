@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from open_tulid.models import Config, ProjectConfig
@@ -17,8 +18,9 @@ def _write_config(home: Path, tracker_root: Path, body: str | None = None) -> Pa
     config_dir = home / CONFIG_DIRNAME
     config_dir.mkdir(parents=True, exist_ok=True)
     cfg = config_dir / CONFIG_FILENAME
+    tracker_type = default_adapter_type()
     cfg.write_text(body or (
-        f"tracker:\n  type: obsidian\n  root: {tracker_root}\n"
+        f"tracker:\n  type: {tracker_type}\n  root: {tracker_root}\n"
         "projects:\n  Engine: {}\n"
     ), encoding="utf-8")
     return cfg
@@ -133,7 +135,7 @@ class TestConfigLoading:
         repo_root = tmp_path / "repos" / "open-tulid"
         repo_root.mkdir(parents=True)
         _write_config(tmp_path, tmp_vault, (
-            f"tracker:\n  type: obsidian\n  root: {tmp_vault}\n"
+            f"tracker:\n  type: {default_adapter_type()}\n  root: {tmp_vault}\n"
             "projects:\n  Agent:\n    path: Tracker\n"
             f"    repo_root: {repo_root}\n    main_branch: trunk\n"
         ))
@@ -148,7 +150,7 @@ class TestConfigLoading:
     def test_config_loads_runtime_resources_and_proxy_settings(self, tmp_path: Path, tmp_vault: Path):
         tmp_vault.mkdir()
         _write_config(tmp_path, tmp_vault, (
-            f"tracker:\n  type: obsidian\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
+            f"tracker:\n  type: {default_adapter_type()}\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
             "runtime:\n  docker_executable: podman\n  container_workspace: /workspace/custom\n"
             "  image_tag_prefix: registry.local/tulid/agent\n  default_timeout_seconds: 45\n"
             "  shared_workspace_root: ../workspaces\n  completion_host: 127.0.0.1\n  completion_port: 8765\n"
@@ -171,7 +173,7 @@ class TestConfigLoading:
 
     @pytest.mark.parametrize("body", [
         "other: {foo: bar}\n",
-        "tracker: {type: obsidian, root: /tmp}\nprojects: []\n",
+        f"tracker: {{type: {default_adapter_type()}, root: /tmp}}\nprojects: []\n",
     ])
     def test_config_rejects_invalid_shape(self, tmp_path: Path, body: str):
         _write_config(tmp_path, tmp_path, body)
@@ -182,7 +184,7 @@ class TestConfigLoading:
     def test_config_loads_subscription_model_backend(self, tmp_path: Path, tmp_vault: Path):
         tmp_vault.mkdir()
         _write_config(tmp_path, tmp_vault, (
-            f"tracker:\n  type: obsidian\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
+            f"tracker:\n  type: {default_adapter_type()}\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
             "runtime:\n  worker_resources: {codex: [codex-subscription]}\n  worker_types: {codex: codex}\n"
             "model_proxy:\n  chatgpt-codex:\n    kind: subscription\n    auth_home: ~/.codex\n"
             "resources:\n  codex-subscription:\n    kind: model\n    capacity: 4\n    proxy: chatgpt-codex\n"
@@ -198,7 +200,7 @@ class TestConfigLoading:
     def test_config_rejects_tracker_path_escape(self, tmp_path: Path, tmp_vault: Path):
         tmp_vault.mkdir()
         _write_config(tmp_path, tmp_vault, (
-            f"tracker:\n  type: obsidian\n  root: {tmp_vault}\nprojects:\n  Agent:\n    path: ../Agent\n"
+            f"tracker:\n  type: {default_adapter_type()}\n  root: {tmp_vault}\nprojects:\n  Agent:\n    path: ../Agent\n"
         ))
         with pytest.raises(SystemExit):
             load_config()

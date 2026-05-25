@@ -62,7 +62,7 @@ class ModelProxyServerConfig:
 class Config:
     vault_root: Path
     projects: list[str]
-    tracker_type: str = "obsidian"
+    tracker_type: str = ""
     config_dir: Path | None = None
     project_configs: dict[str, ProjectConfig] = field(default_factory=dict)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)

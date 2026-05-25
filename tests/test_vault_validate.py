@@ -6,13 +6,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.config import load_config
 from open_tulid.models import Config
 from open_tulid.domain import (
-    ObsidianStateMappingDefinition,
-    ObsidianStorageDefinition,
     RequirementDefinition,
     StateDefinition,
     StorageDefinition,
@@ -38,8 +37,9 @@ def _make_config(vault_root: Path, projects: list[str]) -> Path:
     config_dir.mkdir(exist_ok=True)
     cfg = config_dir / CONFIG_FILENAME
     project_lines = "".join(f"  {project}: {{}}\n" for project in projects)
+    tracker_type = default_adapter_type()
     cfg.write_text(
-        f'tracker:\n  type: obsidian\n  root: {vault_root}\nprojects:\n{project_lines}',
+        f'tracker:\n  type: {tracker_type}\n  root: {vault_root}\nprojects:\n{project_lines}',
         encoding="utf-8",
     )
     return cfg
@@ -615,10 +615,14 @@ def test_project_validation_uses_runtime_workflow_semantics(tmp_path: Path):
         operation_types=MappingProxyType({}),
         workers=MappingProxyType({}),
         transitions=MappingProxyType({}),
-        storage=StorageDefinition(obsidian=ObsidianStorageDefinition(
-            boards=MappingProxyType({"work": "kanban/Work.md"}),
-            state_mappings=(ObsidianStateMappingDefinition("Review", "work", "Review"),),
-        )),
+        storage=StorageDefinition(
+            config=MappingProxyType({
+                "boards": MappingProxyType({"work": "kanban/Work.md"}),
+                "state_mappings": (
+                    MappingProxyType({"state": "Review", "board": "work", "column": "Review"}),
+                ),
+            }),
+        ),
     )
 
     report = validate_project(Project(name="Agent", path=project_dir), workflow)

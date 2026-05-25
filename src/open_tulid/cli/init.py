@@ -5,19 +5,20 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 
 console = Console()
 
 BASE_CONFIG = """# Tulid stores tracker projects and machine-local runtime settings here.
 tracker:
-  # Tracker adapter to use. "obsidian" is the implemented adapter today.
-  type: obsidian
+  # Tracker adapter to use.
+  type: {adapter_type}
   # Root directory containing Tulid-managed tracker projects.
   root: /path/to/tracker/root
 
 # New projects can be added by running: tulid project <name>
-projects: {}
+projects: {{}}
 
 runtime:
   # Command used to launch worker containers.
@@ -31,19 +32,19 @@ runtime:
   completion_port: 0
   completion_container_host: host.docker.internal
   container_volume_relabel: false
-  worker_images: {}
-  worker_args: {}
-  worker_resources: {}
-  worker_types: {}
+  worker_images: {{}}
+  worker_args: {{}}
+  worker_resources: {{}}
+  worker_types: {{}}
   # Optional provider-compatible env vars rendered only for workers with exactly
   # one leased model endpoint. Available placeholders:
-  # {endpoint}, {token}, {proxy_id}, {resource_id}
-  worker_model_env: {}
-  env: {}
+  # {{endpoint}}, {{token}}, {{proxy_id}}, {{resource_id}}
+  worker_model_env: {{}}
+  env: {{}}
 
 # Model backends stay here. Local/OpenAI backends use the HTTP proxy; Codex
 # subscription backends mount host Codex auth into the worker instead.
-model_proxy: {}
+model_proxy: {{}}
 """
 
 
@@ -60,7 +61,7 @@ def init() -> None:
         raise SystemExit(1)
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    config_path.write_text(BASE_CONFIG, encoding="utf-8")
+    config_path.write_text(BASE_CONFIG.format(adapter_type=default_adapter_type()), encoding="utf-8")
 
     console.print(Panel(
         f"Config created at {config_path}",
@@ -72,13 +73,12 @@ def default_workflow() -> str:
     return (
         "schema_version: 1\n"
         "storage:\n"
-        "  obsidian:\n"
-        "    boards:\n"
-        "      Work: kanban/Work.md\n"
-        "    state_mappings:\n"
-        "      - state: Todo\n"
-        "        board: Work\n"
-        "        column: Todo\n"
+        "  boards:\n"
+        "    Work: kanban/Work.md\n"
+        "  state_mappings:\n"
+        "    - state: Todo\n"
+        "      board: Work\n"
+        "      column: Todo\n"
         "statements:\n"
         "  - kind: state\n"
         "    id: Todo\n"

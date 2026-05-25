@@ -1,5 +1,5 @@
 tracker:
-  type: obsidian
+  type: {tracker_type}
   root: "{vault_root}"
 
 projects:

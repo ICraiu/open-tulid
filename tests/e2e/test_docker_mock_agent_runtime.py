@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.runtime import JsonlEventStore
@@ -167,6 +168,7 @@ def _make_e2e_project(
     config_template = (fixture_project / "config.yaml.template").read_text(encoding="utf-8")
     (root / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(
         config_template.format(
+            tracker_type=default_adapter_type(),
             vault_root=vault,
             repo_root=repo,
             workflow_path=workflow,

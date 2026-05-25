@@ -5,6 +5,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.domain import DomainError, EventActor, EventType
@@ -17,8 +18,9 @@ runner = CliRunner()
 def _write_config(root: Path) -> None:
     config_dir = root / CONFIG_DIRNAME
     config_dir.mkdir()
+    tracker_type = default_adapter_type()
     (config_dir / CONFIG_FILENAME).write_text(
-        f'tracker:\n  type: obsidian\n  root: {root}\nprojects:\n  Agent: {{}}\n',
+        f'tracker:\n  type: {tracker_type}\n  root: {root}\nprojects:\n  Agent: {{}}\n',
         encoding="utf-8",
     )
 

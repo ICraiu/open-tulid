@@ -13,7 +13,14 @@ from typing import Any, Mapping
 
 from ruamel.yaml import YAML
 
-from open_tulid.domain.schema import BoardPosition, DomainError, ProjectSnapshot, Task, WorkflowDefinition
+from open_tulid.domain.schema import (
+    BoardPosition,
+    DomainError,
+    ProjectSnapshot,
+    StorageDefinition,
+    Task,
+    WorkflowDefinition,
+)
 from open_tulid.vault.links import parse_task_row
 
 from .base import (
@@ -624,20 +631,42 @@ def config_from_workflow(
     tasks_dir: str | Path = "tasks",
     events_dir: str | Path = "events",
 ) -> ObsidianAdapterConfig:
-    storage = workflow.storage.obsidian if workflow.storage is not None else None
+    return config_from_storage_definition(
+        project_id=project_id,
+        project_root=project_root,
+        storage=workflow.storage,
+        tasks_dir=tasks_dir,
+        events_dir=events_dir,
+    )
+
+
+def config_from_storage_definition(
+    *,
+    project_id: str,
+    project_root: Path,
+    storage: StorageDefinition | None,
+    tasks_dir: str | Path = "tasks",
+    events_dir: str | Path = "events",
+) -> ObsidianAdapterConfig:
     if storage is None:
-        raise ValueError("workflow.storage.obsidian is required for the Obsidian adapter")
+        raise ValueError("workflow.storage is required for the configured storage adapter")
+    boards_value = storage.config.get("boards")
+    state_mappings_value = storage.config.get("state_mappings")
+    if not isinstance(boards_value, Mapping):
+        raise ValueError("workflow.storage.config.boards must be a mapping")
+    if not isinstance(state_mappings_value, tuple):
+        raise ValueError("workflow.storage.config.state_mappings must be a tuple")
     return ObsidianAdapterConfig(
         project_id=project_id,
         project_root=project_root,
-        boards=dict(storage.boards),
+        boards={str(name): str(path) for name, path in boards_value.items()},
         state_mappings=tuple(
             ObsidianStateMapping(
-                state=mapping.state,
-                board=mapping.board,
-                column=mapping.column,
+                state=str(mapping["state"]),
+                board=str(mapping["board"]),
+                column=str(mapping["column"]),
             )
-            for mapping in storage.state_mappings
+            for mapping in state_mappings_value
         ),
         tasks_dir=tasks_dir,
         events_dir=events_dir,

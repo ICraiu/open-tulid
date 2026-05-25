@@ -27,8 +27,6 @@ from open_tulid.domain.schema import (
     ArtifactTypeDefinition,
     OperationCallDefinition,
     OperationTypeDefinition,
-    ObsidianStateMappingDefinition,
-    ObsidianStorageDefinition,
     RequirementDefinition,
     StateDefinition,
     StorageDefinition,
@@ -108,20 +106,7 @@ def _transaction_to_def(txn: TransactionPlan) -> TransactionDefinition:
 def _storage_to_def(document: WorkflowDocument) -> StorageDefinition | None:
     if document.storage is None:
         return None
-    obsidian = None
-    if document.storage.obsidian is not None:
-        obsidian = ObsidianStorageDefinition(
-            boards=_freeze_mapping(document.storage.obsidian.boards),
-            state_mappings=tuple(
-                ObsidianStateMappingDefinition(
-                    state=mapping.state,
-                    board=mapping.board,
-                    column=mapping.column,
-                )
-                for mapping in document.storage.obsidian.state_mappings
-            ),
-        )
-    return StorageDefinition(obsidian=obsidian)
+    return StorageDefinition(config=_freeze_mapping(document.storage.config))
 
 
 def _validate_requirement_refs_with_spans(
@@ -278,47 +263,58 @@ def _validate_storage_refs(
     states: dict[str, StateDefinition],
     diagnostics: list[WorkflowCompileDiagnostic],
 ) -> None:
-    if document.storage is None or document.storage.obsidian is None:
+    if document.storage is None:
         return
-    boards = document.storage.obsidian.boards
+    boards_value = document.storage.config.get("boards")
+    mappings_value = document.storage.config.get("state_mappings")
+    if not isinstance(boards_value, Mapping) or not isinstance(mappings_value, list):
+        return
+    boards = boards_value
     seen_states: set[str] = set()
     seen_board_columns: set[tuple[str, str]] = set()
-    for mapping in document.storage.obsidian.state_mappings:
-        path, line, column = _span_to_diag_fields(mapping.span)
-        if mapping.state not in states:
+    for mapping in mappings_value:
+        if not isinstance(mapping, Mapping):
+            continue
+        state = mapping.get("state")
+        board = mapping.get("board")
+        column_name = mapping.get("column")
+        if not all(isinstance(value, str) for value in (state, board, column_name)):
+            continue
+        path, line, column = _span_to_diag_fields(document.storage.span)
+        if state not in states:
             diagnostics.append(WorkflowCompileDiagnostic(
                 code="workflow.compile.unknown_state_ref",
-                message=f"storage.obsidian maps unknown state {mapping.state!r}",
+                message=f"storage maps unknown state {state!r}",
                 path=path,
                 line=line,
                 column=column,
             ))
-        if mapping.board not in boards:
+        if board not in boards:
             diagnostics.append(WorkflowCompileDiagnostic(
                 code="workflow.compile.unknown_board_ref",
-                message=f"storage.obsidian maps state {mapping.state!r} to unknown board {mapping.board!r}",
+                message=f"storage maps state {state!r} to unknown board {board!r}",
                 path=path,
                 line=line,
                 column=column,
             ))
-        if mapping.state in seen_states:
+        if state in seen_states:
             diagnostics.append(WorkflowCompileDiagnostic(
                 code="workflow.compile.duplicate_state_mapping",
-                message=f"storage.obsidian maps state {mapping.state!r} more than once",
+                message=f"storage maps state {state!r} more than once",
                 path=path,
                 line=line,
                 column=column,
             ))
-        board_column = (mapping.board, mapping.column)
+        board_column = (board, column_name)
         if board_column in seen_board_columns:
             diagnostics.append(WorkflowCompileDiagnostic(
                 code="workflow.compile.duplicate_board_column_mapping",
-                message=f"storage.obsidian maps board column {mapping.board!r}/{mapping.column!r} more than once",
+                message=f"storage maps board column {board!r}/{column_name!r} more than once",
                 path=path,
                 line=line,
                 column=column,
             ))
-        seen_states.add(mapping.state)
+        seen_states.add(state)
         seen_board_columns.add(board_column)
 
 

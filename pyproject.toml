@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "open-tulid"
 version = "0.1.0"
-description = "CLI tool for managing Obsidian vault projects"
+description = "CLI tool for managing tracker projects"
 requires-python = ">=3.11"
 dependencies = [
     "typer",

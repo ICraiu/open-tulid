@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
-from open_tulid.domain.schema import DomainError, ProjectSnapshot, Task
+from open_tulid.domain.schema import DomainError, ProjectSnapshot, Task, WorkflowDefinition
 
 
 class AdapterCapability(str, Enum):
@@ -40,6 +41,14 @@ class WriteResult(AdapterResult):
     path: str | None = None
 
 
+@dataclass(frozen=True)
+class AdapterBuildRequest:
+    project_id: str
+    project_root: Path
+    tracker_type: str
+    workflow: WorkflowDefinition
+
+
 @runtime_checkable
 class StorageAdapter(Protocol):
     name: str
@@ -62,3 +71,11 @@ class StorageAdapter(Protocol):
 
     def append_event(self, event: Mapping[str, Any]) -> WriteResult:
         """Append one structured event record."""
+
+
+@runtime_checkable
+class StorageAdapterFactory(Protocol):
+    adapter_type: str
+
+    def build(self, request: AdapterBuildRequest) -> StorageAdapter:
+        """Build one storage adapter instance from runtime configuration."""

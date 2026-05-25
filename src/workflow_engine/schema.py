@@ -25,32 +25,7 @@ def generate_json_schema() -> dict:
             },
             "storage": {
                 "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "obsidian": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "boards": {
-                                "type": "object",
-                                "additionalProperties": {"type": "string"},
-                            },
-                            "state_mappings": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "required": ["state", "board", "column"],
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "state": {"type": "string"},
-                                        "board": {"type": "string"},
-                                        "column": {"type": "string"},
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
+                "additionalProperties": True,
             },
         },
     }

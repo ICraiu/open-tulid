@@ -20,17 +20,16 @@ def _build_document(yaml_source: str) -> workflow_engine.WorkflowDocument:
     return ast_result.document
 
 
-def test_compiles_storage_obsidian_mapping_into_domain_definition():
+def test_compiles_storage_mapping_into_domain_definition():
     doc = _build_document("""
 schema_version: 1
 storage:
-  obsidian:
-    boards:
-      Work: kanban/Work.md
-    state_mappings:
-      - state: Todo
-        board: Work
-        column: Todo
+  boards:
+    Work: kanban/Work.md
+  state_mappings:
+    - state: Todo
+      board: Work
+      column: Todo
 statements:
   - kind: state
     id: Todo
@@ -41,23 +40,20 @@ statements:
     assert result.valid is True
     assert result.definition is not None
     assert result.definition.storage is not None
-    obsidian = result.definition.storage.obsidian
-    assert obsidian is not None
-    assert dict(obsidian.boards) == {"Work": "kanban/Work.md"}
-    assert obsidian.state_mappings[0].state == "Todo"
+    assert dict(result.definition.storage.config["boards"]) == {"Work": "kanban/Work.md"}
+    assert result.definition.storage.config["state_mappings"][0]["state"] == "Todo"
 
 
-def test_rejects_obsidian_mapping_to_unknown_state():
+def test_rejects_storage_mapping_to_unknown_state():
     doc = _build_document("""
 schema_version: 1
 storage:
-  obsidian:
-    boards:
-      Work: kanban/Work.md
-    state_mappings:
-      - state: Missing
-        board: Work
-        column: Todo
+  boards:
+    Work: kanban/Work.md
+  state_mappings:
+    - state: Missing
+      board: Work
+      column: Todo
 statements:
   - kind: state
     id: Todo

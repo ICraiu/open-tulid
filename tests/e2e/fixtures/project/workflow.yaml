@@ -1,15 +1,14 @@
 schema_version: 1
 storage:
-  obsidian:
-    boards:
-      Work: kanban/Work.md
-    state_mappings:
-      - state: Todo
-        board: Work
-        column: Todo
-      - state: CodeReview
-        board: Work
-        column: Code review
+  boards:
+    Work: kanban/Work.md
+  state_mappings:
+    - state: Todo
+      board: Work
+      column: Todo
+    - state: CodeReview
+      board: Work
+      column: Code review
 statements:
   - kind: state
     id: Todo

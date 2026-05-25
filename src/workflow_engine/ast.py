@@ -70,23 +70,8 @@ class DerivesSpec:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class ObsidianStateMapping:
-    state: str
-    board: str
-    column: str
-    span: SourceSpan | None = None
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class ObsidianStorage:
-    boards: Mapping[str, str] = dataclasses.field(default_factory=dict)
-    state_mappings: tuple[ObsidianStateMapping, ...] = ()
-    span: SourceSpan | None = None
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
 class WorkflowStorage:
-    obsidian: ObsidianStorage | None = None
+    config: Mapping[str, object] = dataclasses.field(default_factory=dict)
     span: SourceSpan | None = None
 
 

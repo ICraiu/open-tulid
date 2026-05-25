@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from open_tulid.domain import WorkflowDefinition
-from open_tulid.adapters.obsidian import ObsidianAdapter, config_from_workflow
+from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter, default_adapter_type
 from open_tulid.models import Config, Project, ValidationError, ValidationReport
 from open_tulid.runtime import TaskManager, ValidateProject
 from open_tulid.vault.links import validate_kanban_file
@@ -17,6 +17,7 @@ REQUIRED_DIRS = ["kanban", "docs", "tasks", "agents"]
 def validate_project(
     project: Project,
     workflow_definition: WorkflowDefinition | None = None,
+    tracker_type: str | None = None,
 ) -> ValidationReport:
     """Validate project structure, then workflow semantics when available."""
     report = ValidationReport()
@@ -65,9 +66,10 @@ def validate_project(
 
     if workflow_definition is not None:
         try:
-            adapter = ObsidianAdapter(config_from_workflow(
+            adapter = build_storage_adapter(AdapterBuildRequest(
                 project_id=project.name,
                 project_root=abs_project,
+                tracker_type=tracker_type or default_adapter_type(),
                 workflow=workflow_definition,
             ))
         except ValueError as exc:
@@ -128,7 +130,11 @@ def validate_vault(
                         )
                         for diagnostic in loaded_workflow.diagnostics
                     )
-        project_report = validate_project(project, selected_workflow)
+        project_report = validate_project(
+            project,
+            selected_workflow,
+            tracker_type=config.tracker_type,
+        )
         report.errors.extend(project_report.errors)
         report.checked_projects += project_report.checked_projects
         report.checked_kanban_files += project_report.checked_kanban_files

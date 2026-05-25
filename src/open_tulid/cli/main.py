@@ -24,7 +24,7 @@ from open_tulid.containers import (
     docker_install_plan,
     list_agent_image_specs,
 )
-from open_tulid.adapters.obsidian import ObsidianAdapter, config_from_workflow
+from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter
 from open_tulid.domain import EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
 from open_tulid.models import Config, ProjectConfig, ValidationReport
 from open_tulid.runtime import (
@@ -66,7 +66,7 @@ from open_tulid.workflow.implementations import (
 
 app = typer.Typer(
     name="tulid",
-    help="CLI tool for managing Obsidian vault projects.",
+    help="CLI tool for managing tracker projects.",
 )
 
 console = Console()
@@ -1212,9 +1212,10 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         name=project,
         tracker_path=project,
     )
-    adapter = ObsidianAdapter(config_from_workflow(
+    adapter = build_storage_adapter(AdapterBuildRequest(
         project_id=project,
         project_root=project_path,
+        tracker_type=config.tracker_type,
         workflow=workflow,
     ))
     app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)

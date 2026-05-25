@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import typer
 from typer.testing import CliRunner
 
+from open_tulid.adapters import default_adapter_type
 from open_tulid.cli import main as cli_main
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
@@ -23,8 +24,9 @@ runner = CliRunner()
 def _write_config(root: Path) -> None:
     config_dir = root / CONFIG_DIRNAME
     config_dir.mkdir()
+    tracker_type = default_adapter_type()
     (config_dir / CONFIG_FILENAME).write_text(
-        f'tracker:\n  type: obsidian\n  root: {root}\nprojects:\n  Agent: {{}}\n',
+        f'tracker:\n  type: {tracker_type}\n  root: {root}\nprojects:\n  Agent: {{}}\n',
         encoding="utf-8",
     )
     (root / "Agent").mkdir()
@@ -373,7 +375,12 @@ def test_jobs_daemon_logs_failed_job_and_keeps_control_flow(tmp_path: Path, monk
         "job_store": object(),
         "workspace_root": tmp_path / "workspaces",
         "lease_store": object(),
-        "config": SimpleNamespace(runtime=SimpleNamespace(worker_resources={})),
+        "config": SimpleNamespace(
+            runtime=SimpleNamespace(
+                worker_resources={},
+                repo_execution_mode="serial",
+            ),
+        ),
         "event_store": SimpleNamespace(append_many=lambda events: None),
         "journal_store": object(),
     }
