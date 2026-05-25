@@ -242,6 +242,26 @@ def test_runtime_status_reports_running_processes(tmp_path: Path, monkeypatch):
     assert result.output == "Runtime running for Agent scheduler_pid=4321 proxy_pid=9876\n"
 
 
+def test_runtime_status_without_project_reports_all_projects(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path, projects=("Agent", "Beta"))
+    state_root = tmp_path / CONFIG_DIRNAME / "runtime"
+    state_root.mkdir(parents=True)
+    (state_root / "Agent.json").write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    (state_root / "Beta.json").write_text('{"scheduler_pid": 5432, "project": "Beta"}', encoding="utf-8")
+    (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 5432, 9876})
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "status"])
+
+    assert result.exit_code == 0
+    assert result.output == (
+        "Runtime running for Agent scheduler_pid=4321 proxy_pid=9876\n"
+        "\n"
+        "Runtime running for Beta scheduler_pid=5432 proxy_pid=9876\n"
+    )
+
+
 def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
     state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
@@ -262,6 +282,32 @@ def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkey
     assert result.output.endswith("Runtime stopped for Agent\n")
     assert killed == [(4321, 15), (9876, 15)]
     assert not state_path.exists()
+    assert not proxy_state.exists()
+
+
+def test_runtime_stop_without_project_stops_all_projects(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path, projects=("Agent", "Beta"))
+    state_root = tmp_path / CONFIG_DIRNAME / "runtime"
+    state_root.mkdir(parents=True)
+    (state_root / "Agent.json").write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    (state_root / "Beta.json").write_text('{"scheduler_pid": 5432, "project": "Beta"}', encoding="utf-8")
+    proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
+    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 5432, 9876})
+    monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: True)
+    monkeypatch.setattr("open_tulid.cli.main._reconcile_active_runtime_jobs", lambda *args, **kwargs: None)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "stop"])
+
+    assert result.exit_code == 0
+    assert "MODEL_PROXY_STOPPED pid=9876" in result.output
+    assert result.output.endswith("Runtime stopped for 2 projects\n")
+    assert killed == [(4321, 15), (5432, 15), (9876, 15)]
+    assert not (state_root / "Agent.json").exists()
+    assert not (state_root / "Beta.json").exists()
     assert not proxy_state.exists()
 
 

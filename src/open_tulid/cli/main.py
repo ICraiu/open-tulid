@@ -805,31 +805,35 @@ def runtime_stop(
 ) -> None:
     """Stop the detached runtime processes."""
     config = _load_cli_config()
-    project_name = _resolve_project_name(config, project)
-    state_path = _runtime_state_path(config, project_name)
-    state = _load_runtime_state(state_path)
-    if state is None:
+    projects = _resolve_projects(config, project)
+    stopped_any = False
+    for project_name in projects:
+        state_path = _runtime_state_path(config, project_name)
+        state = _load_runtime_state(state_path)
+        if state is None:
+            state_path.unlink(missing_ok=True)
+            if project is not None:
+                console.print(f"Runtime is not running for {project_name}")
+            continue
+        stopped_any = True
+        for key in ("scheduler_pid",):
+            pid = state.get(key)
+            if _pid_is_running(pid):
+                os.kill(int(pid), signal.SIGTERM)
+                if not _wait_for_pid_exit(int(pid)):
+                    console.print(_runtime_log_line(
+                        "SCHEDULER_STOP_TIMEOUT",
+                        f"project={project_name} pid={pid}",
+                    ))
+                    raise typer.Exit(1)
+        _reconcile_active_runtime_jobs(
+            config,
+            project_name,
+            reason="runtime stop requested",
+            actor_id="runtime-stop",
+            stop_worker_containers=True,
+        )
         state_path.unlink(missing_ok=True)
-        console.print(f"Runtime is not running for {project_name}")
-        return
-    for key in ("scheduler_pid",):
-        pid = state.get(key)
-        if _pid_is_running(pid):
-            os.kill(int(pid), signal.SIGTERM)
-            if not _wait_for_pid_exit(int(pid)):
-                console.print(_runtime_log_line(
-                    "SCHEDULER_STOP_TIMEOUT",
-                    f"project={project_name} pid={pid}",
-                ))
-                raise typer.Exit(1)
-    _reconcile_active_runtime_jobs(
-        config,
-        project_name,
-        reason="runtime stop requested",
-        actor_id="runtime-stop",
-        stop_worker_containers=True,
-    )
-    state_path.unlink(missing_ok=True)
     if not _any_scheduler_running(config):
         proxy_state_path = _proxy_state_path(config)
         proxy_state = _load_runtime_state(proxy_state_path)
@@ -843,7 +847,13 @@ def runtime_stop(
                 raise typer.Exit(1)
             console.print(_runtime_log_line("MODEL_PROXY_STOPPED", f"pid={proxy_state['proxy_pid']}"))
         proxy_state_path.unlink(missing_ok=True)
-    console.print(f"Runtime stopped for {project_name}")
+    if not stopped_any:
+        console.print("Runtime is not running for any configured project")
+        return
+    if project is not None or len(projects) == 1:
+        console.print(f"Runtime stopped for {projects[0]}")
+    else:
+        console.print(f"Runtime stopped for {len(projects)} projects")
 
 
 @runtime_app.command("status")
@@ -852,25 +862,31 @@ def runtime_status(
 ) -> None:
     """Show whether the detached runtime processes are running."""
     config = _load_cli_config()
-    project_name = _resolve_project_name(config, project)
-    state_path = _runtime_state_path(config, project_name)
-    state = _load_runtime_state(state_path)
-    if state is None:
-        console.print(f"Runtime not running for {project_name}")
-        return
-    scheduler_running = _pid_is_running(state.get("scheduler_pid"))
     proxy_state = _load_runtime_state(_proxy_state_path(config))
     proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
-    if scheduler_running and proxy_running:
-        console.print(
-            f"Runtime running for {project_name} "
-            f"scheduler_pid={state['scheduler_pid']} proxy_pid={proxy_state['proxy_pid']}"
+    projects = _resolve_projects(config, project)
+    lines: list[str] = []
+    for project_name in projects:
+        state_path = _runtime_state_path(config, project_name)
+        state = _load_runtime_state(state_path)
+        if state is None:
+            lines.append(f"Runtime not running for {project_name}")
+            continue
+        scheduler_running = _pid_is_running(state.get("scheduler_pid"))
+        if scheduler_running and proxy_running:
+            lines.append(
+                f"Runtime running for {project_name} "
+                f"scheduler_pid={state['scheduler_pid']} proxy_pid={proxy_state['proxy_pid']}"
+            )
+            continue
+        lines.append(
+            f"Runtime degraded for {project_name} "
+            f"scheduler_running={scheduler_running} proxy_running={proxy_running}"
         )
-        return
-    console.print(
-        f"Runtime degraded for {project_name} "
-        f"scheduler_running={scheduler_running} proxy_running={proxy_running}"
-    )
+    for index, line in enumerate(lines):
+        if index:
+            console.print()
+        console.print(line)
 
 
 @model_proxy_app.command("serve")
