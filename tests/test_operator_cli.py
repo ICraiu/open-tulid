@@ -22,15 +22,17 @@ from open_tulid.runtime import FileExecutionJobStore
 runner = CliRunner()
 
 
-def _write_config(root: Path) -> None:
+def _write_config(root: Path, projects: tuple[str, ...] = ("Agent",)) -> None:
     config_dir = root / CONFIG_DIRNAME
     config_dir.mkdir()
     tracker_type = default_adapter_type()
+    projects_yaml = "\n".join(f"  {project}: {{}}" for project in projects)
     (config_dir / CONFIG_FILENAME).write_text(
-        f'tracker:\n  type: {tracker_type}\n  root: {root}\nprojects:\n  Agent: {{}}\n',
+        f"tracker:\n  type: {tracker_type}\n  root: {root}\nprojects:\n{projects_yaml}\n",
         encoding="utf-8",
     )
-    (root / "Agent").mkdir()
+    for project in projects:
+        (root / project).mkdir()
 
 
 def _with_cwd(path: Path):
@@ -105,6 +107,39 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     assert proxy_state["proxy_pid"] == 4321
     assert state["project"] == "Agent"
     assert state["interval"] == 5.0
+
+
+def test_runtime_start_without_project_starts_all_configured_projects(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path, projects=("Agent", "Beta"))
+
+    processes = iter((
+        type("ProxyProcess", (), {"pid": 4321})(),
+        type("SchedulerProcess", (), {"pid": 9876})(),
+        type("SchedulerProcess", (), {"pid": 9877})(),
+    ))
+    seen: list[tuple[object, object]] = []
+
+    def fake_popen(args, **kwargs):
+        seen.append((args, kwargs))
+        return next(processes)
+
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
+    monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start", "--interval", "5"])
+
+    agent_state = json.loads((tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json").read_text(encoding="utf-8"))
+    beta_state = json.loads((tmp_path / CONFIG_DIRNAME / "runtime" / "Beta.json").read_text(encoding="utf-8"))
+    assert result.exit_code == 0
+    assert "MODEL_PROXY_STARTED pid=4321" in result.output
+    assert "SCHEDULER_STARTED project=Agent pid=9876 interval=5.0" in result.output
+    assert "SCHEDULER_STARTED project=Beta pid=9877 interval=5.0" in result.output
+    assert seen[1][0][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "5.0"][-7:]
+    assert seen[2][0][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Beta", "--interval", "5.0"][-7:]
+    assert agent_state["scheduler_pid"] == 9876
+    assert beta_state["scheduler_pid"] == 9877
 
 
 def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path: Path, monkeypatch):
@@ -403,3 +438,39 @@ def test_jobs_daemon_logs_failed_job_and_keeps_control_flow(tmp_path: Path, monk
 
     assert result.exit_code == 0
     assert "JOB_RUN_FAILED project=Agent job=job-1 exit_code=1" in result.output
+
+
+def test_tasks_list_without_project_lists_all_projects_grouped(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path, projects=("Agent", "Beta"))
+
+    snapshots = {
+        "Agent": SimpleNamespace(tasks={
+            "1": SimpleNamespace(id="1", current_state="Todo", task_type="ImplementationTask", title="Ship agent"),
+        }),
+        "Beta": SimpleNamespace(tasks={
+            "2": SimpleNamespace(id="2", current_state="Done", task_type="ProductIdea", title="Ship beta"),
+        }),
+    }
+
+    def fake_context(project):
+        return {
+            "adapter": SimpleNamespace(load_project=lambda: SimpleNamespace(
+                accepted=True,
+                snapshot=snapshots[project],
+                errors=(),
+            )),
+        }
+
+    monkeypatch.setattr("open_tulid.cli.main._runtime_project_context", fake_context)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["tasks", "list"])
+
+    assert result.exit_code == 0
+    assert result.output == (
+        "Agent:\n"
+        "  1  state=Todo  type=ImplementationTask  title=Ship agent\n"
+        "\n"
+        "Beta:\n"
+        "  2  state=Done  type=ProductIdea  title=Ship beta\n"
+    )

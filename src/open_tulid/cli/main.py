@@ -699,18 +699,24 @@ def runtime_start(
 ) -> None:
     """Start the runtime services as detached background processes."""
     config = _load_cli_config()
-    project_name = _resolve_project_name(config, project)
-    state_path = _runtime_state_path(config, project_name)
-    state = _load_runtime_state(state_path)
+    projects = _resolve_projects(config, project)
     proxy_state_path = _proxy_state_path(config)
     proxy_state = _load_runtime_state(proxy_state_path)
-    scheduler_running = state is not None and _pid_is_running(state.get("scheduler_pid"))
     proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
-    if scheduler_running and proxy_running:
-        console.print(f"Runtime already running for {project_name}")
+    scheduler_states: dict[str, tuple[Path, dict[str, object] | None, bool]] = {}
+    for project_name in projects:
+        state_path = _runtime_state_path(config, project_name)
+        state = _load_runtime_state(state_path)
+        scheduler_running = state is not None and _pid_is_running(state.get("scheduler_pid"))
+        scheduler_states[project_name] = (state_path, state, scheduler_running)
+        if state is not None and not scheduler_running:
+            _fail_orphaned_runtime_jobs(config, project_name)
+    if proxy_running and all(running for _, _, running in scheduler_states.values()):
+        if len(projects) == 1:
+            console.print(f"Runtime already running for {projects[0]}")
+        else:
+            console.print("Runtime already running for all selected projects")
         return
-    if state is not None and not scheduler_running:
-        _fail_orphaned_runtime_jobs(config, project_name)
 
     readiness = check_backend_readiness(config.model_proxy, env=os.environ)
     for result in readiness:
@@ -755,22 +761,27 @@ def runtime_start(
             "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         }, sort_keys=True), encoding="utf-8")
         console.print(_runtime_log_line("MODEL_PROXY_STARTED", f"pid={proxy_pid}"))
-    if scheduler_running:
-        console.print(_runtime_log_line(
-            "SCHEDULER_ALREADY_RUNNING",
-            f"project={project_name} pid={state['scheduler_pid']}",
-        ))
-    else:
+    scheduler_failures = False
+    active_schedulers = 0
+    for project_name in projects:
+        state_path, state, scheduler_running = scheduler_states[project_name]
+        if scheduler_running:
+            active_schedulers += 1
+            console.print(_runtime_log_line(
+                "SCHEDULER_ALREADY_RUNNING",
+                f"project={project_name} pid={state['scheduler_pid']}",
+            ))
+            continue
         scheduler_process = _spawn_runtime_process(
             config,
             f"scheduler-{project_name}",
             _self_cli_command("jobs", "daemon", project_name, "--interval", str(interval)),
         )
         if not _process_survived_startup(scheduler_process):
+            scheduler_failures = True
             console.print(_runtime_log_line("SCHEDULER_START_FAILED", f"project={project_name} pid={scheduler_process.pid}"))
-            if started_new_proxy:
-                _stop_new_proxy_after_failed_start(proxy_process, proxy_state_path)
-            raise typer.Exit(1)
+            continue
+        active_schedulers += 1
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps({
             "scheduler_pid": scheduler_process.pid,
@@ -782,6 +793,10 @@ def runtime_start(
             "SCHEDULER_STARTED",
             f"project={project_name} pid={scheduler_process.pid} interval={interval}",
         ))
+    if scheduler_failures:
+        if started_new_proxy and active_schedulers == 0:
+            _stop_new_proxy_after_failed_start(proxy_process, proxy_state_path)
+        raise typer.Exit(1)
 
 
 @runtime_app.command("stop")
@@ -1073,39 +1088,61 @@ def job_logs(
 
 @tasks_app.command("list")
 def list_tasks(
-    project: str = typer.Argument(..., help="Configured project name."),
+    project: str | None = typer.Argument(None, help="Configured project name."),
 ) -> None:
-    """List tasks from the configured project."""
-    ctx = _runtime_project_context(project)
-    loaded = ctx["adapter"].load_project()
-    if not loaded.accepted or loaded.snapshot is None:
-        _print_domain_errors(loaded.errors)
-        raise typer.Exit(1)
-    for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
-        console.print(f"{task.id} state={task.current_state} type={task.task_type} title={task.title}")
+    """List tasks from one project or all configured projects."""
+    config = _load_cli_config()
+    projects = _resolve_projects(config, project)
+    for index, project_name in enumerate(projects):
+        ctx = _runtime_project_context(project_name)
+        loaded = ctx["adapter"].load_project()
+        if not loaded.accepted or loaded.snapshot is None:
+            _print_domain_errors(loaded.errors)
+            raise typer.Exit(1)
+        if index:
+            console.print()
+        console.print(f"{project_name}:")
+        if not loaded.snapshot.tasks:
+            console.print("  No tasks.")
+            continue
+        for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
+            console.print(
+                f"  {task.id}  state={task.current_state}  type={task.task_type}  title={task.title}",
+            )
 
 
 @tasks_app.command("runnable")
 def runnable_tasks(
-    project: str = typer.Argument(..., help="Configured project name."),
+    project: str | None = typer.Argument(None, help="Configured project name."),
 ) -> None:
     """List tasks with worker-backed outgoing transitions."""
-    ctx = _runtime_project_context(project)
-    loaded = ctx["adapter"].load_project()
-    if not loaded.accepted or loaded.snapshot is None:
-        _print_domain_errors(loaded.errors)
-        raise typer.Exit(1)
+    config = _load_cli_config()
+    projects = _resolve_projects(config, project)
     found = False
-    for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
-        transitions = [
-            transition for transition in ctx["workflow"].transitions.values()
-            if transition.task_type == task.task_type
-            and transition.from_state == task.current_state
-            and transition.worker is not None
-        ]
-        for transition in transitions:
-            found = True
-            console.print(f"{task.id} transition={transition.id} worker={transition.worker}")
+    for project_name in projects:
+        ctx = _runtime_project_context(project_name)
+        loaded = ctx["adapter"].load_project()
+        if not loaded.accepted or loaded.snapshot is None:
+            _print_domain_errors(loaded.errors)
+            raise typer.Exit(1)
+        lines: list[str] = []
+        for task in sorted(loaded.snapshot.tasks.values(), key=lambda item: item.id):
+            transitions = [
+                transition for transition in ctx["workflow"].transitions.values()
+                if transition.task_type == task.task_type
+                and transition.from_state == task.current_state
+                and transition.worker is not None
+            ]
+            for transition in transitions:
+                lines.append(f"  {task.id}  transition={transition.id}  worker={transition.worker}")
+        if not lines:
+            continue
+        if found:
+            console.print()
+        found = True
+        console.print(f"{project_name}:")
+        for line in lines:
+            console.print(line)
     if not found:
         console.print("No runnable tasks.")
 
@@ -1388,6 +1425,13 @@ def _resolve_project_name(config: Config, project: str | None) -> str:
         return config.projects[0]
     console.print(Panel("Multiple projects configured. Pass --project.", style="red"))
     raise typer.Exit(2)
+
+
+def _resolve_projects(config: Config, project: str | None) -> list[str]:
+    if project is not None:
+        _project_path(config, project)
+        return [project]
+    return list(config.projects)
 
 
 def _tail_human_logs(log_dir: Path, lines: int) -> tuple[str, ...]:

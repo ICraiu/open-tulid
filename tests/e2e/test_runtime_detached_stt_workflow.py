@@ -173,9 +173,10 @@ def _run_tulid(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         if not existing_pythonpath
         else f"{REPO_SRC}{os.pathsep}{existing_pythonpath}"
     )
+    python_executable = _project_python()
     return subprocess.run(
         (
-            sys.executable,
+            python_executable,
             "-m",
             "open_tulid",
             *args,
@@ -187,6 +188,20 @@ def _run_tulid(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=60,
     )
+
+
+def _project_python() -> str:
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        for name in ("python3", "python"):
+            candidate = Path(virtual_env) / "bin" / name
+            if candidate.exists():
+                return str(candidate)
+    for name in ("python3", "python"):
+        candidate = REPO_SRC.parent / ".venv" / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def _wait_for(predicate, description: str, *, timeout: float = 20.0, interval: float = 0.2) -> None:

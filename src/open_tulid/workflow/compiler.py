@@ -106,7 +106,7 @@ def _transaction_to_def(txn: TransactionPlan) -> TransactionDefinition:
 def _storage_to_def(document: WorkflowDocument) -> StorageDefinition | None:
     if document.storage is None:
         return None
-    return StorageDefinition(config=_freeze_mapping(document.storage.config))
+    return StorageDefinition(config=_freeze_mapping(_normalized_storage_config(document.storage.config)))
 
 
 def _validate_requirement_refs_with_spans(
@@ -265,8 +265,9 @@ def _validate_storage_refs(
 ) -> None:
     if document.storage is None:
         return
-    boards_value = document.storage.config.get("boards")
-    mappings_value = document.storage.config.get("state_mappings")
+    storage_config = _normalized_storage_config(document.storage.config)
+    boards_value = storage_config.get("boards")
+    mappings_value = storage_config.get("state_mappings")
     if not isinstance(boards_value, Mapping) or not isinstance(mappings_value, list):
         return
     boards = boards_value
@@ -316,6 +317,15 @@ def _validate_storage_refs(
             ))
         seen_states.add(state)
         seen_board_columns.add(board_column)
+
+
+def _normalized_storage_config(config: Mapping[str, object]) -> Mapping[str, object]:
+    obsidian_value = config.get("obsidian")
+    if "boards" not in config and "state_mappings" not in config and isinstance(obsidian_value, Mapping):
+        source = obsidian_value
+    else:
+        source = config
+    return {str(key): value for key, value in source.items()}
 
 
 def compile_workflow(

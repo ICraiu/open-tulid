@@ -44,6 +44,31 @@ statements:
     assert result.definition.storage.config["state_mappings"][0]["state"] == "Todo"
 
 
+def test_compiles_legacy_obsidian_storage_mapping_into_domain_definition():
+    doc = _build_document("""
+schema_version: 1
+storage:
+  obsidian:
+    boards:
+      Work: kanban/Work.md
+    state_mappings:
+      - state: Todo
+        board: Work
+        column: Todo
+statements:
+  - kind: state
+    id: Todo
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.storage is not None
+    assert dict(result.definition.storage.config["boards"]) == {"Work": "kanban/Work.md"}
+    assert result.definition.storage.config["state_mappings"][0]["state"] == "Todo"
+
+
 def test_rejects_storage_mapping_to_unknown_state():
     doc = _build_document("""
 schema_version: 1
