@@ -25,6 +25,7 @@ from open_tulid.domain import (
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
+from open_tulid.runtime.executor import _build_runtime_prompt
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 
 
@@ -62,6 +63,43 @@ class FakeAdapter:
 
     def append_event(self, event: Mapping[str, Any]) -> WriteResult:
         return WriteResult(path="events/test.jsonl")
+
+
+def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_read_only():
+    prompt = _build_runtime_prompt(
+        job_id=JOB_ID,
+        task_title="Implement CLI",
+        task_body="Do the implementation work.",
+        transition_id="ImplementTask",
+        from_state="Todo",
+        to_state="SelfReview1",
+        required_artifacts=(),
+        required_validations=("tests_pass",),
+        derived_artifact_type=None,
+        completion_endpoint="http://127.0.0.1/jobs/test/complete",
+    )
+
+    assert "No artifacts are required for this transition. Submit an empty `artifacts` array." in prompt
+    assert "Treat existing files under `output/` as read-only context" in prompt
+    assert "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files" in prompt
+
+
+def test_build_runtime_prompt_for_derived_transition_requires_artifact_submission_per_file():
+    prompt = _build_runtime_prompt(
+        job_id=JOB_ID,
+        task_title="Break down spec",
+        task_body="Generate child tasks.",
+        transition_id="BreakDownImplementationSpec",
+        from_state="ReadyForBreakdown",
+        to_state="Done",
+        required_artifacts=(),
+        required_validations=(),
+        derived_artifact_type="ImplementationTaskFile",
+        completion_endpoint="http://127.0.0.1/jobs/test/complete",
+    )
+
+    assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in prompt
+    assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in prompt
 
 
 def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(

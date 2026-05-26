@@ -507,6 +507,7 @@ def _build_runtime_prompt(
     artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
     validations = ", ".join(required_validations) if required_validations else "none"
     derive_lines: tuple[str, ...] = ()
+    artifact_guidance: tuple[str, ...]
     if derived_artifact_type:
         derive_lines = (
             "",
@@ -514,6 +515,14 @@ def _build_runtime_prompt(
             f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
             "If you generate multiple task files, every generated file must appear in the `artifacts` array.",
             "Only submitted derived-task artifacts will be promoted and turned into tasks.",
+        )
+    if required_artifacts:
+        artifact_guidance = ("Only create the artifact files explicitly required for this transition.",)
+    else:
+        artifact_guidance = (
+            "No artifacts are required for this transition. Submit an empty `artifacts` array.",
+            "Treat existing files under `output/` as read-only context unless this transition explicitly requires output artifacts.",
+            "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files for an implementation transition.",
         )
     return "\n".join((
         "# Open Tulid Job",
@@ -527,6 +536,7 @@ def _build_runtime_prompt(
         "Write required completion artifacts under `output/`.",
         f"Required artifacts: {artifacts}",
         f"Required validations: {validations}",
+        *artifact_guidance,
         *derive_lines,
         "",
         "When ready, submit completion evidence with:",
