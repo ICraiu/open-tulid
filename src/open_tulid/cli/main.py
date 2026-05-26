@@ -1311,19 +1311,8 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         app_state / "resource-leases",
         config.resources,
     )
-    listed_jobs = job_store.list()
-    if listed_jobs.accepted:
-        active_statuses = {
-            ExecutionJobStatus.PENDING.value,
-            ExecutionJobStatus.RUNNING.value,
-            ExecutionJobStatus.COMPLETION_REJECTED.value,
-            ExecutionJobStatus.STALE.value,
-        }
-        active_job_ids = {
-            job.job_id
-            for job in listed_jobs.jobs
-            if str(job.status.value if hasattr(job.status, "value") else job.status) in active_statuses
-        }
+    active_job_ids = _active_runtime_job_ids(config, app_state)
+    if active_job_ids is not None:
         released = lease_store.release_inactive_reservations(active_job_ids)
         for job_id in released:
             console.print(_runtime_log_line(
@@ -1343,6 +1332,26 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         "lease_store": lease_store,
         "model_proxy_sessions": FileModelProxySessionStore(_model_proxy_session_root(config)),
     }
+
+
+def _active_runtime_job_ids(config: Config, app_state: Path) -> set[str] | None:
+    active_statuses = {
+        ExecutionJobStatus.PENDING.value,
+        ExecutionJobStatus.RUNNING.value,
+        ExecutionJobStatus.COMPLETION_REJECTED.value,
+        ExecutionJobStatus.STALE.value,
+    }
+    active_job_ids: set[str] = set()
+    for project in config.project_configs:
+        listed_jobs = FileExecutionJobStore(app_state / "jobs" / project).list()
+        if not listed_jobs.accepted:
+            return None
+        active_job_ids.update(
+            job.job_id
+            for job in listed_jobs.jobs
+            if str(job.status.value if hasattr(job.status, "value") else job.status) in active_statuses
+        )
+    return active_job_ids
 
 
 def _print_domain_errors(errors) -> None:

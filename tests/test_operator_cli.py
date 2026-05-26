@@ -17,6 +17,7 @@ from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.runtime.scheduler import ScheduleResult
 from open_tulid.domain import ExecutionJob
 from open_tulid.runtime import FileExecutionJobStore
+from open_tulid.models import ResourceConfig
 
 
 runner = CliRunner()
@@ -140,6 +141,65 @@ def test_runtime_start_without_project_starts_all_configured_projects(tmp_path: 
     assert seen[2][0][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Beta", "--interval", "5.0"][-7:]
     assert agent_state["scheduler_pid"] == 9876
     assert beta_state["scheduler_pid"] == 9877
+
+
+def test_active_runtime_job_ids_and_lease_cleanup_span_all_projects(tmp_path: Path):
+    _write_config(tmp_path, projects=("Agent", "Beta"))
+    app_state = tmp_path / CONFIG_DIRNAME
+    agent_store = FileExecutionJobStore(app_state / "jobs" / "Agent")
+    beta_store = FileExecutionJobStore(app_state / "jobs" / "Beta")
+
+    assert agent_store.create(ExecutionJob(
+        job_id="01J00000000000000000000AGT",
+        project_id="Agent",
+        task_id="task-1",
+        transition_id="code",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "agent-workspace"),
+    )).accepted is True
+    assert beta_store.create(ExecutionJob(
+        job_id="01J00000000000000000000BET",
+        project_id="Beta",
+        task_id="task-2",
+        transition_id="code",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "beta-workspace"),
+    )).accepted is True
+    assert beta_store.create(ExecutionJob(
+        job_id="01J00000000000000000000OLD",
+        project_id="Beta",
+        task_id="task-3",
+        transition_id="code",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "old-workspace"),
+    )).accepted is True
+
+    assert agent_store.update_status("01J00000000000000000000AGT", "running").accepted is True
+    assert beta_store.update_status("01J00000000000000000000BET", "running").accepted is True
+    assert beta_store.update_status("01J00000000000000000000OLD", "failed").accepted is True
+
+    lease_store = cli_main.FileResourceLeaseStore(
+        app_state / "resource-leases",
+        {"qwen-local": ResourceConfig(kind="model", capacity=3)},
+    )
+    assert lease_store.try_acquire(("qwen-local",), job_id="01J00000000000000000000AGT", worker_id="qwen_27b").acquired is True
+    assert lease_store.try_acquire(("qwen-local",), job_id="01J00000000000000000000BET", worker_id="qwen_27b").acquired is True
+    assert lease_store.try_acquire(("qwen-local",), job_id="01J00000000000000000000OLD", worker_id="qwen_27b").acquired is True
+
+    with _with_cwd(tmp_path):
+        config = cli_main._load_cli_config()
+
+    active_job_ids = cli_main._active_runtime_job_ids(config, app_state)
+
+    assert active_job_ids == {"01J00000000000000000000AGT", "01J00000000000000000000BET"}
+
+    removed = lease_store.release_inactive_reservations(active_job_ids)
+
+    assert removed == ("01J00000000000000000000OLD",)
+    assert [lease.job_id for lease in lease_store.leases_for("qwen-local")] == [
+        "01J00000000000000000000AGT",
+        "01J00000000000000000000BET",
+    ]
 
 
 def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path: Path, monkeypatch):
