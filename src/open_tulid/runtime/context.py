@@ -9,6 +9,9 @@ from open_tulid.domain import DomainError, Task
 
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#/\\]+(?:/[^\]|#\\]+)*)\]\]")
+DERIVED_TASKS_SECTION_RE = re.compile(
+    r"\n## Derived tasks\n(?:- \[\[[^\n]+\]\]\n?)+(?:\n## Derived tasks\n(?:- \[\[[^\n]+\]\]\n?)+)*\s*\Z",
+)
 
 
 @dataclass(frozen=True)
@@ -52,14 +55,14 @@ class LinkedContextResolver:
 
         queue: list[tuple[str, int, bool]] = []
         queue.extend((link, 0, True) for link in task.artifact_links)
-        queue.extend((link, 0, False) for link in _wiki_links(task.body))
+        queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(task.body)))
         for parent_task in parent_tasks:
             queue.extend(
                 (link, 0, True)
                 for link in parent_task.artifact_links
                 if not _is_implementation_task_file_link(link)
             )
-            queue.extend((link, 0, False) for link in _wiki_links(parent_task.body))
+            queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(parent_task.body)))
         while queue:
             ref, depth, required = queue.pop(0)
             if _is_implementation_task_file_link(ref):
@@ -165,3 +168,7 @@ def _wiki_links(text: str) -> tuple[str, ...]:
 
 def _is_implementation_task_file_link(ref: str) -> bool:
     return "ImplementationTaskFile" in Path(_clean_ref(ref)).parts
+
+
+def sanitize_task_body_for_runtime(text: str) -> str:
+    return DERIVED_TASKS_SECTION_RE.sub("", text.rstrip()).rstrip()

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from open_tulid.domain import DomainError, ExecutionJob, Task, TransitionDefinition
+from open_tulid.runtime.context import sanitize_task_body_for_runtime
 
 
 @dataclass(frozen=True)
@@ -143,7 +144,7 @@ def _write_context(
             "type": task.task_type,
             "state": task.current_state,
             "dependencies": list(task.dependencies),
-            "body": task.body,
+            "body": sanitize_task_body_for_runtime(task.body),
         },
     }
     (context_dir / "job-context.json").write_text(

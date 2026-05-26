@@ -97,6 +97,24 @@ def test_linked_context_skips_parent_implementation_task_files(tmp_path: Path):
     assert "Sibling task content" not in result.packet.text
 
 
+def test_linked_context_ignores_generated_derived_task_section_in_task_bodies(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "real-context.md").write_text("Real context.\n", encoding="utf-8")
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "tasks" / "stale-child.md").write_text("Stale child.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(
+            body="See [[real-context]].\n\n## Derived tasks\n- [[stale-child]]\n",
+        ),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [doc.ref for doc in result.packet.documents] == ["real-context"]
+    assert "Stale child" not in result.packet.text
+
+
 def test_linked_context_skips_direct_implementation_task_file_links(tmp_path: Path):
     (tmp_path / "artifacts" / "parent" / "ImplementationTaskFile").mkdir(parents=True)
     task_file = "artifacts/parent/ImplementationTaskFile/01-project-shell.md"

@@ -16,7 +16,7 @@ from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_c
 from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver
-from open_tulid.runtime.context import LinkedContextResolver
+from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
 from open_tulid.runtime.workspaces import WorkspacePreparer
@@ -131,20 +131,22 @@ class JobExecutor:
             prompt_text = _build_runtime_prompt(
                 job_id=job.job_id,
                 task_title=task_result.task.title,
-                task_body=task_result.task.body,
+                task_body=sanitize_task_body_for_runtime(task_result.task.body),
                 transition_id=transition.id,
                 from_state=transition.from_state,
                 to_state=transition.to_state,
                 required_artifacts=transition.requires.artifacts,
                 required_validations=tuple(call.type for call in transition.requires.validations),
+                derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
                 completion_endpoint=endpoint.url,
             )
             project_root = _adapter_project_root(self.adapter)
             if project_root is not None:
                 parent_tasks = _load_parent_tasks(self.adapter, task_result.task)
+                task_for_context = _task_for_prompt_context(task_result.task, transition)
                 prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
                 context_result = LinkedContextResolver(project_root).build_context_packet(
-                    task_result.task,
+                    task_for_context,
                     parent_tasks=parent_tasks,
                 )
                 if not context_result.accepted:
@@ -499,10 +501,20 @@ def _build_runtime_prompt(
     to_state: str,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
+    derived_artifact_type: str | None,
     completion_endpoint: str,
 ) -> str:
     artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
     validations = ", ".join(required_validations) if required_validations else "none"
+    derive_lines: tuple[str, ...] = ()
+    if derived_artifact_type:
+        derive_lines = (
+            "",
+            f"This transition derives child tasks via `{derived_artifact_type}` artifacts.",
+            f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
+            "If you generate multiple task files, every generated file must appear in the `artifacts` array.",
+            "Only submitted derived-task artifacts will be promoted and turned into tasks.",
+        )
     return "\n".join((
         "# Open Tulid Job",
         "",
@@ -515,6 +527,7 @@ def _build_runtime_prompt(
         "Write required completion artifacts under `output/`.",
         f"Required artifacts: {artifacts}",
         f"Required validations: {validations}",
+        *derive_lines,
         "",
         "When ready, submit completion evidence with:",
         "",
@@ -655,10 +668,43 @@ def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> st
                 f"ID: {task.id}",
                 f"Title: {task.title}",
                 "",
-                task.body.strip(),
+                sanitize_task_body_for_runtime(task.body).strip(),
             ))
         )
     return f"{prompt_text}\n\n" + "\n\n".join(sections)
+
+
+def _task_for_prompt_context(task: Task, transition: TransitionDefinition) -> Task:
+    excluded_artifact_types = set(transition.requires.artifacts)
+    if transition.derives is not None:
+        excluded_artifact_types.add(transition.derives.artifact_type)
+    artifact_links = tuple(
+        link for link in task.artifact_links
+        if _artifact_type_from_link(link) not in excluded_artifact_types
+    )
+    return Task(
+        id=task.id,
+        title=task.title,
+        path=task.path,
+        current_state=task.current_state,
+        task_type=task.task_type,
+        dependencies=task.dependencies,
+        artifact_links=artifact_links,
+        parent_id=task.parent_id,
+        metadata=task.metadata,
+        body=task.body,
+    )
+
+
+def _artifact_type_from_link(link: str) -> str | None:
+    parts = Path(link).parts
+    try:
+        index = parts.index("artifacts")
+    except ValueError:
+        return None
+    if index + 2 >= len(parts):
+        return None
+    return parts[index + 2]
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

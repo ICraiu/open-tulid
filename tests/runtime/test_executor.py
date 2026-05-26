@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
 from open_tulid.containers.runtime import AgentRunResult, ContainerMount
 from open_tulid.domain import (
+    DerivesDefinition,
     DomainError,
     ExecutionJob,
     ProjectSnapshot,
@@ -403,6 +404,103 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
     result = executor.run(JOB_ID)
 
     assert result.accepted is True
+
+
+def test_executor_strips_generated_derived_task_sections_and_guides_multi_artifact_derivation(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    project = tmp_path / "project"
+    (project / "artifacts" / TASK_ID / "result.md").mkdir(parents=True)
+    (project / "docs").mkdir(parents=True)
+    (project / "docs" / "real-context.md").write_text("Real context.\n", encoding="utf-8")
+    (project / "tasks").mkdir()
+    (project / "tasks" / "stale-child.md").write_text("Stale child task.\n", encoding="utf-8")
+    (project / "agents").mkdir()
+    (project / "agents" / "default.agent.md").write_text("Default instructions.\n", encoding="utf-8")
+    (project / "artifacts" / TASK_ID / "result.md" / "old.md").write_text("Old result artifact.\n", encoding="utf-8")
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+
+    class ProjectAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+        def read_task(self, task_id: str) -> ReadTaskResult:
+            if task_id != TASK_ID:
+                return ReadTaskResult()
+            return ReadTaskResult(task=Task(
+                id=TASK_ID,
+                title="Task",
+                path="tasks/task.md",
+                current_state="Todo",
+                task_type="task",
+                artifact_links=("artifacts/01J00000000000000000000001/result.md/old.md",),
+                body="See [[real-context]].\n\n## Derived tasks\n- [[stale-child]]\n",
+            ))
+
+    seen: dict[str, str] = {}
+
+    def fake_run_agent_container(request, *, docker_executable):
+        prompt = (Path(request.workspace) / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
+        context = json.loads((Path(request.workspace) / ".open-tulid" / "job-context.json").read_text(encoding="utf-8"))
+        seen["prompt"] = prompt
+        seen["body"] = context["task"]["body"]
+        return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=1)
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            "Todo": StateDefinition(id="Todo"),
+            "Done": StateDefinition(id="Done"),
+        }),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="Done",
+                worker="codex",
+                requires=RequirementDefinition(artifacts=("result.md",)),
+                derives=DerivesDefinition(task_type="child", state="Todo", artifact_type="ImplementationTaskFile"),
+                transaction=None,
+            ),
+        }),
+    )
+    executor = JobExecutor(
+        workflow=workflow,
+        adapter=ProjectAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert "## Derived tasks" not in seen["prompt"]
+    assert "stale-child" not in seen["prompt"]
+    assert "Stale child task." not in seen["prompt"]
+    assert "Old result artifact." not in seen["prompt"]
+    assert "See [[real-context]]." in seen["prompt"]
+    assert "Real context." in seen["prompt"]
+    assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in seen["prompt"]
+    assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in seen["prompt"]
+    assert "## Derived tasks" not in seen["body"]
 
 
 def test_executor_uses_worker_implementation_for_container_image_and_fallback_args(tmp_path: Path, monkeypatch):
