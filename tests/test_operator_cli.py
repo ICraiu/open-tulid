@@ -540,6 +540,8 @@ def test_jobs_daemon_logs_failed_job_and_keeps_control_flow(tmp_path: Path, monk
             runtime=SimpleNamespace(
                 worker_resources={},
                 repo_execution_mode="serial",
+                failed_job_backoff_seconds=60,
+                max_failed_attempts_per_transition=0,
             ),
         ),
         "event_store": SimpleNamespace(append_many=lambda events: None),
@@ -579,6 +581,8 @@ def test_jobs_run_one_builds_project_images_before_scheduling(tmp_path: Path, mo
             runtime=SimpleNamespace(
                 worker_resources={},
                 repo_execution_mode="serial",
+                failed_job_backoff_seconds=60,
+                max_failed_attempts_per_transition=0,
             ),
         ),
         "event_store": SimpleNamespace(append_many=lambda events: None),

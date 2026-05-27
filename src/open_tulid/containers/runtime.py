@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Protocol, Sequence
+from typing import IO, Mapping, Protocol, Sequence, TextIO
 
 from open_tulid.models import RuntimeConfig
 
@@ -105,6 +106,7 @@ def run_agent_container(
     *,
     docker_executable: str = "docker",
     runner: CommandRunner = subprocess.run,
+    log_dir: Path | None = None,
 ) -> AgentRunResult:
     workspace = request.workspace.resolve()
     mounts = (ContainerMount(workspace, request.workdir), *request.mounts)
@@ -127,6 +129,9 @@ def run_agent_container(
         command.extend(["-e", f"{key}={value}"])
     command.append(request.image)
     command.extend(request.args)
+
+    if log_dir is not None and runner is subprocess.run:
+        return _run_agent_container_streaming(request, tuple(command), log_dir)
 
     try:
         completed = runner(
@@ -164,6 +169,90 @@ def run_agent_container(
         stdout=completed.stdout,
         stderr=completed.stderr,
     )
+
+
+def _run_agent_container_streaming(
+    request: AgentRunRequest,
+    command: tuple[str, ...],
+    log_dir: Path,
+) -> AgentRunResult:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = log_dir / "stdout.log"
+    stderr_path = log_dir / "stderr.log"
+    agent_path = log_dir / "agent.log"
+    try:
+        with (
+            stdout_path.open("w", encoding="utf-8") as stdout,
+            stderr_path.open("w", encoding="utf-8") as stderr,
+            agent_path.open("w", encoding="utf-8") as agent,
+        ):
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            lock = threading.Lock()
+            threads = (
+                threading.Thread(
+                    target=_copy_stream,
+                    args=(_text_stream(process.stdout), stdout, agent, lock),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_copy_stream,
+                    args=(_text_stream(process.stderr), stderr, agent, lock),
+                    daemon=True,
+                ),
+            )
+            for thread in threads:
+                thread.start()
+            try:
+                returncode = process.wait(timeout=request.timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                message = f"Agent container timed out after {request.timeout_seconds} seconds\n"
+                stderr.write(message)
+                agent.write(message)
+                returncode = 124
+            for thread in threads:
+                thread.join(timeout=5)
+    except FileNotFoundError as exc:
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=command,
+            returncode=127,
+            stderr=str(exc),
+        )
+
+    return AgentRunResult(
+        agent_id=request.agent_id,
+        image=request.image,
+        command=command,
+        returncode=returncode,
+        stdout=stdout_path.read_text(encoding="utf-8") if stdout_path.is_file() else "",
+        stderr=stderr_path.read_text(encoding="utf-8") if stderr_path.is_file() else "",
+    )
+
+
+def _copy_stream(source: TextIO, stream_log: IO[str], agent_log: IO[str], lock: threading.Lock) -> None:
+    while True:
+        chunk = source.read(1)
+        if chunk == "":
+            return
+        with lock:
+            stream_log.write(chunk)
+            stream_log.flush()
+            agent_log.write(chunk)
+            agent_log.flush()
+
+
+def _text_stream(stream: TextIO | None) -> TextIO:
+    assert stream is not None
+    return stream
 
 
 def default_shared_workspace_root(runtime: RuntimeConfig, fallback: Path) -> Path:

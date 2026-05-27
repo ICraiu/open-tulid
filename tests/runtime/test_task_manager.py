@@ -212,7 +212,7 @@ def test_create_execution_job_uses_transition_worker_and_workspace(tmp_path: Pat
     assert result.job is not None
     assert result.job.worker_id == "codex"
     assert result.job.workspace_path.startswith(str(tmp_path))
-    assert result.events[-1].event_type == "ExecutionJobCreated"
+    assert [event.event_type for event in result.events] == ["ExecutionJobCreated"]
     assert result.effects[0]["type"] == "create_execution_job"
 
 

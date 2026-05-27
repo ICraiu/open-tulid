@@ -78,7 +78,6 @@ def test_run_one_with_scripted_docker_worker_accepts_and_moves_task(
     _assert_artifacts_promoted(project.project)
     _assert_container_logs(project.project, "scripted worker scenario=accept_first_try")
     assert [event.event_type for event in JsonlEventStore(project.project / "events").iter_events()] == [
-        "TransitionAccepted",
         "ExecutionJobCreated",
         "ExecutionStarted",
         "ExecutionCompletionSubmitted",

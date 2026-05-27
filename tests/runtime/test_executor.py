@@ -760,6 +760,16 @@ def test_executor_redacts_scoped_tokens_from_persisted_command_log(tmp_path: Pat
     assert "provider-secret" not in command_log
     assert "OPEN_TULID_COMPLETION_TOKEN=<redacted>" in command_log
     assert "KEEP_ME=visible" in command_log
+    trace = json.loads((workspace / ".open-tulid" / "logs" / "agent-run.json").read_text(encoding="utf-8"))
+    trace_text = json.dumps(trace)
+    assert trace["status"] == "finished"
+    assert trace["job"]["job_id"] == JOB_ID
+    assert trace["agent"]["env"]["OPEN_TULID_COMPLETION_TOKEN"] == "<redacted>"
+    assert trace["result"]["returncode"] == 1
+    assert "completion-secret" not in trace_text
+    assert "model-secret" not in trace_text
+    assert "json-secret" not in trace_text
+    assert "provider-secret" not in trace_text
 
 
 def test_executor_marks_job_failed_when_internal_error_occurs_after_running(tmp_path: Path, monkeypatch):

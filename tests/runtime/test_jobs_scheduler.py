@@ -263,7 +263,7 @@ def test_scheduler_creates_first_runnable_job_in_board_order(tmp_path: Path):
     assert result.task_id == TASK_ID
     assert result.transition_id == "implement"
     assert result.job is not None
-    assert [event.event_type for event in result.events] == ["TransitionAccepted", "ExecutionJobCreated"]
+    assert [event.event_type for event in result.events] == ["ExecutionJobCreated"]
     assert store.get(result.job.job_id).accepted is True
     assert [skip.code for skip in result.skipped] == ["task.dependency_missing"]
 
@@ -317,6 +317,60 @@ def test_scheduler_backs_off_after_recent_failed_job(tmp_path: Path):
     assert result.accepted is True
     assert result.scheduled is False
     assert result.skipped[0].code == "job.recent_failure"
+
+
+def test_scheduler_uses_configured_failed_job_backoff(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=1,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+
+
+def test_scheduler_can_stop_after_configured_failed_attempts(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    for index in range(2):
+        assert store.create(ExecutionJob(
+            job_id=f"01J00000000000000000000J{index:02d}",
+            project_id="Agent",
+            task_id=TASK_ID,
+            transition_id="implement",
+            worker_id="codex",
+            workspace_path=str(tmp_path / f"work-{index}"),
+            status="failed",
+            metadata={"updated_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()},
+        )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        max_failed_attempts_per_transition=2,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.retry_limit_reached"
 
 
 def test_scheduler_retries_after_failed_job_backoff_expires(tmp_path: Path):
@@ -529,7 +583,6 @@ def test_scheduler_transactionally_persists_creation_events(tmp_path: Path):
     assert result.scheduled is True
     assert result.events_persisted is True
     assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()] == [
-        "TransitionAccepted",
         "ExecutionJobCreated",
     ]
     journals = TransactionJournalStore(tmp_path / "events" / "journals").iter_journals()
@@ -578,7 +631,6 @@ def test_recover_job_creation_transactions_finishes_prepared_creation(tmp_path: 
 
     assert recovered == ("01J00000000000000000000JRN",)
     assert [event.event_type for event in event_store.iter_events()] == [
-        "TransitionAccepted",
         "ExecutionJobCreated",
     ]
 

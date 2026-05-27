@@ -190,6 +190,21 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
     if timeout <= 0:
         _fail("runtime.default_timeout_seconds must be positive")
 
+    failed_job_backoff_seconds = raw.get("failed_job_backoff_seconds", 60)
+    if isinstance(failed_job_backoff_seconds, bool) or not isinstance(failed_job_backoff_seconds, int):
+        _fail("runtime.failed_job_backoff_seconds must be an integer")
+    if failed_job_backoff_seconds < 0:
+        _fail("runtime.failed_job_backoff_seconds must be zero or positive")
+
+    max_failed_attempts_per_transition = raw.get("max_failed_attempts_per_transition", 0)
+    if (
+        isinstance(max_failed_attempts_per_transition, bool)
+        or not isinstance(max_failed_attempts_per_transition, int)
+    ):
+        _fail("runtime.max_failed_attempts_per_transition must be an integer")
+    if max_failed_attempts_per_transition < 0:
+        _fail("runtime.max_failed_attempts_per_transition must be zero or positive")
+
     shared_root = _runtime_optional_path(raw, "shared_workspace_root", config_dir, table="runtime")
 
     worker_images = _runtime_string_map(raw.get("worker_images", {}), "runtime.worker_images")
@@ -224,6 +239,8 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         repo_execution_mode=repo_execution_mode,
         image_tag_prefix=image_tag_prefix,
         default_timeout_seconds=timeout,
+        failed_job_backoff_seconds=failed_job_backoff_seconds,
+        max_failed_attempts_per_transition=max_failed_attempts_per_transition,
         worker_images=worker_images,
         worker_args=worker_args,
         worker_resources=worker_resources,

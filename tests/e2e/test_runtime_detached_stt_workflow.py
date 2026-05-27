@@ -125,9 +125,12 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
 
         project_log = _run_tulid(project.root, "log", "200", "--project", "Agent")
         assert project_log.returncode == 0, project_log.stdout + project_log.stderr
-        assert "TRANSITION_ACCEPTED task=1 transition=DraftDirection" in project_log.stdout
-        assert "TRANSITION_ACCEPTED task=1 transition=ApproveDirection" in project_log.stdout
-        assert "TRANSITION_ACCEPTED task=2 transition=SelfReviewPass2" in project_log.stdout
+        compact_log = " ".join(project_log.stdout.split())
+        assert "TRANSITION_ACCEPTED task=1 job=" in compact_log
+        assert "transition=DraftDirection" in compact_log
+        assert "TRANSITION_ACCEPTED task=1 transition=ApproveDirection" in compact_log
+        assert "TRANSITION_ACCEPTED task=2 job=" in compact_log
+        assert "transition=SelfReviewPass2" in compact_log
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
         _print_system_logs(project, capsys)

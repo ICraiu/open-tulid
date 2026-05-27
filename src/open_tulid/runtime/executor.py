@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Mapping
@@ -234,11 +235,32 @@ class JobExecutor:
                 },
                 mounts=self._subscription_mounts(required_resources),
             )
+            log_dir = _agent_log_dir(prepared.workspace)
+            started_at = _utc_now()
+            _write_run_trace(
+                log_dir,
+                job=job,
+                request=request,
+                status="running",
+                started_at=started_at,
+            )
             try:
-                result = run_agent_container(request, docker_executable=self.runtime.docker_executable)
+                result = _run_agent_container_with_logs(
+                    request,
+                    docker_executable=self.runtime.docker_executable,
+                    log_dir=log_dir,
+                )
             finally:
                 endpoint.stop()
-            _write_run_logs(Path(job.workspace_path), result)
+            finished_at = _utc_now()
+            _write_run_logs_with_metadata(
+                Path(job.workspace_path),
+                result,
+                request=request,
+                job=job,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
             loaded_after_run = self.job_store.get(job.job_id)
             status_after_run = (
                 str(
@@ -435,12 +457,131 @@ class _ManagedCompletionEndpoint:
         self.thread.join(timeout=5)
 
 
-def _write_run_logs(workspace: Path, result: AgentRunResult) -> None:
-    log_dir = workspace / ".open-tulid" / "logs"
+def _agent_log_dir(workspace: Path) -> Path:
+    return workspace / ".open-tulid" / "logs"
+
+
+def _run_agent_container_with_logs(
+    request,
+    *,
+    docker_executable: str,
+    log_dir: Path,
+) -> AgentRunResult:
+    try:
+        return run_agent_container(request, docker_executable=docker_executable, log_dir=log_dir)
+    except TypeError as exc:
+        if "log_dir" not in str(exc):
+            raise
+        return run_agent_container(request, docker_executable=docker_executable)
+
+
+def _write_run_logs_with_metadata(
+    workspace: Path,
+    result: AgentRunResult,
+    *,
+    request,
+    job,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    try:
+        _write_run_logs(
+            workspace,
+            result,
+            request=request,
+            job=job,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+        _write_run_logs(workspace, result)
+
+
+def _write_run_logs(
+    workspace: Path,
+    result: AgentRunResult,
+    *,
+    request=None,
+    job=None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+) -> None:
+    log_dir = _agent_log_dir(workspace)
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
     (log_dir / "stderr.log").write_text(result.stderr, encoding="utf-8")
+    (log_dir / "agent.log").write_text(result.stdout + result.stderr, encoding="utf-8")
     (log_dir / "command.txt").write_text(" ".join(_redact_command_for_log(result.command)) + "\n", encoding="utf-8")
+    _write_run_trace(
+        log_dir,
+        job=job,
+        request=request,
+        result=result,
+        status="finished",
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+def _write_run_trace(
+    log_dir: Path,
+    *,
+    status: str,
+    job=None,
+    request=None,
+    result: AgentRunResult | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    trace: dict[str, object] = {
+        "schema_version": 1,
+        "status": status,
+        "started_at": _format_time(started_at),
+        "finished_at": _format_time(finished_at),
+    }
+    if started_at is not None and finished_at is not None:
+        trace["duration_seconds"] = round((finished_at - started_at).total_seconds(), 3)
+    if job is not None:
+        trace["job"] = {
+            "job_id": job.job_id,
+            "project_id": job.project_id,
+            "task_id": job.task_id,
+            "transition_id": job.transition_id,
+            "worker_id": job.worker_id,
+        }
+    if request is not None:
+        trace["agent"] = {
+            "agent_id": request.agent_id,
+            "image": request.image,
+            "args": list(request.args),
+            "workdir": request.workdir,
+            "container_name": request.container_name,
+            "timeout_seconds": request.timeout_seconds,
+            "env": _redact_env_for_log(dict(request.env)),
+            "mounts": [
+                {
+                    "host_path": str(mount.host_path),
+                    "container_path": mount.container_path,
+                    "readonly": mount.readonly,
+                }
+                for mount in request.mounts
+            ],
+            "extra_hosts": list(request.extra_hosts),
+        }
+    if result is not None:
+        trace["result"] = {
+            "returncode": result.returncode,
+            "succeeded": result.succeeded,
+            "command": list(_redact_command_for_log(result.command)),
+            "agent_log": "agent.log",
+            "stdout_log": "stdout.log",
+            "stderr_log": "stderr.log",
+            "command_log": "command.txt",
+        }
+    (log_dir / "agent-run.json").write_text(json.dumps(trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _render_worker_model_env(
@@ -472,6 +613,23 @@ def _redact_command_for_log(command: tuple[str, ...]) -> tuple[str, ...]:
         else:
             redacted.append(part)
     return tuple(redacted)
+
+
+def _redact_env_for_log(env: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: "<redacted>" if _should_redact_env_key(key) else value
+        for key, value in sorted(env.items())
+    }
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_time(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _should_redact_env_key(key: str) -> bool:

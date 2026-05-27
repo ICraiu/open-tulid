@@ -235,14 +235,6 @@ class TaskManager:
             _event(
                 project_id=command.project_id,
                 actor=command.actor,
-                event_type=EventType.TransitionAccepted,
-                task_id=task.id,
-                transition_id=transition.id,
-                data={"from": transition.from_state, "to": transition.to_state},
-            ),
-            _event(
-                project_id=command.project_id,
-                actor=command.actor,
                 event_type=EventType.ExecutionJobCreated,
                 task_id=command.task_id,
                 transition_id=command.transition_id,

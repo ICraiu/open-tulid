@@ -112,6 +112,8 @@ class TestInitCommand:
         assert "runtime:" in text
         assert "# Tulid stores tracker projects" in text
         assert "projects: {}" in text
+        assert "failed_job_backoff_seconds: 60" in text
+        assert "max_failed_attempts_per_transition: 0" in text
         assert not (config_path.parent / "workflow.yaml").exists()
 
     def test_init_refuses_existing_config(self, tmp_path: Path):
@@ -155,6 +157,7 @@ class TestConfigLoading:
             f"tracker:\n  type: {default_adapter_type()}\n  root: {tmp_vault}\nprojects:\n  Agent: {{}}\n"
             "runtime:\n  docker_executable: podman\n  container_workspace: /workspace/custom\n"
             "  image_tag_prefix: registry.local/tulid/agent\n  default_timeout_seconds: 45\n"
+            "  failed_job_backoff_seconds: 5\n  max_failed_attempts_per_transition: 7\n"
             "  shared_workspace_root: ../workspaces\n  completion_host: 127.0.0.1\n  completion_port: 8765\n"
             "  completion_container_host: host.test\n  container_volume_relabel: true\n"
             "  worker_images: {codex: 'registry.local/codex:dev'}\n  worker_args: {codex: [exec, '{prompt_packet}']}\n"
@@ -168,6 +171,8 @@ class TestConfigLoading:
         config = load_config()
         assert config.runtime.docker_executable == "podman"
         assert config.runtime.shared_workspace_root == tmp_path / "workspaces"
+        assert config.runtime.failed_job_backoff_seconds == 5
+        assert config.runtime.max_failed_attempts_per_transition == 7
         assert config.runtime.worker_args == {"codex": ("exec", "{prompt_packet}")}
         assert config.runtime.worker_model_env["codex"]["OPENAI_BASE_URL"] == "{endpoint}"
         assert config.model_proxy["openai"].api_key_file == tmp_path / ".tulid" / "secrets" / "openai.key"

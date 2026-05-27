@@ -28,6 +28,11 @@ runtime:
   container_workspace: /workspace/project
   image_tag_prefix: open-tulid/agent
   default_timeout_seconds: 3600
+  # Wait this long before retrying a failed task transition.
+  failed_job_backoff_seconds: 60
+  # 0 means retry forever. Set a positive number to stop after that many failed jobs
+  # for the same task and transition.
+  max_failed_attempts_per_transition: 0
   completion_host: 0.0.0.0
   completion_port: 0
   completion_container_host: host.docker.internal

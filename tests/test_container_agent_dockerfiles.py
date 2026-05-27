@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import subprocess
 from pathlib import Path
@@ -375,6 +376,49 @@ def test_run_agent_container_builds_docker_run_command(tmp_path: Path):
         "run",
         "task",
     )]
+
+
+def test_run_agent_container_streams_logs_to_files(tmp_path: Path, monkeypatch):
+    seen: list[tuple[str, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, args, *, stdout, stderr, text, **kwargs):
+            seen.append(tuple(args))
+            assert text is True
+            assert kwargs == {"bufsize": 1}
+            assert stdout is subprocess.PIPE
+            assert stderr is subprocess.PIPE
+            self.stdout = io.StringIO("live stdout\n")
+            self.stderr = io.StringIO("live stderr\n")
+
+        def wait(self, timeout):
+            assert timeout == 30
+            return self.returncode
+
+        def kill(self):
+            self.returncode = 124
+
+    monkeypatch.setattr(subprocess, "Popen", FakeProcess)
+    request = AgentRunRequest(
+        agent_id="codex",
+        image="open-tulid/agent-codex:latest",
+        workspace=tmp_path / "workspace",
+        timeout_seconds=30,
+    )
+
+    result = run_agent_container(request, log_dir=tmp_path / "logs")
+
+    assert result.succeeded is True
+    assert result.stdout == "live stdout\n"
+    assert result.stderr == "live stderr\n"
+    assert (tmp_path / "logs" / "stdout.log").read_text(encoding="utf-8") == "live stdout\n"
+    assert (tmp_path / "logs" / "stderr.log").read_text(encoding="utf-8") == "live stderr\n"
+    agent_log = (tmp_path / "logs" / "agent.log").read_text(encoding="utf-8")
+    assert "live stdout\n" in agent_log
+    assert "live stderr\n" in agent_log
+    assert seen[0][-1] == "open-tulid/agent-codex:latest"
 
 
 def test_request_for_worker_uses_runtime_worker_image_override(tmp_path: Path):

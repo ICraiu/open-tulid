@@ -47,6 +47,8 @@ class Scheduler:
         lease_store: FileResourceLeaseStore | None = None,
         worker_resources: dict[str, tuple[str, ...]] | None = None,
         serial_repo_execution: bool = True,
+        failed_job_backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
+        max_failed_attempts_per_transition: int = 0,
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
     ) -> None:
@@ -57,6 +59,8 @@ class Scheduler:
         self.lease_store = lease_store
         self.worker_resources = worker_resources or {}
         self.serial_repo_execution = serial_repo_execution
+        self.failed_job_backoff_seconds = failed_job_backoff_seconds
+        self.max_failed_attempts_per_transition = max_failed_attempts_per_transition
         self.event_store = event_store
         self.journal_store = journal_store
 
@@ -129,11 +133,37 @@ class Scheduler:
                 ))
                 continue
 
+            if self.max_failed_attempts_per_transition > 0:
+                failed_attempts = _find_failed_jobs(
+                    self.job_store,
+                    project_id,
+                    task.id,
+                    transition.id,
+                )
+                if not failed_attempts.accepted:
+                    return ScheduleResult(
+                        scheduled=False,
+                        errors=(failed_attempts.error or _error("job.read_failed", "Cannot inspect failed jobs."),),
+                        skipped=tuple(skipped),
+                    )
+                if len(failed_attempts.jobs) >= self.max_failed_attempts_per_transition:
+                    skipped.append(_error(
+                        "job.retry_limit_reached",
+                        (
+                            f"Task {task.id!r} failed transition {transition.id!r} "
+                            f"{len(failed_attempts.jobs)} time(s); retry limit "
+                            f"{self.max_failed_attempts_per_transition} reached."
+                        ),
+                        task.id,
+                    ))
+                    continue
+
             recent_failure = _find_recent_failed_job(
                 self.job_store,
                 project_id,
                 task.id,
                 transition.id,
+                backoff_seconds=self.failed_job_backoff_seconds,
             )
             if not recent_failure.accepted:
                 return ScheduleResult(
@@ -146,7 +176,7 @@ class Scheduler:
                     "job.recent_failure",
                     (
                         f"Task {task.id!r} recently failed transition {transition.id!r}; "
-                        f"waiting {RECENT_FAILURE_BACKOFF_SECONDS}s before retry."
+                        f"waiting {self.failed_job_backoff_seconds}s before retry."
                     ),
                     task.id,
                 ))
@@ -388,6 +418,25 @@ def _find_recent_failed_job(
         recent,
         key=lambda job: _job_timestamp(job) or datetime.min.replace(tzinfo=timezone.utc),
     ),))
+
+
+def _find_failed_jobs(
+    job_store: FileExecutionJobStore,
+    project_id: str,
+    task_id: str,
+    transition_id: str,
+) -> JobStoreResult:
+    listed = job_store.list()
+    if not listed.accepted:
+        return listed
+    failed = tuple(
+        job for job in listed.jobs
+        if job.project_id == project_id
+        and job.task_id == task_id
+        and job.transition_id == transition_id
+        and _status_value(job.status) == ExecutionJobStatus.FAILED.value
+    )
+    return JobStoreResult(jobs=failed)
 
 
 def _job_timestamp(job: ExecutionJob) -> datetime | None:

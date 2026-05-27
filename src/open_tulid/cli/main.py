@@ -392,6 +392,8 @@ def schedule_job(
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
+        failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
+        max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -432,6 +434,8 @@ def create_job(
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
+        failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
+        max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -630,6 +634,8 @@ def run_one_job(
         lease_store=ctx["lease_store"],
         worker_resources=ctx["config"].runtime.worker_resources,
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
+        failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
+        max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -665,6 +671,8 @@ def jobs_daemon(
             lease_store=ctx["lease_store"],
             worker_resources=ctx["config"].runtime.worker_resources,
             serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
+            failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
+            max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
         )
@@ -1103,7 +1111,7 @@ def serve_completions(
 def job_logs(
     project: str = typer.Argument(..., help="Configured project name."),
     job_id: str = typer.Argument(..., help="Execution job id."),
-    stream: str = typer.Option("stdout", "--stream", help="stdout, stderr, or command."),
+    stream: str = typer.Option("stdout", "--stream", help="stdout, stderr, agent, command, or trace."),
 ) -> None:
     """Print persisted worker logs for one job."""
     ctx = _runtime_project_context(project)
@@ -1111,9 +1119,15 @@ def job_logs(
     if not loaded.accepted or loaded.job is None:
         _print_domain_errors((loaded.error,))
         raise typer.Exit(1)
-    name = {"stdout": "stdout.log", "stderr": "stderr.log", "command": "command.txt"}.get(stream)
+    name = {
+        "stdout": "stdout.log",
+        "stderr": "stderr.log",
+        "agent": "agent.log",
+        "command": "command.txt",
+        "trace": "agent-run.json",
+    }.get(stream)
     if name is None:
-        console.print(Panel("stream must be stdout, stderr, or command", style="red"))
+        console.print(Panel("stream must be stdout, stderr, agent, command, or trace", style="red"))
         raise typer.Exit(2)
     path = loaded.job.workspace_path
     log_path = __import__("pathlib").Path(path) / ".open-tulid" / "logs" / name
