@@ -504,40 +504,169 @@ def _build_runtime_prompt(
     derived_artifact_type: str | None,
     completion_endpoint: str,
 ) -> str:
+    variant = _runtime_prompt_variant(
+        transition_id=transition_id,
+        required_artifacts=required_artifacts,
+        derived_artifact_type=derived_artifact_type,
+    )
     artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
     validations = ", ".join(required_validations) if required_validations else "none"
-    derive_lines: tuple[str, ...] = ()
-    artifact_guidance: tuple[str, ...]
-    if derived_artifact_type:
-        derive_lines = (
-            "",
-            f"This transition derives child tasks via `{derived_artifact_type}` artifacts.",
-            f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
-            "If you generate multiple task files, every generated file must appear in the `artifacts` array.",
-            "Only submitted derived-task artifacts will be promoted and turned into tasks.",
-        )
-    if required_artifacts:
-        artifact_guidance = ("Only create the artifact files explicitly required for this transition.",)
-    else:
-        artifact_guidance = (
-            "No artifacts are required for this transition. Submit an empty `artifacts` array.",
-            "Treat existing files under `output/` as read-only context unless this transition explicitly requires output artifacts.",
-            "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files for an implementation transition.",
-        )
-    return "\n".join((
+    sections: list[str] = [
         "# Open Tulid Job",
         "",
         f"Job: {job_id}",
         f"Task: {task_title}",
         f"Transition: {transition_id} ({from_state} -> {to_state})",
         "",
+        _render_prompt_role_section(variant),
+        "",
+        _render_prompt_primary_objective_section(variant),
+        "",
+        _render_prompt_priority_section(variant),
+        "",
+        _render_prompt_paths_section(variant, required_artifacts=required_artifacts),
+        "",
+        _render_prompt_completion_section(
+            completion_endpoint=completion_endpoint,
+            required_artifacts=required_artifacts,
+            required_validations=required_validations,
+            derived_artifact_type=derived_artifact_type,
+            artifacts=artifacts,
+            validations=validations,
+        ),
+        "",
+        "## Task Body",
+        task_body.strip(),
+    ]
+    return "\n".join(sections)
+
+
+def _runtime_prompt_variant(
+    *,
+    transition_id: str,
+    required_artifacts: tuple[str, ...],
+    derived_artifact_type: str | None,
+) -> str:
+    if derived_artifact_type is not None:
+        return "planning"
+    normalized = transition_id.strip().lower()
+    if not required_artifacts and (
+        "implement" in normalized
+        or "review" in normalized
+    ):
+        return "implementation"
+    return "planning"
+
+
+def _render_prompt_role_section(variant: str) -> str:
+    if variant == "implementation":
+        lines = (
+            "## Role",
+            "You are implementing one already-derived scoped task inside an existing plan.",
+            "Do not switch into planning mode and do not broaden scope beyond the current task.",
+        )
+    else:
+        lines = (
+            "## Role",
+            "You are executing a planning or artifact-producing workflow transition for this project.",
+            "Synthesize the required project artifacts for this transition and keep the result aligned with the defined workflow state change.",
+        )
+    return "\n".join(lines)
+
+
+def _render_prompt_primary_objective_section(variant: str) -> str:
+    if variant == "implementation":
+        lines = (
+            "## Primary Objective",
+            "Complete the implementation work defined by the current task body in this workspace.",
+            "Make the required code or test changes, satisfy the required validations, and submit explicit completion evidence.",
+            "Success for this transition is not producing new planning artifacts.",
+        )
+    else:
+        lines = (
+            "## Primary Objective",
+            "Produce the planning artifacts and completion evidence required by this transition.",
+            "Use the provided project context to synthesize the next workflow artifacts without skipping required deliverables.",
+        )
+    return "\n".join(lines)
+
+
+def _render_prompt_priority_section(variant: str) -> str:
+    if variant == "implementation":
+        lines = (
+            "## Context Priority",
+            "1. The current task body is the authoritative scope boundary for this job.",
+            "2. Required validations and completion requirements are mandatory.",
+            "3. Parent and linked context are background reference material only.",
+            "4. If reference material suggests broader project work, stay within the current task instead of expanding scope.",
+        )
+    else:
+        lines = (
+            "## Context Priority",
+            "1. The transition objective and required artifacts define the deliverable for this job.",
+            "2. The current task body and linked context describe the project state you must synthesize from.",
+            "3. Parent context provides background project intent and continuity.",
+            "4. Completion requirements remain mandatory even for planning transitions.",
+        )
+    return "\n".join(lines)
+
+
+def _render_prompt_paths_section(variant: str, *, required_artifacts: tuple[str, ...]) -> str:
+    lines = [
+        "## Read-Only And Writable Paths",
         "Read `.open-tulid/job-context.json` before making changes.",
-        "Make the requested code changes in this workspace.",
-        "Write required completion artifacts under `output/`.",
+    ]
+    if variant == "implementation":
+        lines.extend((
+            "Planning and specification documents in the workspace are read-only reference context.",
+            "Source files and test files in the workspace are writable implementation targets.",
+            "Use `output/` only for required completion artifacts.",
+        ))
+        if required_artifacts:
+            lines.append("This implementation transition requires explicit artifacts under `output/`.")
+        else:
+            lines.append("This implementation transition does not require artifacts, so leave `output/` alone unless Tulid explicitly requires it.")
+    else:
+        lines.extend((
+            "Use workspace files as needed to complete this transition.",
+            "Write required completion artifacts under `output/`.",
+        ))
+    return "\n".join(lines)
+
+
+def _render_prompt_completion_section(
+    *,
+    completion_endpoint: str,
+    required_artifacts: tuple[str, ...],
+    required_validations: tuple[str, ...],
+    derived_artifact_type: str | None,
+    artifacts: str,
+    validations: str,
+) -> str:
+    lines = [
+        "## Completion Contract",
         f"Required artifacts: {artifacts}",
         f"Required validations: {validations}",
-        *artifact_guidance,
-        *derive_lines,
+    ]
+    if required_artifacts:
+        lines.append("Only create the artifact files explicitly required for this transition.")
+    else:
+        lines.extend((
+            "No artifacts are required for this transition. Submit an empty `artifacts` array.",
+            "Treat existing files under `output/` as read-only context unless this transition explicitly requires output artifacts.",
+            "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files for an implementation transition.",
+        ))
+    if derived_artifact_type:
+        lines.extend((
+            f"This transition derives child tasks via `{derived_artifact_type}` artifacts.",
+            f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
+            "If you generate multiple task files, every generated file must appear in the `artifacts` array.",
+            "Only submitted derived-task artifacts will be promoted and turned into tasks.",
+        ))
+    lines.extend((
+        "Completion is not implied by process exit code or workspace edits alone.",
+        "Use `changed_files` for every workspace path you modified outside `output/`.",
+        "Use `validation_evidence` to report concrete command or result evidence for each required validation.",
         "",
         "When ready, submit completion evidence with:",
         "",
@@ -555,10 +684,8 @@ def _build_runtime_prompt(
         "```",
         "",
         "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
-        "",
-        "## Task Body",
-        task_body.strip(),
     ))
+    return "\n".join(lines)
 
 
 def _worker_args(
@@ -674,7 +801,8 @@ def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> st
     for index, task in enumerate(parent_tasks, start=1):
         sections.append(
             "\n".join((
-                f"## Parent Task {index}",
+                f"## Parent Context {index}",
+                "This section is background project context, not an instruction to broaden the assigned task.",
                 f"ID: {task.id}",
                 f"Title: {task.title}",
                 "",

@@ -79,9 +79,42 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
         completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
 
+    assert "## Role" in prompt
+    assert "You are implementing one already-derived scoped task inside an existing plan." in prompt
+    assert "## Primary Objective" in prompt
+    assert "Success for this transition is not producing new planning artifacts." in prompt
+    assert "## Context Priority" in prompt
+    assert "The current task body is the authoritative scope boundary for this job." in prompt
+    assert "## Read-Only And Writable Paths" in prompt
     assert "No artifacts are required for this transition. Submit an empty `artifacts` array." in prompt
     assert "Treat existing files under `output/` as read-only context" in prompt
     assert "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files" in prompt
+    assert "This implementation transition does not require artifacts, so leave `output/` alone unless Tulid explicitly requires it." in prompt
+    assert "## Completion Contract" in prompt
+    assert "Completion is not implied by process exit code or workspace edits alone." in prompt
+
+
+def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
+    prompt = _build_runtime_prompt(
+        job_id=JOB_ID,
+        task_title="Write implementation spec",
+        task_body="Produce the implementation spec.",
+        transition_id="WriteImplementationSpec",
+        from_state="DirectionApproved",
+        to_state="SpecReady",
+        required_artifacts=("ImplementationSpec",),
+        required_validations=(),
+        derived_artifact_type=None,
+        completion_endpoint="http://127.0.0.1/jobs/test/complete",
+    )
+
+    assert "## Role" in prompt
+    assert "You are executing a planning or artifact-producing workflow transition for this project." in prompt
+    assert "## Context Priority" in prompt
+    assert "The transition objective and required artifacts define the deliverable for this job." in prompt
+    assert "## Read-Only And Writable Paths" in prompt
+    assert "Write required completion artifacts under `output/`." in prompt
+    assert "Only create the artifact files explicitly required for this transition." in prompt
 
 
 def test_build_runtime_prompt_for_derived_transition_requires_artifact_submission_per_file():
@@ -98,6 +131,7 @@ def test_build_runtime_prompt_for_derived_transition_requires_artifact_submissio
         completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
 
+    assert "You are executing a planning or artifact-producing workflow transition for this project." in prompt
     assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in prompt
     assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in prompt
 
@@ -421,15 +455,33 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         (output / "result.md").write_text("done\n", encoding="utf-8")
         prompt = (Path(request.workspace) / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
         assert "Task body." in prompt
-        assert "## Parent Task 1" in prompt
+        assert "## Parent Context 1" in prompt
+        assert "background project context, not an instruction to broaden the assigned task" in prompt
         assert "Parent body sees" in prompt
         assert "Spec sees" in prompt
         assert "Extra context." in prompt
         assert "Parent extra context." in prompt
+        assert "Linked Reference Context: artifacts/spec.md" in prompt
+        assert "supports implementation decisions but does not redefine the assigned task scope" in prompt
         assert "Default instructions." in prompt
         return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=17)
 
     monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    monkeypatch.setattr("open_tulid.runtime.executor._write_run_logs", lambda workspace, result: None)
+    monkeypatch.setattr(
+        JobExecutor,
+        "_start_completion_endpoint",
+        lambda self, job_id: type(
+            "Endpoint",
+            (),
+            {
+                "url": f"http://127.0.0.1/jobs/{job_id}/complete",
+                "host": "127.0.0.1",
+                "port": 0,
+                "stop": lambda self: None,
+            },
+        )(),
+    )
     executor = JobExecutor(
         workflow=_workflow(),
         adapter=ProjectAdapter(),
