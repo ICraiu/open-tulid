@@ -18,11 +18,15 @@ from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import CONFIG_DIRNAME, load_config
 from open_tulid.containers import (
+    build_project_worker_images,
     build_agent_images,
     check_docker,
     default_shared_workspace_root,
     docker_install_plan,
     list_agent_image_specs,
+    project_dockerfile_path,
+    project_worker_ids,
+    runtime_with_project_images,
 )
 from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter
 from open_tulid.domain import EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
@@ -199,6 +203,15 @@ def build_agent_images_cmd(
         raise typer.Exit(1)
 
 
+@agents_app.command("build-project-image")
+def build_project_image_cmd(
+    project: str = typer.Argument(..., help="Configured project name."),
+) -> None:
+    """Build the Docker.tulid image layer for a project."""
+    config = _load_cli_config()
+    _ensure_project_runtime_images(config, project)
+
+
 @agents_app.command("doctor")
 def agents_doctor(
     docker: str = typer.Option(
@@ -369,6 +382,7 @@ def schedule_job(
     project: str = typer.Argument(..., help="Configured project name."),
 ) -> None:
     """Schedule the next runnable task and create one execution job."""
+    _require_project_dockerfile(_load_cli_config(), project)
     ctx = _runtime_project_context(project)
     scheduler = Scheduler(
         workflow=ctx["workflow"],
@@ -606,6 +620,7 @@ def run_one_job(
     project: str = typer.Argument(..., help="Configured project name."),
 ) -> None:
     """Schedule and run one runnable task."""
+    _ensure_project_runtime_images(_load_cli_config(), project)
     ctx = _runtime_project_context(project)
     scheduler = Scheduler(
         workflow=ctx["workflow"],
@@ -640,6 +655,7 @@ def jobs_daemon(
     """Continuously schedule and run runnable jobs."""
     completed = 0
     while True:
+        _require_project_dockerfile(_load_cli_config(), project, stop_runtime=True)
         ctx = _runtime_project_context(project)
         scheduler = Scheduler(
             workflow=ctx["workflow"],
@@ -717,6 +733,11 @@ def runtime_start(
         else:
             console.print("Runtime already running for all selected projects")
         return
+
+    for project_name in projects:
+        _state_path, _state, scheduler_running = scheduler_states[project_name]
+        if not scheduler_running:
+            _ensure_project_runtime_images(config, project_name)
 
     readiness = check_backend_readiness(config.model_proxy, env=os.environ)
     for result in readiness:
@@ -1256,16 +1277,117 @@ def _project_path(config: Config, name: str):
     return path
 
 
+def _project_config(config: Config, project: str) -> ProjectConfig:
+    return config.project_configs.get(project) or ProjectConfig(
+        name=project,
+        tracker_path=project,
+    )
+
+
+def _load_project_workflow(config: Config, project: str, project_path: Path) -> WorkflowDefinition:
+    project_config = _project_config(config, project)
+    workflow_path = project_config.workflow_path or project_path / "workflow.yaml"
+    if not workflow_path.is_file():
+        console.print(Panel(f"workflow.yaml is required in project {project!r}.", style="red"))
+        raise typer.Exit(2)
+    workflow = load_workflow_definition(workflow_path)
+    if workflow.valid and workflow.definition is not None:
+        return workflow.definition
+
+    console.print(Panel("Workflow validation failed.", style="red"))
+    for diagnostic in workflow.diagnostics:
+        parts = []
+        if getattr(diagnostic, "path", None):
+            parts.append(str(diagnostic.path))
+        if getattr(diagnostic, "line", None) is not None:
+            parts.append(str(diagnostic.line))
+        prefix = ":".join(parts)
+        message = f"{diagnostic.code}: {diagnostic.message}"
+        console.print(f"{prefix}: {message}" if prefix else message)
+    raise typer.Exit(2)
+
+
+def _project_dockerfile(config: Config, project: str, project_path: Path) -> Path:
+    return project_dockerfile_path(_project_config(config, project), project_path)
+
+
+def _require_project_dockerfile(config: Config, project: str, *, stop_runtime: bool = False) -> Path:
+    project_path = _project_path(config, project)
+    dockerfile = _project_dockerfile(config, project, project_path)
+    if dockerfile.is_file():
+        return dockerfile
+    console.print(_runtime_log_line(
+        "RUNTIME_PRECHECK_FAILED",
+        f"project={project} code=project_dockerfile_missing path={dockerfile}",
+    ))
+    if stop_runtime:
+        _runtime_state_path(config, project).unlink(missing_ok=True)
+        console.print(_runtime_log_line(
+            "SCHEDULER_STOPPED",
+            f"project={project} reason=project_dockerfile_missing",
+        ))
+    raise typer.Exit(1)
+
+
+def _ensure_project_runtime_images(config: Config, project: str) -> None:
+    project_path = _project_path(config, project)
+    dockerfile = _require_project_dockerfile(config, project)
+    workflow = _load_project_workflow(config, project, project_path)
+    worker_ids = project_worker_ids(workflow)
+    if not worker_ids:
+        console.print(_runtime_log_line(
+            "PROJECT_IMAGE_SKIPPED",
+            f"project={project} reason=no_worker_transitions",
+        ))
+        return
+    results = build_project_worker_images(
+        project=project,
+        worker_ids=worker_ids,
+        dockerfile=dockerfile,
+        runtime=config.runtime,
+        docker_executable=config.runtime.docker_executable,
+    )
+    failed = [result for result in results if not result.succeeded]
+    for result in results:
+        if result.succeeded:
+            console.print(_runtime_log_line(
+                "PROJECT_IMAGE_BUILT",
+                f"project={project} worker={result.worker_id} image={result.tag} base={result.base_image}",
+            ))
+        else:
+            detail = result.stderr.strip() or result.stdout.strip() or "docker build failed"
+            console.print(_runtime_log_line(
+                "PROJECT_IMAGE_BUILD_FAILED",
+                f"project={project} worker={result.worker_id} image={result.tag} error={detail}",
+            ))
+    if failed:
+        raise typer.Exit(1)
+
+
+def _apply_project_runtime_images_if_available(
+    config: Config,
+    project: str,
+    project_path: Path,
+    workflow: WorkflowDefinition,
+) -> None:
+    dockerfile = _project_dockerfile(config, project, project_path)
+    if not dockerfile.is_file():
+        return
+    config.runtime = runtime_with_project_images(
+        config.runtime,
+        project=project,
+        worker_ids=project_worker_ids(workflow),
+    )
+
+
 def _runtime_project_context(project: str) -> dict[str, object]:
     config, workflow = _load_cli_context(project)
     if workflow is None:
         console.print(Panel(f"workflow.yaml is required in project {project!r}.", style="red"))
         raise typer.Exit(2)
     project_path = _project_path(config, project)
-    project_config = config.project_configs.get(project) or ProjectConfig(
-        name=project,
-        tracker_path=project,
-    )
+    project_config = _project_config(config, project)
+    _apply_project_runtime_images_if_available(config, project, project_path, workflow)
     adapter = build_storage_adapter(AdapterBuildRequest(
         project_id=project,
         project_root=project_path,

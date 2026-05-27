@@ -50,6 +50,13 @@ def create_project(config: Config, name: str) -> CreatedProject:
             dir_path.mkdir(parents=True, exist_ok=True)
             created_dirs.append(f"{name}/{dir_name}")
         (project_path / "workflow.yaml").write_text("", encoding="utf-8")
+        (project_path / "Docker.tulid").write_text(
+            "ARG TULID_AGENT_IMAGE\n"
+            "FROM ${TULID_AGENT_IMAGE}\n"
+            "\n"
+            "# Add project runtime dependencies here. Jobs must start with a ready environment.\n",
+            encoding="utf-8",
+        )
         (project_path / "agents" / "default.agent.md").write_text(
             "# Default Agent Instructions\n\n"
             "Add project-wide coding standards and completion guidance here.\n",

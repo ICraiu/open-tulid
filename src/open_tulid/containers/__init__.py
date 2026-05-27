@@ -6,6 +6,16 @@ from .images import (
     get_agent_image_spec,
     list_agent_image_specs,
 )
+from .project_images import (
+    PROJECT_DOCKERFILE,
+    ProjectImageBuildResult,
+    build_project_worker_image,
+    build_project_worker_images,
+    project_dockerfile_path,
+    project_worker_ids,
+    project_worker_image_tag,
+    runtime_with_project_images,
+)
 from .docker import DockerAvailability, DockerInstallPlan, check_docker, docker_install_plan
 from .runtime import (
     AgentRunRequest,
@@ -25,14 +35,22 @@ __all__ = [
     "AgentRunRequest",
     "AgentRunResult",
     "ContainerMount",
+    "PROJECT_DOCKERFILE",
+    "ProjectImageBuildResult",
     "build_agent_image",
     "build_agent_images",
+    "build_project_worker_image",
+    "build_project_worker_images",
     "check_docker",
     "docker_install_plan",
     "default_shared_workspace_root",
     "get_agent_image_spec",
     "image_for_agent",
     "list_agent_image_specs",
+    "project_dockerfile_path",
+    "project_worker_ids",
+    "project_worker_image_tag",
     "request_for_worker",
     "run_agent_container",
+    "runtime_with_project_images",
 ]

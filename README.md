@@ -265,8 +265,15 @@ Agent image and host checks:
 ```bash
 tulid agents doctor
 tulid agents build-images
+tulid agents build-project-image <project>
 tulid install docker
 ```
+
+Each runnable project must provide `Docker.tulid` at its repo root, or at the
+project tracker directory when no `repo_root` is configured. Runtime start builds
+project-specific worker images from that file using `TULID_AGENT_IMAGE` as the
+base agent image. If the file is missing, the scheduler exits before creating
+any execution job; task and job state are left untouched.
 
 Model proxy:
 

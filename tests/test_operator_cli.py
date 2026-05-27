@@ -92,6 +92,7 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", fake_popen)
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start", "--interval", "5"])
@@ -108,6 +109,20 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     assert proxy_state["proxy_pid"] == 4321
     assert state["project"] == "Agent"
     assert state["interval"] == 5.0
+
+
+def test_runtime_start_fails_before_scheduler_when_project_dockerfile_missing(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("proxy precheck should not run")))
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start"])
+
+    assert result.exit_code == 1
+    assert "RUNTIME_PRECHECK_FAILED project=Agent" in result.output
+    assert "code=project_dockerfile_missing" in result.output
+    assert not (tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json").exists()
+    assert not (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").exists()
 
 
 def test_runtime_start_without_project_starts_all_configured_projects(tmp_path: Path, monkeypatch):
@@ -127,6 +142,7 @@ def test_runtime_start_without_project_starts_all_configured_projects(tmp_path: 
     monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", fake_popen)
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start", "--interval", "5"])
@@ -212,6 +228,7 @@ def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path
     monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: seen.append(args) or type("P", (), {"pid": 4321})())
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start"])
@@ -242,6 +259,7 @@ def test_runtime_start_fails_active_jobs_from_dead_prior_scheduler(tmp_path: Pat
     monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: next(processes))
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start"])
@@ -496,6 +514,7 @@ def test_runtime_start_stops_new_proxy_when_scheduler_fails(tmp_path: Path, monk
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value == 4321)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
     killed = []
     monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: killed.append((pid, sig)))
 
@@ -533,6 +552,7 @@ def test_jobs_daemon_logs_failed_job_and_keeps_control_flow(tmp_path: Path, monk
         worker_id="codex",
     )
     monkeypatch.setattr("open_tulid.cli.main._runtime_project_context", lambda project: fake_ctx)
+    monkeypatch.setattr("open_tulid.cli.main._require_project_dockerfile", lambda *args, **kwargs: tmp_path / "Docker.tulid")
     monkeypatch.setattr(
         "open_tulid.cli.main.Scheduler",
         lambda **kwargs: SimpleNamespace(schedule_one=lambda project: ScheduleResult(scheduled=True, job=fake_job)),
@@ -544,6 +564,66 @@ def test_jobs_daemon_logs_failed_job_and_keeps_control_flow(tmp_path: Path, monk
 
     assert result.exit_code == 0
     assert "JOB_RUN_FAILED project=Agent job=job-1 exit_code=1" in result.output
+
+
+def test_jobs_run_one_builds_project_images_before_scheduling(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    calls: list[tuple[str, str]] = []
+    fake_ctx = {
+        "workflow": object(),
+        "adapter": object(),
+        "job_store": object(),
+        "workspace_root": tmp_path / "workspaces",
+        "lease_store": object(),
+        "config": SimpleNamespace(
+            runtime=SimpleNamespace(
+                worker_resources={},
+                repo_execution_mode="serial",
+            ),
+        ),
+        "event_store": SimpleNamespace(append_many=lambda events: None),
+        "journal_store": object(),
+    }
+    fake_job = SimpleNamespace(
+        job_id="job-1",
+        task_id="task-1",
+        transition_id="implement",
+        worker_id="codex",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._ensure_project_runtime_images",
+        lambda config, project: calls.append(("ensure", project)),
+    )
+    monkeypatch.setattr("open_tulid.cli.main._runtime_project_context", lambda project: fake_ctx)
+    monkeypatch.setattr(
+        "open_tulid.cli.main.Scheduler",
+        lambda **kwargs: SimpleNamespace(schedule_one=lambda project: ScheduleResult(scheduled=True, job=fake_job)),
+    )
+    monkeypatch.setattr("open_tulid.cli.main.run_job", lambda project, job_id: calls.append(("run", job_id)))
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["jobs", "run-one", "Agent"])
+
+    assert result.exit_code == 0
+    assert calls == [("ensure", "Agent"), ("run", "job-1")]
+
+
+def test_jobs_daemon_stops_runtime_when_project_dockerfile_missing(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    with _with_cwd(tmp_path):
+        config = cli_main._load_cli_config()
+        monkeypatch.setattr("open_tulid.cli.main._runtime_project_context", lambda project: {"config": config})
+        result = runner.invoke(app, ["jobs", "daemon", "Agent", "--limit", "1"])
+
+    assert result.exit_code == 1
+    assert "RUNTIME_PRECHECK_FAILED project=Agent" in result.output
+    assert "code=project_dockerfile_missing" in result.output
+    assert "SCHEDULER_STOPPED project=Agent" in result.output
+    assert "reason=project_dockerfile_missing" in result.output
+    assert not state_path.exists()
 
 
 def test_tasks_list_without_project_lists_all_projects_grouped(tmp_path: Path, monkeypatch):

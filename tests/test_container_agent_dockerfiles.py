@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 from typer.testing import CliRunner
@@ -13,13 +14,24 @@ from open_tulid.containers import (
     ImageBuildResult,
     build_agent_image,
     build_agent_images,
+    build_project_worker_image,
     check_docker,
     docker_install_plan,
     get_agent_image_spec,
     list_agent_image_specs,
+    project_worker_ids,
+    runtime_with_project_images,
     run_agent_container,
 )
 from open_tulid.cli import main as cli_main
+from open_tulid.domain import (
+    RequirementDefinition,
+    StateDefinition,
+    TaskTypeDefinition,
+    TransitionDefinition,
+    WorkerDefinition,
+    WorkflowDefinition,
+)
 from open_tulid.models import RuntimeConfig
 from open_tulid.containers.runtime import image_for_agent, request_for_worker
 
@@ -121,6 +133,102 @@ def test_build_agent_images_defaults_to_all_agents():
     assert len(calls) == 2
 
 
+def test_build_project_worker_image_composes_from_worker_agent_image(tmp_path: Path):
+    dockerfile = tmp_path / "Docker.tulid"
+    dockerfile.write_text("ARG TULID_AGENT_IMAGE\nFROM ${TULID_AGENT_IMAGE}\n", encoding="utf-8")
+    calls: list[tuple[str, ...]] = []
+
+    def runner(args, *, check, capture_output, text):
+        calls.append(tuple(args))
+        assert check is False
+        assert capture_output is True
+        assert text is True
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="ok", stderr="")
+
+    result = build_project_worker_image(
+        project="STT-clipboard",
+        worker_id="qwen_27b",
+        dockerfile=dockerfile,
+        runtime=RuntimeConfig(
+            worker_images={"qwen_27b": "open-tulid/agent-opencode:latest"},
+        ),
+        docker_executable="podman",
+        runner=runner,
+    )
+
+    assert result.succeeded is True
+    assert result.base_image == "open-tulid/agent-opencode:latest"
+    assert result.tag == "open-tulid/project-stt-clipboard-qwen_27b:latest"
+    assert calls == [(
+        "podman",
+        "build",
+        "-f",
+        str(dockerfile),
+        "--build-arg",
+        "TULID_AGENT_IMAGE=open-tulid/agent-opencode:latest",
+        "--label",
+        "open-tulid.project=STT-clipboard",
+        "--label",
+        "open-tulid.worker=qwen_27b",
+        "-t",
+        "open-tulid/project-stt-clipboard-qwen_27b:latest",
+        str(tmp_path),
+    )]
+
+
+def test_runtime_with_project_images_overrides_worker_tags():
+    runtime = runtime_with_project_images(
+        RuntimeConfig(worker_images={"codex": "custom/codex:base"}),
+        project="Agent",
+        worker_ids=("codex", "qwen_27b"),
+    )
+
+    assert runtime.worker_images["codex"] == "open-tulid/project-agent-codex:latest"
+    assert runtime.worker_images["qwen_27b"] == "open-tulid/project-agent-qwen_27b:latest"
+
+
+def test_project_worker_ids_uses_worker_implementation_ids():
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            "Todo": StateDefinition(id="Todo"),
+            "Done": StateDefinition(id="Done"),
+        }),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({
+            "qwen_27b": WorkerDefinition(id="qwen_27b", type="local_llm", implementation_id="local_llm"),
+            "codex_direction": WorkerDefinition(id="codex_direction", type="codex", implementation_id="codex"),
+        }),
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="Done",
+                worker="qwen_27b",
+                requires=RequirementDefinition(),
+                transaction=None,
+            ),
+            "direction": TransitionDefinition(
+                id="direction",
+                task_type="task",
+                from_state="Todo",
+                to_state="Done",
+                worker="codex_direction",
+                requires=RequirementDefinition(),
+                transaction=None,
+            ),
+        }),
+    )
+
+    assert project_worker_ids(workflow) == ("codex", "local_llm")
+
+
 def test_build_agent_image_reports_missing_docker():
     def runner(args, *, check, capture_output, text):
         raise FileNotFoundError("docker")
@@ -174,6 +282,22 @@ def test_agents_build_images_cli_rejects_unknown_agent():
 
     assert result.exit_code == 2
     assert "Unknown agent image" in result.output
+
+
+def test_agents_build_project_image_cli_invokes_project_builder(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli_main, "_load_cli_config", lambda: object())
+    monkeypatch.setattr(
+        cli_main,
+        "_ensure_project_runtime_images",
+        lambda config, project: calls.append(project),
+    )
+
+    result = runner.invoke(cli_main.app, ["agents", "build-project-image", "Agent"])
+
+    assert result.exit_code == 0
+    assert calls == ["Agent"]
 
 
 def test_check_docker_reports_missing_cli():

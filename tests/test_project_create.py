@@ -61,6 +61,8 @@ class TestProjectCreation:
             assert f"Engine/{dirname}" in result.created_dirs
         assert (tmp_vault / "Engine" / "workflow.yaml").is_file()
         assert (tmp_vault / "Engine" / "workflow.yaml").read_text(encoding="utf-8") == ""
+        assert (tmp_vault / "Engine" / "Docker.tulid").is_file()
+        assert "FROM ${TULID_AGENT_IMAGE}" in (tmp_vault / "Engine" / "Docker.tulid").read_text(encoding="utf-8")
         assert (tmp_vault / "Engine" / "agents" / "default.agent.md").is_file()
 
     def test_project_fails_when_exists(self, valid_config: Config):
