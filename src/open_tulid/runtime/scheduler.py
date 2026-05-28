@@ -385,7 +385,11 @@ def _serial_repo_lane_focus(
             return _SerialRepoLaneFocus(task=task, active_jobs=active_jobs)
 
     for task in tasks:
-        if task.id in jobs_by_task and _has_scheduler_eligible_transition(task, workflow):
+        task_jobs = jobs_by_task.get(task.id, ())
+        if (
+            _has_accepted_job(task_jobs)
+            and _has_scheduler_eligible_transition(task, workflow)
+        ):
             return _SerialRepoLaneFocus(task=task)
     return None
 
@@ -484,6 +488,13 @@ def _has_outgoing_transition(task: Task, workflow: WorkflowDefinition) -> bool:
     return any(
         transition.task_type == task.task_type and transition.from_state == task.current_state
         for transition in workflow.transitions.values()
+    )
+
+
+def _has_accepted_job(jobs: list[ExecutionJob]) -> bool:
+    return any(
+        _status_value(job.status) == ExecutionJobStatus.ACCEPTED.value
+        for job in jobs
     )
 
 

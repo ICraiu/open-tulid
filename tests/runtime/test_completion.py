@@ -258,6 +258,49 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     ]
 
 
+def test_completion_replays_terminal_accepted_job_as_idempotent_success(tmp_path: Path):
+    store = _job_store(tmp_path)
+    assert store.update_status("01J00000000000000000000JOB", "accepted").accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="late duplicate"),
+    )
+
+    assert result.accepted is True
+    assert tuple(events.iter_events()) == ()
+
+
+def test_completion_marks_terminal_failed_job_submission_as_ignored(tmp_path: Path):
+    store = _job_store(tmp_path)
+    assert store.update_status("01J00000000000000000000JOB", "failed").accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="late duplicate"),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "completion.job_terminal"
+    assert [event.event_type for event in events.iter_events()] == ["ExecutionCompletionIgnored"]
+
+
 def test_completion_promotes_changed_files_into_repo_root(tmp_path: Path):
     store = _job_store(tmp_path)
     workspace = tmp_path / "workspace"

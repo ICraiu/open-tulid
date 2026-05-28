@@ -277,6 +277,58 @@ def test_executor_fails_successful_worker_without_explicit_completion_evidence(
     assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
 
 
+def test_executor_preserves_terminal_failed_status_set_during_worker_run(
+    tmp_path: Path,
+    monkeypatch,
+):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    adapter = FakeAdapter()
+    events = JsonlEventStore(tmp_path / "events")
+
+    def fake_run_agent_container(request, *, docker_executable):
+        store.update_status(
+            JOB_ID,
+            "failed",
+            metadata={"failure_reason": "validation_failed"},
+        )
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+
+    executor = JobExecutor(
+        workflow=_workflow_without_requirements(),
+        adapter=adapter,
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "validation_failed"
+    assert [event.event_type for event in events.iter_events()] == ["ExecutionStarted"]
+
+
 def test_executor_requires_explicit_completion_call_even_when_workspace_changes(
     tmp_path: Path,
     monkeypatch,

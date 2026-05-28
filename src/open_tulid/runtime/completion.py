@@ -107,11 +107,14 @@ class CompletionService:
                 if isinstance(error, Mapping)
             ) or (_error("completion.replayed_rejection", "Completion submission was already rejected."),))
 
+        if _status(job.status) == ExecutionJobStatus.ACCEPTED.value:
+            return CompletionResult(True)
+
         if _status(job.status) in TERMINAL_JOB_STATUSES:
             self.event_store.append(build_event(
                 project_id=job.project_id,
                 actor=EventActor(type="executor", id=job.worker_id),
-                event_type="ExecutionCompletionConflict",
+                event_type="ExecutionCompletionIgnored",
                 correlation_id=job.job_id,
                 task_id=job.task_id,
                 job_id=job.job_id,

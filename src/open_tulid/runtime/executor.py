@@ -278,6 +278,12 @@ class JobExecutor:
             )
             if status_after_run == ExecutionJobStatus.ACCEPTED.value:
                 return ExecutorRunResult(True, run=result)
+            if status_after_run in {
+                ExecutionJobStatus.FAILED.value,
+                ExecutionJobStatus.STALE.value,
+                ExecutionJobStatus.CANCELLED.value,
+            }:
+                return ExecutorRunResult(True, run=result)
             if not result.succeeded:
                 self.job_store.update_status(
                     job.job_id,

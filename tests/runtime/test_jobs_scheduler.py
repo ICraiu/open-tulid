@@ -400,6 +400,89 @@ def test_scheduler_retries_after_failed_job_backoff_expires(tmp_path: Path):
     assert result.job.job_id != "01J00000000000000000000JOB"
 
 
+def test_scheduler_does_not_pin_serial_lane_on_recent_failed_job(tmp_path: Path):
+    blocked = Task(
+        id=TASK_ID,
+        title="Blocked",
+        path="tasks/blocked.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    next_task = Task(
+        id="01J00000000000000000000002",
+        title="Next",
+        path="tasks/next.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000OLD",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": datetime.now(timezone.utc).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot(blocked, next_task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == next_task.id
+    assert [error.code for error in result.skipped] == ["job.recent_failure"]
+
+
+def test_scheduler_does_not_pin_serial_lane_on_retry_limited_job(tmp_path: Path):
+    blocked = Task(
+        id=TASK_ID,
+        title="Blocked",
+        path="tasks/blocked.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    next_task = Task(
+        id="01J00000000000000000000002",
+        title="Next",
+        path="tasks/next.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000OLD",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot(blocked, next_task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        max_failed_attempts_per_transition=1,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == next_task.id
+    assert [error.code for error in result.skipped] == ["job.retry_limit_reached"]
+
+
 def test_scheduler_keeps_started_task_on_serial_repo_lane(tmp_path: Path):
     started = Task(
         id=TASK_ID,
