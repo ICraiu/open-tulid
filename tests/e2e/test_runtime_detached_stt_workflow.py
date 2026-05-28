@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -131,12 +132,94 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         assert "TRANSITION_ACCEPTED task=1 transition=ApproveDirection" in compact_log
         assert "TRANSITION_ACCEPTED task=2 job=" in compact_log
         assert "transition=SelfReviewPass2" in compact_log
+
+        implementation_job = _job_payload_for_transition(project, "ImplementTask")
+        implementation_workspace = Path(implementation_job["workspace_path"])
+        implementation_prompt = (implementation_workspace / ".open-tulid" / "prompt-packet.md").read_text(
+            encoding="utf-8",
+        )
+        assert "## Role" in implementation_prompt
+        assert "## Primary Objective" in implementation_prompt
+        assert "## Context Priority" in implementation_prompt
+        assert "## Read-Only And Writable Paths" in implementation_prompt
+        assert "The current task body is the authoritative scope boundary for this job." in implementation_prompt
+        assert (
+            "This implementation transition does not require artifacts, so leave `output/` alone"
+            in implementation_prompt
+        )
+        assert "## Parent Context 1" in implementation_prompt
+        assert "## Parent Task" not in implementation_prompt
+        assert "## Derived tasks" not in implementation_prompt
+        assert not any((implementation_workspace / "output").glob("*"))
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
         _print_system_logs(project, capsys)
 
 
-def _make_runtime_project(tmp_path: Path, worker_image: str) -> RuntimeProject:
+def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits(
+    tmp_path: Path,
+    scripted_runtime_worker_image: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = _make_runtime_project(
+        tmp_path,
+        scripted_runtime_worker_image,
+        scenario="self_review_reject_once",
+    )
+
+    try:
+        started = _run_tulid(project.root, "runtime", "start", "--interval", "0.2")
+        assert started.returncode == 0, started.stdout + started.stderr
+
+        _wait_for(
+            lambda: _task_state(project.project, "1") == "HumanReview",
+            "product idea to reach HumanReview",
+        )
+        manual = _run_tulid(project.root, "transition", "Agent", "1", "ApproveDirection")
+        assert manual.returncode == 0, manual.stdout + manual.stderr
+
+        _wait_for(
+            lambda: _task_state(project.project, "2") == "Done",
+            "implementation task to recover from rejected self-review and finish",
+            timeout=40.0,
+        )
+
+        rejected_events = [
+            event
+            for event in JsonlEventStore(project.project / "events").iter_events()
+            if event.event_type == "ExecutionCompletionRejected"
+        ]
+        assert rejected_events
+        assert any(
+            feedback.get("code") == "completion.changed_files_missing"
+            for event in rejected_events
+            for feedback in event.data.get("feedback", [])
+            if isinstance(feedback, dict)
+        )
+
+        review_job = _job_payload_for_transition(project, "SelfReviewPass1")
+        assert review_job["status"] == "accepted"
+        review_stdout = _job_stdout(review_job)
+        assert (
+            "scripted runtime worker scenario=self_review_reject_once transition=SelfReviewPass1"
+            in review_stdout
+        )
+        assert "completion status=400" in review_stdout
+        assert "completion status=200" in review_stdout
+        assert (project.repo / "app.py").read_text(encoding="utf-8").endswith(
+            "\n# self review pass 1\n# self review pass 2\n",
+        )
+    finally:
+        _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
+        _print_system_logs(project, capsys)
+
+
+def _make_runtime_project(
+    tmp_path: Path,
+    worker_image: str,
+    *,
+    scenario: str = "default",
+) -> RuntimeProject:
     root = tmp_path / "workspace"
     vault = root / "vault"
     project = vault / "Agent"
@@ -154,6 +237,8 @@ def _make_runtime_project(tmp_path: Path, worker_image: str) -> RuntimeProject:
             vault_root=vault,
             repo_root=repo,
             worker_image=worker_image,
+            scenario=scenario,
+            model_proxy_port=_free_tcp_port(),
         ),
         encoding="utf-8",
     )
@@ -207,6 +292,12 @@ def _project_python() -> str:
     return sys.executable
 
 
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _wait_for(predicate, description: str, *, timeout: float = 20.0, interval: float = 0.2) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -244,6 +335,29 @@ def _scheduler_stdout(project: RuntimeProject) -> str:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
+
+
+def _job_payloads(project: RuntimeProject) -> list[dict[str, object]]:
+    job_root = project.root / CONFIG_DIRNAME / "jobs" / "Agent"
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(job_root.glob("*/job.json"))
+    ]
+
+
+def _job_payload_for_transition(project: RuntimeProject, transition_id: str) -> dict[str, object]:
+    matches = [
+        payload
+        for payload in _job_payloads(project)
+        if payload.get("transition_id") == transition_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _job_stdout(job_payload: dict[str, object]) -> str:
+    workspace = Path(str(job_payload["workspace_path"]))
+    return (workspace / ".open-tulid" / "logs" / "stdout.log").read_text(encoding="utf-8")
 
 
 def _system_log_paths(project: RuntimeProject) -> tuple[Path, ...]:

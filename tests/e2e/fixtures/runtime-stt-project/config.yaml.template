@@ -7,6 +7,9 @@ projects:
     path: Agent
     repo_root: "{repo_root}"
 
+model_proxy_server:
+  port: {model_proxy_port}
+
 runtime:
   completion_host: 0.0.0.0
   completion_container_host: host.docker.internal
@@ -15,3 +18,5 @@ runtime:
   worker_images:
     codex: "{worker_image}"
     local_llm: "{worker_image}"
+  env:
+    SCRIPTED_RUNTIME_SCENARIO: "{scenario}"

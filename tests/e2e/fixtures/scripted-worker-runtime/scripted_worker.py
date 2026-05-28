@@ -18,8 +18,9 @@ output = pathlib.Path(os.environ["OPEN_TULID_OUTPUT_DIR"])
 
 transition_id = context["transition_id"]
 task_id = context["task_id"]
+scenario = os.environ.get("SCRIPTED_RUNTIME_SCENARIO", "default")
 
-print(f"scripted runtime worker transition={transition_id} task={task_id}")
+print(f"scripted runtime worker scenario={scenario} transition={transition_id} task={task_id}")
 print(f"prompt-bytes={len(prompt.encode('utf-8'))}")
 
 
@@ -137,9 +138,24 @@ if transition_id == "ImplementTask":
 
 if transition_id == "SelfReviewPass1":
     append_workspace_file("app.py", "\n# self review pass 1\n")
+    if scenario == "self_review_reject_once":
+        rejected = submit({
+            "submission_id": "self-review-1-missing-changed-files",
+            "attempt": 1,
+            "summary": "self review pass 1 omitted changed files first",
+            "artifacts": [],
+            "changed_files": [],
+            "validation_evidence": {
+                "tests_pass": "passed",
+                "project_build": "passed",
+            },
+        })
+        if rejected == 200:
+            print("expected missing changed_files submission to be rejected", file=sys.stderr)
+            sys.exit(1)
     status = submit({
         "submission_id": "self-review-1",
-        "attempt": 1,
+        "attempt": 2 if scenario == "self_review_reject_once" else 1,
         "summary": "self review pass 1 completed by scripted worker",
         "artifacts": [],
         "changed_files": ["app.py"],
