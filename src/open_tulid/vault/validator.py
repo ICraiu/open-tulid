@@ -18,6 +18,7 @@ def validate_project(
     project: Project,
     workflow_definition: WorkflowDefinition | None = None,
     tracker_type: str | None = None,
+    fix: bool = False,
 ) -> ValidationReport:
     """Validate project structure, then workflow semantics when available."""
     report = ValidationReport()
@@ -79,6 +80,19 @@ def validate_project(
                 message=f"workflow.runtime_unavailable: {exc}",
             ))
             return report
+        repair_project = getattr(adapter, "repair_project", None)
+        if callable(repair_project):
+            repair_errors = repair_project(fix=fix)
+            report.errors.extend(
+                ValidationError(
+                    path=Path(error.location) if error.location is not None else project.path,
+                    line=None,
+                    message=f"{error.code}: {error.message}",
+                )
+                for error in repair_errors
+            )
+            if repair_errors:
+                return report
         runtime_result = TaskManager(
             workflow=workflow_definition,
             adapter=adapter,
@@ -98,6 +112,7 @@ def validate_project(
 def validate_vault(
     config: Config,
     workflow_definition: WorkflowDefinition | None = None,
+    fix: bool = False,
 ) -> ValidationReport:
     report = ValidationReport()
     projects = iter_configured_projects(config)
@@ -134,6 +149,7 @@ def validate_vault(
             project,
             selected_workflow,
             tracker_type=config.tracker_type,
+            fix=fix,
         )
         report.errors.extend(project_report.errors)
         report.checked_projects += project_report.checked_projects

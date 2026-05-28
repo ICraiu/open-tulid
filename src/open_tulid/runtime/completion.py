@@ -181,13 +181,33 @@ class CompletionService:
             submission=submission,
         )
         if not verification.accepted:
+            current = self.job_store.get(job.job_id)
+            current_job = current.job if current.accepted else None
+            if current_job is not None and _status(current_job.status) in TERMINAL_JOB_STATUSES:
+                self.event_store.append(build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="executor", id=job.worker_id),
+                    event_type="ExecutionCompletionIgnored",
+                    correlation_id=job.job_id,
+                    task_id=job.task_id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    submission_id=submission_id,
+                    data={"reason": "terminal_job", "status": _status(current_job.status)},
+                ))
+                return CompletionResult(False, verification=verification, errors=(_error(
+                    "completion.job_terminal",
+                    f"Execution job {job.job_id!r} is terminal: {_status(current_job.status)}.",
+                    job.job_id,
+                ),))
+            metadata = current_job.metadata if current_job is not None else job.metadata
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.COMPLETION_REJECTED,
                 metadata={
                     "last_verification": verification.message,
                     "completion_submissions": _record_submission(
-                        job.metadata,
+                        metadata,
                         submission_id,
                         accepted=False,
                         feedback=tuple(_error_to_dict(error) for error in verification.errors),

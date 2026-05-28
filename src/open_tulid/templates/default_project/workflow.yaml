@@ -1,0 +1,196 @@
+schema_version: 1
+
+storage:
+  obsidian:
+    boards:
+      Work: kanban/Work.md
+    state_mappings:
+      - state: Idea
+        board: Work
+        column: Idea
+      - state: HumanReview
+        board: Work
+        column: Human review
+      - state: ReadyForSpec
+        board: Work
+        column: Ready for spec
+      - state: ReadyForBreakdown
+        board: Work
+        column: Ready for breakdown
+      - state: Todo
+        board: Work
+        column: Todo
+      - state: SelfReview1
+        board: Work
+        column: Self review 1
+      - state: SelfReview2
+        board: Work
+        column: Self review 2
+      - state: Done
+        board: Work
+        column: Done
+
+statements:
+  - kind: state
+    id: Idea
+  - kind: state
+    id: HumanReview
+  - kind: state
+    id: ReadyForSpec
+  - kind: state
+    id: ReadyForBreakdown
+  - kind: state
+    id: Todo
+  - kind: state
+    id: SelfReview1
+  - kind: state
+    id: SelfReview2
+  - kind: state
+    id: Done
+
+  - kind: task_type
+    id: ProductIdea
+    instructions: [default]
+    requirements:
+      HumanReview:
+        artifacts: [ProductSpec, TechnicalDirection]
+      ReadyForBreakdown:
+        artifacts: [ImplementationSpec]
+
+  - kind: task_type
+    id: ImplementationTask
+    instructions: [qwen-implementation]
+
+  - kind: validation_type
+    id: tests_pass
+    args:
+      command:
+        type: string
+  - kind: validation_type
+    id: project_build
+    args:
+      command:
+        type: string
+
+  - kind: artifact_type
+    id: ProductSpec
+    template: product-spec.md
+  - kind: artifact_type
+    id: TechnicalDirection
+    template: technical-direction.md
+  - kind: artifact_type
+    id: ImplementationSpec
+    template: implementation-spec.md
+  - kind: artifact_type
+    id: ImplementationTaskFile
+
+  - kind: worker
+    id: codex_direction
+    type: codex
+    instructions: [default, direction-authoring, product-template, technical-direction-template]
+  - kind: worker
+    id: codex_spec
+    type: codex
+    instructions: [default, implementation-spec, implementation-spec-template, diagram-requirements]
+  - kind: worker
+    id: codex_breakdown
+    type: codex
+    instructions: [default, task-breakdown]
+  - kind: worker
+    id: qwen_27b
+    type: local_llm
+    instructions: [default, qwen-implementation]
+
+  - kind: transition
+    id: DraftDirection
+    task_type: ProductIdea
+    from: Idea
+    to: HumanReview
+    worker: codex_direction
+    default_for_scheduler: true
+    requires:
+      artifacts: [ProductSpec, TechnicalDirection]
+
+  - kind: transition
+    id: ApproveDirection
+    task_type: ProductIdea
+    from: HumanReview
+    to: ReadyForSpec
+
+  - kind: transition
+    id: WriteImplementationSpec
+    task_type: ProductIdea
+    from: ReadyForSpec
+    to: ReadyForBreakdown
+    worker: codex_spec
+    default_for_scheduler: true
+    requires:
+      artifacts: [ImplementationSpec]
+
+  - kind: transition
+    id: BreakDownImplementationSpec
+    task_type: ProductIdea
+    from: ReadyForBreakdown
+    to: Done
+    worker: codex_breakdown
+    default_for_scheduler: true
+    derives:
+      task_type: ImplementationTask
+      state: Todo
+      artifact_type: ImplementationTaskFile
+
+  - kind: transition
+    id: ImplementTask
+    task_type: ImplementationTask
+    from: Todo
+    to: SelfReview1
+    worker: qwen_27b
+    default_for_scheduler: true
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build
+
+  - kind: transition
+    id: SelfReviewPass1
+    task_type: ImplementationTask
+    from: SelfReview1
+    to: SelfReview2
+    worker: qwen_27b
+    default_for_scheduler: true
+    instructions: [self-review]
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build
+
+  - kind: transition
+    id: SelfReviewPass2
+    task_type: ImplementationTask
+    from: SelfReview2
+    to: Done
+    worker: qwen_27b
+    default_for_scheduler: true
+    instructions: [self-review]
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build

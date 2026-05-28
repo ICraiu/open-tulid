@@ -21,7 +21,7 @@ from open_tulid.domain import (
 from types import MappingProxyType
 from open_tulid.vault.validator import validate_project, validate_vault
 from open_tulid.models import Project
-from open_tulid.cli.init import default_workflow
+from open_tulid.vault.default_project import copy_default_project_scaffold
 
 runner = CliRunner()
 TASK_ID = "01J00000000000000000000001"
@@ -57,7 +57,7 @@ def _make_project(
     (project_dir / "tasks").mkdir(parents=True, exist_ok=True)
     (project_dir / "events").mkdir(parents=True, exist_ok=True)
     (project_dir / "agents").mkdir(parents=True, exist_ok=True)
-    (project_dir / "workflow.yaml").write_text(default_workflow(), encoding="utf-8")
+    copy_default_project_scaffold(project_dir)
 
     if kanban_files:
         for fname, content in kanban_files.items():
@@ -70,7 +70,14 @@ def _make_task(vault_root: Path, project_name: str, task_name: str) -> Path:
     task_dir = vault_root / project_name / "tasks"
     task_dir.mkdir(parents=True, exist_ok=True)
     task_file = task_dir / f"{task_name}.md"
+    task_id = task_name.rsplit(" ", 1)[-1] if task_name.rsplit(" ", 1)[-1].isdigit() else TASK_ID
     task_file.write_text(
+        "---\n"
+        f"id: {task_id}\n"
+        "type: ProductIdea\n"
+        "state: Todo\n"
+        "---\n"
+        "\n"
         f"## Idea\n\nIdea: {task_name}\n",
         encoding="utf-8",
     )
@@ -191,6 +198,31 @@ class TestVaultValidateHappyPath:
             assert result.exit_code == 0
         finally:
             os.chdir(original)
+
+    def test_root_validate_fix_assigns_missing_task_defaults_and_board_state(self, tmp_path: Path):
+        _make_config(tmp_path, ["Agent"])
+        project = _make_project(tmp_path, "Agent", kanban_files={
+            "Work.md": "## Idea\n- [ ] [[New product idea]]\n",
+        })
+        task_path = project / "tasks" / "New product idea.md"
+        task_path.write_text("# New product idea\n\nBuild something useful.\n", encoding="utf-8")
+
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            failed = runner.invoke(app, ["validate"])
+            assert failed.exit_code == 1
+            assert "task.id_missing" in failed.output
+            fixed = runner.invoke(app, ["validate", "--fix"])
+            assert fixed.exit_code == 0
+            assert "Vault validation passed after applying fixes." in fixed.output
+        finally:
+            os.chdir(original)
+
+        content = task_path.read_text(encoding="utf-8")
+        assert "id: '1'" in content
+        assert "type: ProductIdea" in content
+        assert "state: Idea" in content
 
     def test_task_row_link_only(self, tmp_path: Path):
         _make_config(tmp_path, ["Agent"])

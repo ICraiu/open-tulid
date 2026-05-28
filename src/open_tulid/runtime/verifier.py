@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -220,32 +223,41 @@ class DeterministicVerifier:
                 "Trusted validation runtime is not configured.",
                 call.type,
             ) for call in transition.requires.validations)
-        context = self.validation_context_factory(workspace, output_root)
-        for call in transition.requires.validations:
-            implementation = self.validation_implementations.get(call.type)
-            if implementation is None:
-                errors.append(_error(
-                    "completion.validation_unimplemented",
-                    f"No trusted validation implementation is installed for {call.type}.",
-                    call.type,
-                ))
-                continue
-            try:
-                result = implementation(context, **dict(call.args))
-            except Exception as exc:
-                errors.append(_error(
-                    "completion.validation_error",
-                    f"Trusted validation {call.type} raised: {exc}",
-                    call.type,
-                ))
-                continue
-            if not bool(getattr(result, "passed", False)):
-                message = str(getattr(result, "message", "") or "validation failed")
-                errors.append(_error(
-                    "completion.validation_failed",
-                    f"Trusted validation {call.type} failed: {message}",
-                    call.type,
-                ))
+        with tempfile.TemporaryDirectory(prefix="open-tulid-validation-") as temp_dir:
+            validation_workspace = Path(temp_dir) / "workspace"
+            shutil.copytree(workspace, validation_workspace, symlinks=True)
+            _make_tree_user_writable(validation_workspace)
+            validation_output = _map_validation_output_root(
+                workspace=workspace,
+                output_root=output_root,
+                validation_workspace=validation_workspace,
+            )
+            context = self.validation_context_factory(validation_workspace, validation_output)
+            for call in transition.requires.validations:
+                implementation = self.validation_implementations.get(call.type)
+                if implementation is None:
+                    errors.append(_error(
+                        "completion.validation_unimplemented",
+                        f"No trusted validation implementation is installed for {call.type}.",
+                        call.type,
+                    ))
+                    continue
+                try:
+                    result = implementation(context, **dict(call.args))
+                except Exception as exc:
+                    errors.append(_error(
+                        "completion.validation_error",
+                        f"Trusted validation {call.type} raised: {exc}",
+                        call.type,
+                    ))
+                    continue
+                if not bool(getattr(result, "passed", False)):
+                    message = str(getattr(result, "message", "") or "validation failed")
+                    errors.append(_error(
+                        "completion.validation_failed",
+                        f"Trusted validation {call.type} failed: {message}",
+                        call.type,
+                    ))
         return tuple(errors)
 
 
@@ -372,6 +384,31 @@ def _duplicates(values: Iterable[str]) -> tuple[str, ...]:
             duplicates.append(value)
         seen.add(value)
     return tuple(duplicates)
+
+
+def _map_validation_output_root(*, workspace: Path, output_root: Path, validation_workspace: Path) -> Path:
+    try:
+        relative_output = output_root.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return validation_workspace / "output"
+    return validation_workspace / relative_output
+
+
+def _make_tree_user_writable(root: Path) -> None:
+    for path in tuple(root.rglob("*")) + (root,):
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISLNK(mode):
+            continue
+        writable_mode = mode | stat.S_IRUSR | stat.S_IWUSR
+        if stat.S_ISDIR(mode):
+            writable_mode |= stat.S_IXUSR
+        try:
+            path.chmod(writable_mode)
+        except OSError:
+            continue
 
 
 def _git_changed_files(workspace: Path) -> set[str] | None:

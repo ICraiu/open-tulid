@@ -269,24 +269,35 @@ def install_docker(
 
 
 @vault_app.command()
-def validate() -> None:
+def validate(
+    fix: bool = typer.Option(False, "--fix", help="Repair task ids, task types, and board-derived task state."),
+) -> None:
     """Validate all configured projects in the vault."""
+    _run_validate(fix=fix)
+
+
+@app.command("validate")
+def validate_alias(
+    fix: bool = typer.Option(False, "--fix", help="Repair task ids, task types, and board-derived task state."),
+) -> None:
+    """Validate all configured projects in the vault."""
+    _run_validate(fix=fix)
+
+
+def _run_validate(*, fix: bool = False) -> None:
     config, workflow_definition = _load_cli_context()
-    report = validate_vault(config, workflow_definition)
+    report = validate_vault(config, workflow_definition, fix=fix)
     _print_report(report)
 
     if report.passed:
-        console.print(Panel("Vault validation passed.", style="green"))
+        message = "Vault validation passed."
+        if fix:
+            message = "Vault validation passed after applying fixes."
+        console.print(Panel(message, style="green"))
         raise typer.Exit(0)
     else:
         console.print(Panel("Vault validation failed.", style="red"))
         raise typer.Exit(1)
-
-
-@app.command("validate")
-def validate_alias() -> None:
-    """Validate all configured projects in the vault."""
-    validate()
 
 
 def _print_report(report: ValidationReport) -> None:

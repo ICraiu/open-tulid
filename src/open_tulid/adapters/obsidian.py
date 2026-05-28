@@ -212,7 +212,7 @@ class ObsidianAdapter:
             ),))
 
         if card.board == target.board and card.column == target.column:
-            return WriteResult(path=str(card.board_path))
+            return self._sync_task_state_cache(task_id, loaded, state, fallback_path=card.board_path)
 
         source_board = loaded.boards_by_name[card.board]
         if target.board != card.board:
@@ -263,6 +263,105 @@ class ObsidianAdapter:
                 str(event_path),
             ),))
         return WriteResult(path=str(event_path))
+
+    def repair_project(self, *, fix: bool = False) -> tuple[DomainError, ...]:
+        errors: list[DomainError] = []
+        note_states: dict[str, str] = {}
+        for board_name, board_path_value in self.config.boards.items():
+            board_path = self._project_path(board_path_value)
+            board_doc = self._read_board(board_name, board_path)
+            if isinstance(board_doc, DomainError):
+                errors.append(board_doc)
+                continue
+            for card in board_doc.cards:
+                state = self._state_for_board_column(card.board, card.column)
+                if state is None:
+                    errors.append(_error(
+                        "board.column_unmapped",
+                        f"Board {card.board!r} column {card.column!r} is not mapped to a logical state.",
+                        f"{board_path}:{card.line_index + 1}",
+                    ))
+                    continue
+                note_states[card.task_note] = state
+
+        used_numeric_ids = _existing_numeric_task_ids(self._tasks_root())
+        next_numeric_id = max(used_numeric_ids, default=0) + 1
+        writes: list[_PreparedWrite] = []
+
+        for task_path in sorted(self._tasks_root().glob("*.md")):
+            try:
+                content = task_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                errors.append(_error("task.invalid_utf8", f"Task file is not valid UTF-8: {task_path}", str(task_path)))
+                continue
+            except OSError as exc:
+                errors.append(_error("task.read_failed", f"Cannot read task file {task_path}: {exc}", str(task_path)))
+                continue
+            try:
+                frontmatter, body = _split_frontmatter(content)
+            except ValueError as exc:
+                errors.append(_error("task.invalid_frontmatter", str(exc), str(task_path)))
+                continue
+
+            changed = False
+            task_id = frontmatter.get("id")
+            if isinstance(task_id, int):
+                frontmatter["id"] = str(task_id)
+                changed = True
+            elif not isinstance(task_id, str) or not task_id.strip():
+                if fix:
+                    while next_numeric_id in used_numeric_ids:
+                        next_numeric_id += 1
+                    frontmatter["id"] = str(next_numeric_id)
+                    used_numeric_ids.add(next_numeric_id)
+                    next_numeric_id += 1
+                    changed = True
+                else:
+                    errors.append(_error(
+                        "task.id_missing",
+                        "Task is missing frontmatter id. Run `tulid validate --fix` to assign the next numeric id.",
+                        str(task_path),
+                    ))
+
+            task_type = frontmatter.get("type")
+            if not isinstance(task_type, str) or not task_type.strip():
+                if fix:
+                    frontmatter["type"] = "ProductIdea"
+                    changed = True
+                else:
+                    errors.append(_error(
+                        "task.type_missing",
+                        "Task is missing frontmatter type. Run `tulid validate --fix` to assign ProductIdea.",
+                        str(task_path),
+                    ))
+
+            board_state = note_states.get(task_path.stem)
+            frontmatter_state = frontmatter.get("state")
+            if board_state is not None and str(frontmatter_state or "") != board_state:
+                if fix:
+                    frontmatter["state"] = board_state
+                    changed = True
+                else:
+                    errors.append(_error(
+                        "task.state_mismatch",
+                        (
+                            f"Task frontmatter state {str(frontmatter_state)!r} does not match "
+                            f"board column state {board_state!r}. Run `tulid validate --fix` to apply the board state."
+                        ),
+                        str(task_path),
+                    ))
+
+            if changed:
+                writes.append(_PreparedWrite(
+                    path=task_path,
+                    content=_serialize_task_document(frontmatter, body),
+                ))
+
+        if fix and writes:
+            written = self._write_prepared(writes)
+            if not written.accepted:
+                errors.extend(written.errors)
+        return tuple(errors)
 
     def _load(self) -> _LoadedProject:
         loaded = _LoadedProject()
@@ -332,15 +431,6 @@ class ObsidianAdapter:
                     ))
                     continue
 
-                frontmatter_state = task_doc.frontmatter.get("state")
-                if frontmatter_state is not None and str(frontmatter_state) != state:
-                    loaded.errors.append(_error(
-                        "task.state_mismatch",
-                        f"Task {task_id} frontmatter state {frontmatter_state!r} does not match board state {state!r}.",
-                        task_id,
-                    ))
-                    continue
-
                 loaded.cards_by_task_id[task_id] = card
                 board_positions[task_id] = BoardPosition(
                     board=card.board,
@@ -400,15 +490,7 @@ class ObsidianAdapter:
             task_id = str(task_id)
             frontmatter["id"] = task_id
         if not isinstance(task_id, str) or not task_id.strip():
-            task_id = _next_numeric_task_id(self._tasks_root())
-            frontmatter["id"] = task_id
-            try:
-                normalized = _serialize_frontmatter(frontmatter) + "\n\n" + body.strip("\n")
-                if body.strip("\n"):
-                    normalized += "\n"
-                path.write_text(normalized, encoding="utf-8")
-            except OSError as exc:
-                return _error("task.id_assignment_failed", f"Cannot assign task ID: {exc}", str(path))
+            return _error("task.id_missing", "Task is missing frontmatter id.", str(path))
         task_id = task_id.strip()
         if not _is_valid_task_id(task_id):
             return _error("task.invalid_id", "Task ID must be a positive integer or legacy 26-character Crockford Base32 ULID.", str(path))
@@ -510,6 +592,24 @@ class ObsidianAdapter:
             if mapping.board == board and mapping.column == column:
                 return mapping.state
         return None
+
+    def _sync_task_state_cache(
+        self,
+        task_id: str,
+        loaded: _LoadedProject,
+        state: str,
+        *,
+        fallback_path: Path,
+    ) -> WriteResult:
+        task_path = loaded.task_paths_by_id.get(task_id)
+        if task_path is None:
+            return WriteResult(path=str(fallback_path))
+        cache_update = self._prepare_task_state_cache(task_path, state)
+        if cache_update.error is not None:
+            return WriteResult(errors=(cache_update.error,))
+        if cache_update.content is None:
+            return WriteResult(path=str(fallback_path))
+        return self._write_prepared((_PreparedWrite(path=task_path, content=cache_update.content),))
 
     def _mapping_for_state(self, state: str) -> ObsidianStateMapping | None:
         for mapping in self.config.state_mappings:
@@ -720,7 +820,7 @@ def _serialize_task(task: Task) -> str:
     if task.parent_id is not None:
         frontmatter["parent_id"] = task.parent_id
     title = task.title.strip()
-    body = task.body.strip("\n")
+    body = _strip_leading_title(task.body).strip("\n")
     content_lines = [_serialize_frontmatter(frontmatter), ""]
     if title:
         content_lines.extend([f"# {title}", ""])
@@ -728,6 +828,31 @@ def _serialize_task(task: Task) -> str:
         content_lines.append(body)
         content_lines.append("")
     return "\n".join(content_lines)
+
+
+def _serialize_task_document(frontmatter: Mapping[str, Any], body: str) -> str:
+    content = _serialize_frontmatter(frontmatter)
+    clean_body = body.strip("\n")
+    if clean_body:
+        content += "\n\n" + clean_body + "\n"
+    else:
+        content += "\n"
+    return content
+
+
+def _strip_leading_title(body: str) -> str:
+    lines = body.splitlines()
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    if not lines:
+        return body
+    first = lines[0].strip()
+    if not first.startswith("# "):
+        return body
+    remaining = lines[1:]
+    if remaining and not remaining[0].strip():
+        remaining = remaining[1:]
+    return "\n".join(remaining)
 
 
 def _extract_title(body: str) -> str | None:
@@ -760,7 +885,11 @@ def _is_valid_task_id(value: str) -> bool:
 
 
 def _next_numeric_task_id(tasks_root: Path) -> str:
-    highest = 0
+    return str(max(_existing_numeric_task_ids(tasks_root), default=0) + 1)
+
+
+def _existing_numeric_task_ids(tasks_root: Path) -> set[int]:
+    ids: set[int] = set()
     for path in tasks_root.glob("*.md"):
         try:
             frontmatter, _body = _split_frontmatter(path.read_text(encoding="utf-8"))
@@ -768,11 +897,11 @@ def _next_numeric_task_id(tasks_root: Path) -> str:
             continue
         task_id = frontmatter.get("id")
         if isinstance(task_id, int):
-            highest = max(highest, task_id)
+            ids.add(task_id)
             continue
         if isinstance(task_id, str) and NUMERIC_TASK_ID_RE.match(task_id.strip()) is not None:
-            highest = max(highest, int(task_id.strip()))
-    return str(highest + 1)
+            ids.add(int(task_id.strip()))
+    return ids
 
 
 def _slugify(value: str) -> str:

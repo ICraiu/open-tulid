@@ -117,6 +117,8 @@ def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
     assert "## Context Priority" in prompt
     assert "The transition objective and required artifacts define the deliverable for this job." in prompt
     assert "## Read-Only And Writable Paths" in prompt
+    assert "If repository files are present in the workspace, inspect them" in prompt
+    assert "Treat repository source files as read-only context for planning transitions" in prompt
     assert "Write required completion artifacts under `output/`." in prompt
     assert "Only create the artifact files explicitly required for this transition." in prompt
 

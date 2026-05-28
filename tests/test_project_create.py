@@ -10,6 +10,7 @@ from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from open_tulid.models import Config, ProjectConfig
 from open_tulid.vault.project import create_project, iter_configured_projects
+from open_tulid.workflow.runtime import load_workflow_definition
 
 runner = CliRunner()
 
@@ -60,10 +61,24 @@ class TestProjectCreation:
             assert (tmp_vault / "Engine" / dirname).is_dir()
             assert f"Engine/{dirname}" in result.created_dirs
         assert (tmp_vault / "Engine" / "workflow.yaml").is_file()
-        assert (tmp_vault / "Engine" / "workflow.yaml").read_text(encoding="utf-8") == ""
+        workflow_text = (tmp_vault / "Engine" / "workflow.yaml").read_text(encoding="utf-8")
+        assert "DraftDirection" in workflow_text
+        assert "STT" not in workflow_text
+        loaded_workflow = load_workflow_definition(tmp_vault / "Engine" / "workflow.yaml")
+        assert loaded_workflow.valid is True
+        assert loaded_workflow.definition is not None
+        assert "ProductIdea" in loaded_workflow.definition.task_types
+        assert (tmp_vault / "Engine" / "kanban" / "Work.md").is_file()
+        assert "## Idea" in (tmp_vault / "Engine" / "kanban" / "Work.md").read_text(encoding="utf-8")
         assert (tmp_vault / "Engine" / "Docker.tulid").is_file()
         assert "FROM ${TULID_AGENT_IMAGE}" in (tmp_vault / "Engine" / "Docker.tulid").read_text(encoding="utf-8")
         assert (tmp_vault / "Engine" / "agents" / "default.agent.md").is_file()
+        agent_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((tmp_vault / "Engine" / "agents").glob("*.md"))
+        )
+        assert "STT" not in agent_text
+        assert "repository files" in agent_text
 
     def test_project_fails_when_exists(self, valid_config: Config):
         create_project(valid_config, "Engine")

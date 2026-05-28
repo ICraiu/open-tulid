@@ -7,6 +7,7 @@ from rich.panel import Panel
 
 from open_tulid.adapters import default_adapter_type
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
+from open_tulid.vault.default_project import default_workflow_text
 
 console = Console()
 
@@ -75,18 +76,4 @@ def init() -> None:
 
 
 def default_workflow() -> str:
-    return (
-        "schema_version: 1\n"
-        "storage:\n"
-        "  boards:\n"
-        "    Work: kanban/Work.md\n"
-        "  state_mappings:\n"
-        "    - state: Todo\n"
-        "      board: Work\n"
-        "      column: Todo\n"
-        "statements:\n"
-        "  - kind: state\n"
-        "    id: Todo\n"
-        "  - kind: task_type\n"
-        "    id: task\n"
-    )
+    return default_workflow_text()

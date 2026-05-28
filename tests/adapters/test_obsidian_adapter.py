@@ -150,19 +150,24 @@ class TestObsidianAdapterLoadProject:
         assert result.accepted is False
         assert [e.code for e in result.errors] == ["task.duplicate_active_card"]
 
-    def test_rejects_frontmatter_state_mismatch(self, tmp_path: Path):
+    def test_snapshot_uses_board_state_without_rewriting_frontmatter(self, tmp_path: Path):
         project = _make_project(tmp_path)
         _write_task(project, f"{TASK_ID}-add-healthz", state="InProgress")
         (project / "kanban" / "Work.md").write_text(
             "## Todo\n"
-            f"- [ ] [[{TASK_ID}-add-healthz]]\n",
+            f"- [ ] [[{TASK_ID}-add-healthz]]\n"
+            "\n"
+            "## In progress\n",
             encoding="utf-8",
         )
 
         result = _adapter(project).load_project()
 
-        assert result.accepted is False
-        assert [e.code for e in result.errors] == ["task.state_mismatch"]
+        assert result.accepted is True
+        assert result.snapshot is not None
+        assert result.snapshot.tasks[TASK_ID].current_state == "Todo"
+        content = (project / "tasks" / f"{TASK_ID}-add-healthz.md").read_text(encoding="utf-8")
+        assert "state: InProgress" in content
 
     def test_rejects_task_without_active_card(self, tmp_path: Path):
         project = _make_project(tmp_path)
@@ -210,7 +215,7 @@ class TestObsidianAdapterLoadProject:
         assert result.accepted is False
         assert result.errors[0].code == "task.invalid_frontmatter"
 
-    def test_assigns_missing_task_id_without_renaming_note_or_card(self, tmp_path: Path):
+    def test_repair_assigns_missing_task_id_type_and_state_without_renaming_note_or_card(self, tmp_path: Path):
         project = _make_project(tmp_path)
         task_path = project / "tasks" / "Add healthz.md"
         task_path.write_text("# Add healthz\n\n## Task\nAdd endpoint.\n", encoding="utf-8")
@@ -218,16 +223,34 @@ class TestObsidianAdapterLoadProject:
         original_board = "## Todo\n- [ ] [[Add healthz]]\n"
         board_path.write_text(original_board, encoding="utf-8")
 
-        result = _adapter(project).load_project()
+        result = _adapter(project).repair_project(fix=True)
+        load_result = _adapter(project).load_project()
 
-        assert result.accepted is True
-        assert result.snapshot is not None
-        assert len(result.snapshot.tasks) == 1
-        task_id = next(iter(result.snapshot.tasks))
+        assert result == ()
+        assert load_result.accepted is True
+        assert load_result.snapshot is not None
+        assert len(load_result.snapshot.tasks) == 1
+        task_id = next(iter(load_result.snapshot.tasks))
         assert task_id == "1"
         assert task_path.exists()
-        assert "id: '1'" in task_path.read_text(encoding="utf-8")
+        content = task_path.read_text(encoding="utf-8")
+        assert "id: '1'" in content
+        assert "type: ProductIdea" in content
+        assert "state: Todo" in content
         assert board_path.read_text(encoding="utf-8") == original_board
+
+    def test_repair_reports_missing_task_metadata_without_fix(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        (project / "tasks" / "Add healthz.md").write_text("# Add healthz\n", encoding="utf-8")
+        (project / "kanban" / "Work.md").write_text("## Todo\n- [ ] [[Add healthz]]\n", encoding="utf-8")
+
+        result = _adapter(project).repair_project(fix=False)
+
+        assert [error.code for error in result] == [
+            "task.id_missing",
+            "task.type_missing",
+            "task.state_mismatch",
+        ]
 
     def test_loads_numeric_task_ids(self, tmp_path: Path):
         project = _make_project(tmp_path)
@@ -275,6 +298,25 @@ class TestObsidianAdapterEffects:
             f"- [ ] [[{TASK_ID}-add-healthz]]\n"
             "\n"
             "## In progress\n",
+            encoding="utf-8",
+        )
+
+        result = _adapter(project).move_task(TASK_ID, "InProgress")
+        load_result = _adapter(project).load_project()
+
+        assert result.accepted is True
+        assert load_result.accepted is True
+        content = (project / "tasks" / f"{TASK_ID}-add-healthz.md").read_text(encoding="utf-8")
+        assert "state: InProgress" in content
+
+    def test_move_repairs_stale_frontmatter_when_card_already_in_target_column(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        _write_task(project, f"{TASK_ID}-add-healthz", state="Todo")
+        (project / "kanban" / "Work.md").write_text(
+            "## Todo\n"
+            "\n"
+            "## In progress\n"
+            f"- [ ] [[{TASK_ID}-add-healthz]]\n",
             encoding="utf-8",
         )
 
@@ -340,6 +382,52 @@ class TestObsidianAdapterEffects:
         assert "state: Todo" in content
         assert "# Renamed task" in content
         assert "Updated body" in content
+
+    def test_write_task_does_not_duplicate_existing_title_heading(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        _write_task(project, f"{TASK_ID}-add-healthz", state="Todo")
+        (project / "kanban" / "Work.md").write_text(
+            "## Todo\n"
+            f"- [ ] [[{TASK_ID}-add-healthz]]\n",
+            encoding="utf-8",
+        )
+        read_result = _adapter(project).read_task(TASK_ID)
+        assert read_result.task is not None
+
+        result = _adapter(project).write_task(read_result.task)
+
+        assert result.accepted is True
+        content = (project / "tasks" / f"{TASK_ID}-add-healthz.md").read_text(encoding="utf-8")
+        assert content.count("# Add health-check endpoint") == 1
+
+    def test_write_task_does_not_duplicate_title_after_leading_blank_body(self, tmp_path: Path):
+        project = _make_project(tmp_path)
+        (project / "tasks" / f"{TASK_ID}-add-healthz.md").write_text(
+            "---\n"
+            f"id: {TASK_ID}\n"
+            "type: task\n"
+            "state: Todo\n"
+            "---\n"
+            "\n"
+            "\n"
+            "# Add health-check endpoint\n"
+            "\n"
+            "Add a /healthz endpoint.\n",
+            encoding="utf-8",
+        )
+        (project / "kanban" / "Work.md").write_text(
+            "## Todo\n"
+            f"- [ ] [[{TASK_ID}-add-healthz]]\n",
+            encoding="utf-8",
+        )
+        read_result = _adapter(project).read_task(TASK_ID)
+        assert read_result.task is not None
+
+        result = _adapter(project).write_task(read_result.task)
+
+        assert result.accepted is True
+        content = (project / "tasks" / f"{TASK_ID}-add-healthz.md").read_text(encoding="utf-8")
+        assert content.count("# Add health-check endpoint") == 1
 
     def test_appends_jsonl_event(self, tmp_path: Path):
         project = _make_project(tmp_path)

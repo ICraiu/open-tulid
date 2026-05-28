@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+import sys
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -30,6 +31,7 @@ from open_tulid.runtime import (
     FileExecutionJobStore,
     JsonlEventStore,
     TransactionJournalStore,
+    VerificationResult,
     build_event,
     recover_completion_transactions,
 )
@@ -299,6 +301,47 @@ def test_completion_marks_terminal_failed_job_submission_as_ignored(tmp_path: Pa
     assert result.accepted is False
     assert result.errors[0].code == "completion.job_terminal"
     assert [event.event_type for event in events.iter_events()] == ["ExecutionCompletionIgnored"]
+
+
+def test_late_rejected_completion_does_not_resurrect_failed_job(tmp_path: Path):
+    store = _job_store(tmp_path)
+    events = JsonlEventStore(tmp_path / "events")
+
+    class FailingAfterExecutorVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            assert store.update_status(
+                "01J00000000000000000000JOB",
+                "failed",
+                metadata={"failure_reason": "completion_not_accepted"},
+            ).accepted is True
+            return VerificationResult(False, errors=(DomainError(
+                code="completion.changed_files_missing",
+                message="Changed-file evidence is required for this transition.",
+            ),))
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+        verifier=FailingAfterExecutorVerifier(),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="late rejection"),
+    )
+
+    loaded = store.get("01J00000000000000000000JOB")
+    assert result.accepted is False
+    assert result.errors[0].code == "completion.job_terminal"
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert [event.event_type for event in events.iter_events()] == [
+        EventType.ExecutionCompletionSubmitted,
+        "ExecutionCompletionIgnored",
+    ]
 
 
 def test_completion_promotes_changed_files_into_repo_root(tmp_path: Path):
@@ -685,6 +728,50 @@ def test_completion_runs_trusted_validation_instead_of_only_trusting_evidence(tm
 
     assert result.accepted is False
     assert {error.code for error in result.errors} == {"completion.validation_failed"}
+
+
+def test_completion_runs_trusted_validation_in_host_owned_workspace_copy(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    workspace.chmod(0o555)
+    workflow = _workflow_with_requires(RequirementDefinition(
+        artifacts=("result.md",),
+        validations=(ValidationCallDefinition(type="tests_pass", args=MappingProxyType({
+            "command": (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('dist').mkdir(); Path('dist/probe.txt').write_text('ok')",
+            ),
+        })),),
+    ))
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+        validation_context_factory=lambda workspace, output_root: WorkflowExecutionContext(
+            project_root=workspace,
+            vault_root=output_root,
+        ),
+    )
+
+    try:
+        result = service.submit(
+            job_id="01J00000000000000000000JOB",
+            token="secret",
+            submission=CompletionSubmission(
+                summary="done",
+                artifacts=("result.md",),
+                validation_evidence={"tests_pass": "passed"},
+            ),
+        )
+    finally:
+        workspace.chmod(0o755)
+
+    assert result.accepted is True
+    assert not (workspace / "dist").exists()
 
 
 def test_completion_rejects_duplicate_submission_entries(tmp_path: Path):

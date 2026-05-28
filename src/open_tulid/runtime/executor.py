@@ -832,6 +832,8 @@ def _render_prompt_paths_section(variant: str, *, required_artifacts: tuple[str,
     else:
         lines.extend((
             "Use workspace files as needed to complete this transition.",
+            "If repository files are present in the workspace, inspect them before writing product, technical, implementation, or breakdown artifacts.",
+            "Treat repository source files as read-only context for planning transitions; write required artifacts under `output/`.",
             "Write required completion artifacts under `output/`.",
         ))
     return "\n".join(lines)
