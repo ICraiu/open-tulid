@@ -176,6 +176,11 @@ class JobExecutor:
                 prompt_packet = prompt_result.packet
                 if prompt_packet is not None:
                     prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
+            prompt_text = _append_final_completion_reminder(
+                prompt_text,
+                required_artifacts=transition.requires.artifacts,
+                required_validations=tuple(call.type for call in transition.requires.validations),
+            )
             prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
 
             self.job_store.update_status(
@@ -699,6 +704,40 @@ def _build_runtime_prompt(
     return "\n".join(sections)
 
 
+def _append_final_completion_reminder(
+    prompt_text: str,
+    *,
+    required_artifacts: tuple[str, ...],
+    required_validations: tuple[str, ...],
+) -> str:
+    validations = ", ".join(required_validations) if required_validations else "none"
+    lines = [
+        "## Final Required Step",
+        "ULTRA IMPORTANT: do not stop after editing files, running tests, or building the project.",
+        "ULTRA IMPORTANT: before exiting successfully, submit completion evidence with `curl` exactly as shown below.",
+        "ULTRA IMPORTANT: if `curl` is missing or the request fails, treat that as a blocking runtime error and report it instead of exiting successfully.",
+        "",
+        "```sh",
+        "curl -sS -X POST \\",
+        "  -H \"content-type: application/json\" \\",
+        "  -H \"x-open-tulid-completion-token: $OPEN_TULID_COMPLETION_TOKEN\" \\",
+        "  \"$OPEN_TULID_COMPLETION_ENDPOINT\" \\",
+        "  --data-binary @- <<'JSON'",
+        "{",
+        "    \"summary\": \"what changed\",",
+        _completion_artifacts_line(required_artifacts),
+        "    \"changed_files\": [\"relative/workspace/path\"],",
+        "    \"validation_evidence\": {\"validation-id\": \"command/result evidence\"}",
+        "}",
+        "JSON",
+        "```",
+        "",
+        f"Required validations to report: {validations}.",
+        "A zero exit code without this curl completion submission is a failed Tulid job.",
+    ]
+    return f"{prompt_text.rstrip()}\n\n" + "\n".join(lines)
+
+
 def _runtime_prompt_variant(
     *,
     transition_id: str,
@@ -826,24 +865,34 @@ def _render_prompt_completion_section(
         "Use `changed_files` for every workspace path you modified outside `output/`.",
         "Use `validation_evidence` to report concrete command or result evidence for each required validation.",
         "",
-        "When ready, submit completion evidence with:",
+        "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`.",
+        "Do not exit successfully until the curl request has been made and accepted.",
         "",
         "```sh",
         "curl -sS -X POST \\",
         "  -H \"content-type: application/json\" \\",
         "  -H \"x-open-tulid-completion-token: $OPEN_TULID_COMPLETION_TOKEN\" \\",
-        f"  \"$OPEN_TULID_COMPLETION_ENDPOINT\" \\",
-        "  -d '{",
+        "  \"$OPEN_TULID_COMPLETION_ENDPOINT\" \\",
+        "  --data-binary @- <<'JSON'",
+        "{",
         "    \"summary\": \"what changed\",",
-        "    \"artifacts\": [{\"type\": \"artifact-type\", \"path\": \"relative/path/in/output\"}],",
+        _completion_artifacts_line(required_artifacts),
         "    \"changed_files\": [\"relative/workspace/path\"],",
         "    \"validation_evidence\": {\"validation-id\": \"command/result evidence\"}",
-        "  }'",
+        "}",
+        "JSON",
         "```",
         "",
         "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
     ))
     return "\n".join(lines)
+
+
+def _completion_artifacts_line(required_artifacts: tuple[str, ...]) -> str:
+    if not required_artifacts:
+        return '    "artifacts": [],'
+    artifact_example = f'{{"type": "{required_artifacts[0]}", "path": "relative/path/in/output"}}'
+    return f'    "artifacts": [{artifact_example}],'
 
 
 def _worker_args(

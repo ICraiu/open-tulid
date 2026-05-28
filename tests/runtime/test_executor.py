@@ -92,6 +92,10 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
     assert "This implementation transition does not require artifacts, so leave `output/` alone unless Tulid explicitly requires it." in prompt
     assert "## Completion Contract" in prompt
     assert "Completion is not implied by process exit code or workspace edits alone." in prompt
+    assert "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`." in prompt
+    assert "curl -sS -X POST \\" in prompt
+    assert "--data-binary @- <<'JSON'" in prompt
+    assert '"artifacts": [],' in prompt
 
 
 def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
@@ -213,6 +217,11 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     assert str(seen["endpoint"]).startswith("http://127.0.0.1:")
     assert seen["prompt"] == "/workspace/project/.open-tulid/prompt-packet.md"
     assert (workspace / ".open-tulid" / "prompt-packet.md").is_file()
+    prompt = (workspace / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
+    assert "## Final Required Step" in prompt
+    assert "ULTRA IMPORTANT: before exiting successfully, submit completion evidence with `curl` exactly as shown below." in prompt
+    assert "curl -sS -X POST \\" in prompt
+    assert prompt.rstrip().endswith("A zero exit code without this curl completion submission is a failed Tulid job.")
     assert adapter.moved_to == "CodeReview"
     loaded = store.get(JOB_ID)
     assert loaded.job is not None
