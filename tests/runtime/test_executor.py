@@ -75,6 +75,8 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
         to_state="SelfReview1",
         required_artifacts=(),
         required_validations=("tests_pass",),
+        required_validation_details=("tests_pass: run `npm test`",),
+        changed_files_required=True,
         derived_artifact_type=None,
         completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
@@ -91,6 +93,9 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
     assert "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files" in prompt
     assert "This implementation transition does not require artifacts, so leave `output/` alone unless Tulid explicitly requires it." in prompt
     assert "## Completion Contract" in prompt
+    assert "Required validation commands:" in prompt
+    assert "- tests_pass: run `npm test`" in prompt
+    assert "`changed_files` is required for this transition." in prompt
     assert "Completion is not implied by process exit code or workspace edits alone." in prompt
     assert "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`." in prompt
     assert "curl -sS -X POST \\" in prompt
@@ -108,6 +113,8 @@ def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
         to_state="SpecReady",
         required_artifacts=("ImplementationSpec",),
         required_validations=(),
+        required_validation_details=(),
+        changed_files_required=False,
         derived_artifact_type=None,
         completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
@@ -133,6 +140,8 @@ def test_build_runtime_prompt_for_derived_transition_requires_artifact_submissio
         to_state="Done",
         required_artifacts=(),
         required_validations=(),
+        required_validation_details=(),
+        changed_files_required=False,
         derived_artifact_type="ImplementationTaskFile",
         completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )

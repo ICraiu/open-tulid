@@ -10,7 +10,7 @@ from typing import Mapping
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.containers.runtime import AgentRunResult, ContainerMount, request_for_worker, run_agent_container
-from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, WorkflowDefinition
+from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, ValidationCallDefinition, WorkflowDefinition
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime.completion import CompletionService
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
@@ -137,7 +137,9 @@ class JobExecutor:
                 from_state=transition.from_state,
                 to_state=transition.to_state,
                 required_artifacts=transition.requires.artifacts,
-                required_validations=tuple(call.type for call in transition.requires.validations),
+                required_validations=_validation_ids(transition.requires.validations),
+                required_validation_details=_validation_details(transition.requires.validations),
+                changed_files_required=transition.requires.changed_files_required,
                 derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
                 completion_endpoint=endpoint.url,
             )
@@ -179,7 +181,9 @@ class JobExecutor:
             prompt_text = _append_final_completion_reminder(
                 prompt_text,
                 required_artifacts=transition.requires.artifacts,
-                required_validations=tuple(call.type for call in transition.requires.validations),
+                required_validations=_validation_ids(transition.requires.validations),
+                required_validation_details=_validation_details(transition.requires.validations),
+                changed_files_required=transition.requires.changed_files_required,
             )
             prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
 
@@ -660,6 +664,24 @@ def _write_prompt_packet(workspace: Path, text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _validation_ids(validations: tuple[ValidationCallDefinition, ...]) -> tuple[str, ...]:
+    return tuple(call.type for call in validations)
+
+
+def _validation_details(validations: tuple[ValidationCallDefinition, ...]) -> tuple[str, ...]:
+    details: list[str] = []
+    for call in validations:
+        command = call.args.get("command")
+        if isinstance(command, str) and command.strip():
+            details.append(f"{call.type}: run `{command.strip()}`")
+        elif call.args:
+            args = json.dumps(dict(call.args), sort_keys=True)
+            details.append(f"{call.type}: args `{args}`")
+        else:
+            details.append(call.type)
+    return tuple(details)
+
+
 def _build_runtime_prompt(
     *,
     job_id: str,
@@ -670,6 +692,8 @@ def _build_runtime_prompt(
     to_state: str,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
+    required_validation_details: tuple[str, ...],
+    changed_files_required: bool,
     derived_artifact_type: str | None,
     completion_endpoint: str,
 ) -> str:
@@ -699,6 +723,8 @@ def _build_runtime_prompt(
             completion_endpoint=completion_endpoint,
             required_artifacts=required_artifacts,
             required_validations=required_validations,
+            required_validation_details=required_validation_details,
+            changed_files_required=changed_files_required,
             derived_artifact_type=derived_artifact_type,
             artifacts=artifacts,
             validations=validations,
@@ -715,6 +741,8 @@ def _append_final_completion_reminder(
     *,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
+    required_validation_details: tuple[str, ...],
+    changed_files_required: bool,
 ) -> str:
     validations = ", ".join(required_validations) if required_validations else "none"
     lines = [
@@ -739,6 +767,8 @@ def _append_final_completion_reminder(
         "```",
         "",
         f"Required validations to report: {validations}.",
+        *_render_validation_detail_lines(required_validation_details),
+        *_render_changed_files_required_lines(changed_files_required),
         "A zero exit code without this curl completion submission is a failed Tulid job.",
     ]
     return f"{prompt_text.rstrip()}\n\n" + "\n".join(lines)
@@ -844,6 +874,8 @@ def _render_prompt_completion_section(
     completion_endpoint: str,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
+    required_validation_details: tuple[str, ...],
+    changed_files_required: bool,
     derived_artifact_type: str | None,
     artifacts: str,
     validations: str,
@@ -872,6 +904,8 @@ def _render_prompt_completion_section(
         "Completion is not implied by process exit code or workspace edits alone.",
         "Use `changed_files` for every workspace path you modified outside `output/`.",
         "Use `validation_evidence` to report concrete command or result evidence for each required validation.",
+        *_render_validation_detail_lines(required_validation_details),
+        *_render_changed_files_required_lines(changed_files_required),
         "",
         "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`.",
         "Do not exit successfully until the curl request has been made and accepted.",
@@ -894,6 +928,25 @@ def _render_prompt_completion_section(
         "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
     ))
     return "\n".join(lines)
+
+
+def _render_validation_detail_lines(required_validation_details: tuple[str, ...]) -> tuple[str, ...]:
+    if not required_validation_details:
+        return ()
+    return (
+        "",
+        "Required validation commands:",
+        *tuple(f"- {detail}" for detail in required_validation_details),
+    )
+
+
+def _render_changed_files_required_lines(changed_files_required: bool) -> tuple[str, ...]:
+    if not changed_files_required:
+        return ()
+    return (
+        "",
+        "`changed_files` is required for this transition. Do not submit completion with an empty `changed_files` array.",
+    )
 
 
 def _completion_artifacts_line(required_artifacts: tuple[str, ...]) -> str:
