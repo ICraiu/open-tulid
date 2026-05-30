@@ -34,7 +34,7 @@ COMPLETION_SETTLE_STATUSES = frozenset({
     ExecutionJobStatus.COMPLETION_SUBMITTED.value,
 })
 
-DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 300.0
+DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 1800.0
 
 
 @dataclass(frozen=True)
@@ -941,6 +941,7 @@ def _render_prompt_completion_section(
         "",
         "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`.",
         "Do not exit successfully until the curl request has been made and accepted.",
+        "If the response says `completion.in_progress`, remain active and wait for the final completion response instead of exiting.",
         "",
         "```sh",
         "curl -sS -X POST \\",
@@ -958,6 +959,7 @@ def _render_prompt_completion_section(
         "```",
         "",
         "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
+        "If completion is still in progress, remain active and wait for the final completion response instead of exiting.",
     ))
     return "\n".join(lines)
 

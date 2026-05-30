@@ -20,7 +20,7 @@ class RuntimeConfig:
     container_workspace: str = "/workspace/project"
     repo_execution_mode: str = "serial"
     image_tag_prefix: str = "open-tulid/agent"
-    default_timeout_seconds: int = 3600
+    default_timeout_seconds: int = 7200
     failed_job_backoff_seconds: int = 60
     max_failed_attempts_per_transition: int = 0
     worker_images: dict[str, str] = field(default_factory=dict)

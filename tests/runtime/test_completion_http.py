@@ -5,10 +5,19 @@ import json
 import threading
 from dataclasses import dataclass
 
+import pytest
+
 from open_tulid.domain import DomainError
 from open_tulid.runtime.completion import CompletionResult
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
 from open_tulid.runtime.verifier import CompletionSubmission
+from socket_utils import can_bind_localhost
+
+
+pytestmark = pytest.mark.skipif(
+    not can_bind_localhost(),
+    reason="localhost socket binding is unavailable in this sandbox",
+)
 
 
 @dataclass

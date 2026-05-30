@@ -184,7 +184,7 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         raw, "image_tag_prefix", default="open-tulid/agent", table="runtime",
     )
 
-    timeout = raw.get("default_timeout_seconds", 3600)
+    timeout = raw.get("default_timeout_seconds", 7200)
     if isinstance(timeout, bool) or not isinstance(timeout, int):
         _fail("runtime.default_timeout_seconds must be an integer")
     if timeout <= 0:

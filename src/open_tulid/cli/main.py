@@ -379,13 +379,13 @@ def log_events(
 ) -> None:
     """Tail human-readable project events, or follow them when no line count is given."""
     config = _load_cli_config()
-    project_name = _resolve_project_name(config, project)
-    log_dir = _project_path(config, project_name) / "events"
+    project_names = _resolve_log_projects(config, project)
+    log_dirs = tuple(_project_path(config, project_name) / "events" for project_name in project_names)
     if lines is not None:
-        for line in _tail_human_logs(log_dir, lines):
+        for line in _tail_human_logs_many(log_dirs, lines):
             console.print(line)
         return
-    _follow_human_logs(log_dir)
+    _follow_human_logs_many(log_dirs)
 
 
 @jobs_app.command("schedule")
@@ -744,7 +744,7 @@ def runtime_start(
         state = _load_runtime_state(state_path)
         scheduler_running = state is not None and _pid_is_running(state.get("scheduler_pid"))
         scheduler_states[project_name] = (state_path, state, scheduler_running)
-        if state is not None and not scheduler_running:
+        if not scheduler_running:
             _fail_orphaned_runtime_jobs(config, project_name)
     if proxy_running and all(running for _, _, running in scheduler_states.values()):
         if len(projects) == 1:
@@ -1606,11 +1606,25 @@ def _resolve_projects(config: Config, project: str | None) -> list[str]:
     return list(config.projects)
 
 
+def _resolve_log_projects(config: Config, project: str | None) -> list[str]:
+    if project is not None:
+        _project_path(config, project)
+        return [project]
+    return list(config.projects)
+
+
 def _tail_human_logs(log_dir: Path, lines: int) -> tuple[str, ...]:
     gathered: list[str] = []
     for path in sorted(log_dir.glob("*.log")):
         gathered.extend(path.read_text(encoding="utf-8").splitlines())
     return tuple(gathered[-lines:])
+
+
+def _tail_human_logs_many(log_dirs: tuple[Path, ...], lines: int) -> tuple[str, ...]:
+    gathered: list[str] = []
+    for log_dir in log_dirs:
+        gathered.extend(_tail_human_logs(log_dir, lines))
+    return tuple(sorted(gathered)[-lines:])
 
 
 def _follow_human_logs(log_dir: Path, *, poll_interval: float = 0.2) -> None:
@@ -1627,6 +1641,27 @@ def _follow_human_logs(log_dir: Path, *, poll_interval: float = 0.2) -> None:
                     for line in handle:
                         console.print(line.rstrip("\n"))
                     positions[path] = handle.tell()
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        return
+
+
+def _follow_human_logs_many(log_dirs: tuple[Path, ...], *, poll_interval: float = 0.2) -> None:
+    positions = {
+        path: path.stat().st_size
+        for log_dir in log_dirs
+        for path in sorted(log_dir.glob("*.log"))
+    }
+    try:
+        while True:
+            for log_dir in log_dirs:
+                for path in sorted(log_dir.glob("*.log")):
+                    offset = positions.get(path, 0)
+                    with path.open("r", encoding="utf-8") as handle:
+                        handle.seek(offset)
+                        for line in handle:
+                            console.print(line.rstrip("\n"))
+                        positions[path] = handle.tell()
             time.sleep(poll_interval)
     except KeyboardInterrupt:
         return
@@ -1744,6 +1779,7 @@ def _reconcile_active_runtime_jobs(
     orphanable = {
         ExecutionJobStatus.PENDING.value,
         ExecutionJobStatus.RUNNING.value,
+        ExecutionJobStatus.COMPLETION_SUBMITTED.value,
         ExecutionJobStatus.COMPLETION_REJECTED.value,
     }
     for job in listed.jobs:

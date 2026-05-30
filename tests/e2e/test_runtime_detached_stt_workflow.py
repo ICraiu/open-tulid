@@ -94,13 +94,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         )
 
         event_store = JsonlEventStore(project.project / "events")
-        events = list(event_store.iter_events())
-        transition_ids = {
-            event.transition_id
-            for event in events
-            if event.event_type == "TransitionAccepted" and event.transition_id is not None
-        }
-        assert {
+        expected_transition_ids = {
             "DraftDirection",
             "ApproveDirection",
             "WriteImplementationSpec",
@@ -108,7 +102,20 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "ImplementTask",
             "SelfReviewPass1",
             "SelfReviewPass2",
-        }.issubset(transition_ids)
+        }
+
+        def accepted_transition_ids() -> set[str]:
+            return {
+                event.transition_id
+                for event in event_store.iter_events()
+                if event.event_type == "TransitionAccepted" and event.transition_id is not None
+            }
+
+        _wait_for(
+            lambda: expected_transition_ids.issubset(accepted_transition_ids()),
+            "all transition acceptance events to be written",
+        )
+        assert expected_transition_ids.issubset(accepted_transition_ids())
 
         scheduler_stdout = _scheduler_stdout(project)
         assert "SCHEDULER_SCHEDULED project=Agent" in scheduler_stdout

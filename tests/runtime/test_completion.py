@@ -311,6 +311,7 @@ def test_completion_rejects_concurrent_submission_while_validation_is_in_progres
 
     assert result.accepted is False
     assert result.errors[0].code == "completion.in_progress"
+    assert "Remain active and wait for final completion feedback" in result.errors[0].message
     assert tuple(events.iter_events()) == ()
 
 
@@ -392,8 +393,11 @@ def test_late_rejected_completion_does_not_resurrect_failed_job(tmp_path: Path):
     assert result.errors[0].code == "completion.job_terminal"
     assert loaded.job is not None
     assert loaded.job.status == "failed"
+    assert "completion_validation_duration_seconds" in loaded.job.metadata
     assert [event.event_type for event in events.iter_events()] == [
         EventType.ExecutionCompletionSubmitted,
+        "ExecutionCompletionValidationStarted",
+        "ExecutionCompletionValidationFinished",
         "ExecutionCompletionIgnored",
     ]
 

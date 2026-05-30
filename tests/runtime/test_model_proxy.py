@@ -5,6 +5,8 @@ from urllib.error import HTTPError, URLError
 from email.message import Message
 import urllib.request
 
+import pytest
+
 from open_tulid.runtime import (
     check_backend_readiness,
     FileModelProxySessionStore,
@@ -20,6 +22,7 @@ from open_tulid.runtime.model_proxy import _proxy_response_headers
 from open_tulid.models import ModelProxyConfig
 from open_tulid.models import ResourceConfig
 from open_tulid.runtime import FileResourceLeaseStore
+from socket_utils import can_bind_localhost
 
 
 class EchoAdapter:
@@ -55,6 +58,10 @@ def test_model_proxy_validates_session_and_writes_full_transcript(tmp_path: Path
     assert '"response_body": "answer"' in transcript
 
 
+@pytest.mark.skipif(
+    not can_bind_localhost(),
+    reason="localhost socket binding is unavailable in this sandbox",
+)
 def test_model_proxy_serves_http_requests(tmp_path: Path):
     sessions = ModelProxySessionStore()
     session = sessions.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm")

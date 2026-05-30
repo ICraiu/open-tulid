@@ -28,7 +28,7 @@ runtime:
   shared_workspace_root: workspaces
   container_workspace: /workspace/project
   image_tag_prefix: open-tulid/agent
-  default_timeout_seconds: 3600
+  default_timeout_seconds: 7200
   # Wait this long before retrying a failed task transition.
   failed_job_backoff_seconds: 60
   # 0 means retry forever. Set a positive number to stop after that many failed jobs

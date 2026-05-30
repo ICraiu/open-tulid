@@ -78,6 +78,31 @@ def test_log_with_count_prints_recent_human_event_lines(tmp_path: Path):
     )
 
 
+def test_log_without_project_reads_all_configured_projects(tmp_path: Path):
+    _write_config(tmp_path, projects=("Agent", "STT-clipboard"))
+    first_events = tmp_path / "Agent" / "events"
+    second_events = tmp_path / "STT-clipboard" / "events"
+    first_events.mkdir()
+    second_events.mkdir()
+    (first_events / "2026-05-14.log").write_text(
+        ">>> 2026-05-14T10:00:00Z AGENT\n",
+        encoding="utf-8",
+    )
+    (second_events / "2026-05-15.log").write_text(
+        ">>> 2026-05-15T10:00:00Z CLIPBOARD\n",
+        encoding="utf-8",
+    )
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["log", "2"])
+
+    assert result.exit_code == 0
+    assert result.output == (
+        ">>> 2026-05-14T10:00:00Z AGENT\n"
+        ">>> 2026-05-15T10:00:00Z CLIPBOARD\n"
+    )
+
+
 def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
 
@@ -272,6 +297,37 @@ def test_runtime_start_fails_active_jobs_from_dead_prior_scheduler(tmp_path: Pat
     assert loaded.job.status == "failed"
 
 
+def test_runtime_start_fails_active_jobs_even_without_prior_state_file(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    job_store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert job_store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="task-1",
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "workspace"),
+    )).accepted is True
+    assert job_store.update_status("01J00000000000000000000JOB", "completion_submitted").accepted is True
+
+    processes = iter((type("ProxyProcess", (), {"pid": 4321})(), type("SchedulerProcess", (), {"pid": 6543})()))
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: False)
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: next(processes))
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
+    monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start"])
+
+    loaded = job_store.get("01J00000000000000000000JOB")
+    assert result.exit_code == 0
+    assert "JOB_ORPHANED project=Agent" in result.output
+    assert "job=01J00000000000000000000JOB prior_status=completion_submitted" in result.output
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+
+
 def test_proxy_listener_ready_retries_until_listener_accepts(monkeypatch):
     attempts = {"count": 0}
 
@@ -429,6 +485,47 @@ def test_runtime_stop_fails_active_jobs_and_stops_worker_containers(tmp_path: Pa
     assert loaded.job is not None
     assert loaded.job.status == "failed"
     assert docker_calls == [("docker", "rm", "-f", "open-tulid-job-01j00000000000000000000job")]
+
+
+def test_runtime_stop_fails_completion_submitted_jobs(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
+    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    job_store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert job_store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="task-1",
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "workspace"),
+    )).accepted is True
+    assert job_store.update_status("01J00000000000000000000JOB", "completion_submitted").accepted is True
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
+    monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: True)
+    monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr(
+        "open_tulid.cli.main.subprocess.run",
+        lambda args, *, check, capture_output, text, timeout: subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="No such container",
+        ),
+    )
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "stop"])
+
+    loaded = job_store.get("01J00000000000000000000JOB")
+    assert result.exit_code == 0
+    assert "JOB_ORPHANED project=Agent" in result.output
+    assert "job=01J00000000000000000000JOB prior_status=completion_submitted" in result.output
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
 
 
 def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, monkeypatch):

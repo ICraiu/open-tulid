@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -113,7 +114,10 @@ class CompletionService:
         if _status(job.status) == ExecutionJobStatus.COMPLETION_SUBMITTED.value:
             return CompletionResult(False, errors=(_error(
                 "completion.in_progress",
-                f"Execution job {job.job_id!r} already has a completion being validated.",
+                (
+                    f"Execution job {job.job_id!r} already has a completion being validated. "
+                    "Remain active and wait for final completion feedback; do not exit successfully yet."
+                ),
                 job.job_id,
             ),))
 
@@ -186,14 +190,53 @@ class CompletionService:
             metadata={
                 "active_submission_id": submission_id,
                 "completion_submitted_at": utc_now(),
+                "completion_validation_started_at": utc_now(),
             },
         )
 
-        verification = self.verifier.verify(
-            workspace=Path(job.workspace_path),
-            output_dir=Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
-            transition=transition,
-            submission=submission,
+        validation_started = time.monotonic()
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="completion-verifier"),
+            event_type="ExecutionCompletionValidationStarted",
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            submission_id=submission_id,
+            data={
+                "validations": tuple(call.type for call in transition.requires.validations),
+                "changed_files": list(submission.changed_files),
+                "artifact_count": len(submission.artifacts),
+            },
+        ))
+        try:
+            verification = self.verifier.verify(
+                workspace=Path(job.workspace_path),
+                output_dir=Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
+                transition=transition,
+                submission=submission,
+            )
+        except Exception as exc:
+            duration_seconds = round(time.monotonic() - validation_started, 3)
+            self._record_validation_finished(
+                job=job,
+                submission_id=submission_id,
+                accepted=False,
+                duration_seconds=duration_seconds,
+                error_codes=("completion.validation_exception",),
+                error_count=1,
+                detail=str(exc),
+            )
+            raise
+        duration_seconds = round(time.monotonic() - validation_started, 3)
+        self._record_validation_finished(
+            job=job,
+            submission_id=submission_id,
+            accepted=verification.accepted,
+            duration_seconds=duration_seconds,
+            error_codes=tuple(error.code for error in verification.errors),
+            error_count=len(verification.errors),
         )
         if not verification.accepted:
             current = self.job_store.get(job.job_id)
@@ -425,6 +468,50 @@ class CompletionService:
             },
         )
         return CompletionResult(True, verification=verification)
+
+    def _record_validation_finished(
+        self,
+        *,
+        job,
+        submission_id: str,
+        accepted: bool,
+        duration_seconds: float,
+        error_codes: tuple[str, ...],
+        error_count: int,
+        detail: str | None = None,
+    ) -> None:
+        data = {
+            "accepted": accepted,
+            "duration_seconds": duration_seconds,
+            "error_codes": list(error_codes),
+            "error_count": error_count,
+        }
+        if detail is not None:
+            data["detail"] = detail
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="completion-verifier"),
+            event_type="ExecutionCompletionValidationFinished",
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            submission_id=submission_id,
+            data=data,
+        ))
+        current = self.job_store.get(job.job_id)
+        if not current.accepted or current.job is None:
+            return
+        self.job_store.update_status(
+            job.job_id,
+            current.job.status,
+            metadata={
+                "completion_validation_finished_at": utc_now(),
+                "completion_validation_duration_seconds": duration_seconds,
+                "completion_validation_error_codes": tuple(error_codes),
+                "completion_validation_error_count": error_count,
+            },
+        )
 
     def _existing_task_ids(self, task_id: str) -> tuple[tuple[str, ...], tuple[DomainError, ...]]:
         loaded = self.adapter.load_project()

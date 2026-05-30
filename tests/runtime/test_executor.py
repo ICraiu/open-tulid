@@ -8,6 +8,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+import pytest
+
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
 from open_tulid.containers.runtime import AgentRunResult, ContainerMount
 from open_tulid.domain import (
@@ -28,10 +30,37 @@ from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, R
 from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
 from open_tulid.runtime.executor import _build_runtime_prompt
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
+from socket_utils import can_bind_localhost
 
 
 TASK_ID = "01J00000000000000000000001"
 JOB_ID = "01J00000000000000000000JOB"
+
+
+@dataclass(frozen=True)
+class _FakeCompletionEndpoint:
+    job_id: str
+    host: str = "127.0.0.1"
+    port: int = 1
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:1/jobs/{self.job_id}/complete"
+
+    def stop(self) -> None:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _fake_completion_endpoint_when_sockets_unavailable(request, monkeypatch):
+    if can_bind_localhost():
+        return
+    if request.node.name == "test_executor_serves_completion_endpoint_and_accepts_before_worker_exit":
+        pytest.skip("localhost socket binding is unavailable in this sandbox")
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.JobExecutor._start_completion_endpoint",
+        lambda self, job_id: _FakeCompletionEndpoint(job_id),
+    )
 
 
 @dataclass
