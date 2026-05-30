@@ -260,6 +260,60 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     ]
 
 
+def test_completion_marks_job_as_submitted_before_expensive_verification(tmp_path: Path):
+    store = _job_store(tmp_path)
+    events = JsonlEventStore(tmp_path / "events")
+
+    class ObservingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            loaded = store.get("01J00000000000000000000JOB")
+            assert loaded.job is not None
+            assert loaded.job.status == "completion_submitted"
+            assert loaded.job.metadata["active_submission_id"]
+            return VerificationResult(True)
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+        verifier=ObservingVerifier(),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="done"),
+    )
+
+    assert result.accepted is True
+    loaded = store.get("01J00000000000000000000JOB")
+    assert loaded.job is not None
+    assert loaded.job.status == "accepted"
+
+
+def test_completion_rejects_concurrent_submission_while_validation_is_in_progress(tmp_path: Path):
+    store = _job_store(tmp_path)
+    assert store.update_status("01J00000000000000000000JOB", "completion_submitted").accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="retry"),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "completion.in_progress"
+    assert tuple(events.iter_events()) == ()
+
+
 def test_completion_replays_terminal_accepted_job_as_idempotent_success(tmp_path: Path):
     store = _job_store(tmp_path)
     assert store.update_status("01J00000000000000000000JOB", "accepted").accepted is True

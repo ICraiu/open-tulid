@@ -12,7 +12,7 @@ from ruamel.yaml import YAML
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, WorkflowDefinition
-from open_tulid.runtime.events import JsonlEventStore, build_event, new_ulid
+from open_tulid.runtime.events import JsonlEventStore, build_event, new_ulid, utc_now
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
@@ -110,6 +110,13 @@ class CompletionService:
         if _status(job.status) == ExecutionJobStatus.ACCEPTED.value:
             return CompletionResult(True)
 
+        if _status(job.status) == ExecutionJobStatus.COMPLETION_SUBMITTED.value:
+            return CompletionResult(False, errors=(_error(
+                "completion.in_progress",
+                f"Execution job {job.job_id!r} already has a completion being validated.",
+                job.job_id,
+            ),))
+
         if _status(job.status) in TERMINAL_JOB_STATUSES:
             self.event_store.append(build_event(
                 project_id=job.project_id,
@@ -173,6 +180,14 @@ class CompletionService:
                 "validation_evidence": dict(submission.validation_evidence),
             },
         ))
+        self.job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.COMPLETION_SUBMITTED,
+            metadata={
+                "active_submission_id": submission_id,
+                "completion_submitted_at": utc_now(),
+            },
+        )
 
         verification = self.verifier.verify(
             workspace=Path(job.workspace_path),

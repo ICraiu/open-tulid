@@ -85,6 +85,7 @@ class EventType(str, Enum):
 class ExecutionJobStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    COMPLETION_SUBMITTED = "completion_submitted"
     COMPLETION_REJECTED = "completion_rejected"
     ACCEPTED = "accepted"
     FAILED = "failed"

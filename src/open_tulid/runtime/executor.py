@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,12 @@ TERMINAL_JOB_STATUSES = frozenset({
     ExecutionJobStatus.STALE.value,
     ExecutionJobStatus.CANCELLED.value,
 })
+
+COMPLETION_SETTLE_STATUSES = frozenset({
+    ExecutionJobStatus.COMPLETION_SUBMITTED.value,
+})
+
+DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,7 @@ class JobExecutor:
         model_proxy_endpoint_base: str | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
+        completion_settle_timeout_seconds: float = DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -72,6 +80,7 @@ class JobExecutor:
         self.model_proxy_endpoint_base = model_proxy_endpoint_base
         self.validation_implementations = validation_implementations
         self.validation_context_factory = validation_context_factory
+        self.completion_settle_timeout_seconds = completion_settle_timeout_seconds
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -253,14 +262,18 @@ class JobExecutor:
                 status="running",
                 started_at=started_at,
             )
+            result = None
             try:
                 result = _run_agent_container_with_logs(
                     request,
                     docker_executable=self.runtime.docker_executable,
                     log_dir=log_dir,
                 )
+                if result.succeeded:
+                    self._wait_for_completion_settlement(job.job_id)
             finally:
                 endpoint.stop()
+            assert result is not None
             finished_at = _utc_now()
             _write_run_logs_with_metadata(
                 Path(job.workspace_path),
@@ -347,6 +360,25 @@ class JobExecutor:
                 self.lease_store.release_job(job.job_id)
             if self.model_proxy_sessions is not None:
                 self.model_proxy_sessions.revoke_job(job.job_id)
+
+    def _wait_for_completion_settlement(self, job_id: str) -> None:
+        deadline = time.monotonic() + max(0.0, self.completion_settle_timeout_seconds)
+        while True:
+            loaded = self.job_store.get(job_id)
+            status = (
+                str(
+                    loaded.job.status.value
+                    if hasattr(loaded.job.status, "value")
+                    else loaded.job.status
+                )
+                if loaded.accepted and loaded.job is not None
+                else ""
+            )
+            if status not in COMPLETION_SETTLE_STATUSES:
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.25)
 
     def _start_completion_endpoint(self, job_id: str) -> "_ManagedCompletionEndpoint":
         service = CompletionService(

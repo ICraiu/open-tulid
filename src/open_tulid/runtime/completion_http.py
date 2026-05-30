@@ -179,7 +179,7 @@ def _status_for_errors(errors: tuple[DomainError, ...]) -> int:
         return 404
     if "completion.identity_mismatch" in codes or "completion.job_not_bound" in codes:
         return 403
-    if "completion.job_terminal" in codes:
+    if "completion.job_terminal" in codes or "completion.in_progress" in codes:
         return 409
     return 400
 

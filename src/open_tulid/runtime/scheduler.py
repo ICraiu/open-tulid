@@ -501,6 +501,7 @@ def _has_accepted_job(jobs: list[ExecutionJob]) -> bool:
 _ACTIVE_REPO_LANE_JOB_STATUSES = frozenset({
     ExecutionJobStatus.PENDING.value,
     ExecutionJobStatus.RUNNING.value,
+    ExecutionJobStatus.COMPLETION_SUBMITTED.value,
     ExecutionJobStatus.COMPLETION_REJECTED.value,
     ExecutionJobStatus.STALE.value,
 })
