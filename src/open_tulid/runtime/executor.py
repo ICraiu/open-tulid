@@ -10,7 +10,7 @@ from threading import Thread
 from typing import Mapping
 
 from open_tulid.adapters.base import StorageAdapter
-from open_tulid.containers.runtime import AgentRunResult, ContainerMount, request_for_worker, run_agent_container
+from open_tulid.containers import AgentRunResult, ContainerMount, ContainersService, build_containers_service
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, ValidationCallDefinition, WorkflowDefinition
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime.completion import CompletionService
@@ -35,6 +35,7 @@ COMPLETION_SETTLE_STATUSES = frozenset({
 })
 
 DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 1800.0
+_active_containers_service: ContainersService | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class JobExecutor:
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
         completion_settle_timeout_seconds: float = DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS,
+        containers: ContainersService | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -81,6 +83,7 @@ class JobExecutor:
         self.validation_implementations = validation_implementations
         self.validation_context_factory = validation_context_factory
         self.completion_settle_timeout_seconds = completion_settle_timeout_seconds
+        self.containers = containers or build_containers_service()
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -238,7 +241,7 @@ class JobExecutor:
                 env=model_proxy_env,
             )
 
-            request = request_for_worker(
+            request = self.containers.request_for_worker(
                 worker_id=_execution_worker_id(worker, job.worker_id),
                 workspace=prepared.workspace,
                 runtime=self.runtime,
@@ -265,6 +268,7 @@ class JobExecutor:
             result = None
             try:
                 result = _run_agent_container_with_logs(
+                    self.containers,
                     request,
                     docker_executable=self.runtime.docker_executable,
                     log_dir=log_dir,
@@ -509,17 +513,37 @@ def _agent_log_dir(workspace: Path) -> Path:
 
 
 def _run_agent_container_with_logs(
+    containers: ContainersService,
     request,
     *,
     docker_executable: str,
     log_dir: Path,
 ) -> AgentRunResult:
+    global _active_containers_service
+    previous = _active_containers_service
+    _active_containers_service = containers
     try:
         return run_agent_container(request, docker_executable=docker_executable, log_dir=log_dir)
     except TypeError as exc:
         if "log_dir" not in str(exc):
             raise
         return run_agent_container(request, docker_executable=docker_executable)
+    finally:
+        _active_containers_service = previous
+
+
+def run_agent_container(
+    request,
+    *,
+    docker_executable: str,
+    log_dir: Path | None = None,
+) -> AgentRunResult:
+    service = _active_containers_service or build_containers_service()
+    return service.run_agent_container(
+        request,
+        docker_executable=docker_executable,
+        log_dir=log_dir,
+    )
 
 
 def _write_run_logs_with_metadata(

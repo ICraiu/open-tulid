@@ -6,6 +6,7 @@ from .images import (
     get_agent_image_spec,
     list_agent_image_specs,
 )
+from .service import ContainersService, DefaultContainersService, build_containers_service
 from .project_images import (
     PROJECT_DOCKERFILE,
     ProjectImageBuildResult,
@@ -30,6 +31,8 @@ from .runtime import (
 __all__ = [
     "AgentImageSpec",
     "ImageBuildResult",
+    "ContainersService",
+    "DefaultContainersService",
     "DockerAvailability",
     "DockerInstallPlan",
     "AgentRunRequest",
@@ -39,6 +42,7 @@ __all__ = [
     "ProjectImageBuildResult",
     "build_agent_image",
     "build_agent_images",
+    "build_containers_service",
     "build_project_worker_image",
     "build_project_worker_images",
     "check_docker",

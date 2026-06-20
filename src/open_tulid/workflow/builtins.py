@@ -8,7 +8,7 @@ from .registry import (
     build_registries,
 )
 from .implementations import OPERATION_IMPLEMENTATIONS, VALIDATION_IMPLEMENTATIONS
-from open_tulid.containers.workers import run_codex_worker, run_opencode_worker
+from open_tulid.containers import ContainersService, build_containers_service
 
 VALIDATION_IDS = [
     "project_build",
@@ -55,8 +55,8 @@ WORKER_IMPLEMENTATIONS = {
     "shell_command": "shell_command",
     "human_approval": "human_approval",
     "noop": "noop",
-    "codex": run_codex_worker,
-    "opencode": run_opencode_worker,
+    "codex": "codex",
+    "opencode": "opencode",
 }
 
 def _build_validations() -> list[ValidationSpec]:
@@ -77,18 +77,24 @@ def _build_operations() -> list[OperationSpec]:
     return specs
 
 
-def _build_workers() -> list[WorkerSpec]:
+def _build_workers(containers: ContainersService) -> list[WorkerSpec]:
     specs: list[WorkerSpec] = []
     for wid in WORKER_IDS:
-        specs.append(WorkerSpec(id=wid, implementation=WORKER_IMPLEMENTATIONS[wid]))
+        implementation = WORKER_IMPLEMENTATIONS[wid]
+        if implementation == "codex":
+            implementation = containers.run_codex_worker
+        elif implementation == "opencode":
+            implementation = containers.run_opencode_worker
+        specs.append(WorkerSpec(id=wid, implementation=implementation))
     return specs
 
 
-def get_builtin_registries() -> RuntimeRegistries:
+def get_builtin_registries(containers: ContainersService | None = None) -> RuntimeRegistries:
+    service = containers or build_containers_service()
     registries, diags = build_registries(
         validations=_build_validations(),
         operations=_build_operations(),
-        workers=_build_workers(),
+        workers=_build_workers(service),
     )
     if registries is None:
         raise RuntimeError(f"built-in registries failed to build: {diags}")

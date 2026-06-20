@@ -18,15 +18,7 @@ from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
 from open_tulid.config import CONFIG_DIRNAME, load_config
 from open_tulid.containers import (
-    build_project_worker_images,
-    build_agent_images,
-    check_docker,
-    default_shared_workspace_root,
-    docker_install_plan,
-    list_agent_image_specs,
-    project_dockerfile_path,
-    project_worker_ids,
-    runtime_with_project_images,
+    build_containers_service,
 )
 from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter
 from open_tulid.domain import EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
@@ -75,6 +67,23 @@ app = typer.Typer(
 )
 
 console = Console()
+containers = build_containers_service()
+
+
+def list_agent_image_specs(*args, **kwargs):
+    return containers.list_agent_image_specs(*args, **kwargs)
+
+
+def build_agent_images(*args, **kwargs):
+    return containers.build_agent_images(*args, **kwargs)
+
+
+def check_docker(*args, **kwargs):
+    return containers.check_docker(*args, **kwargs)
+
+
+def docker_install_plan(*args, **kwargs):
+    return containers.docker_install_plan(*args, **kwargs)
 
 
 def _load_cli_context(project: str | None = None) -> tuple[Config, WorkflowDefinition | None]:
@@ -619,6 +628,7 @@ def run_job(
         model_proxy_endpoint_base=_model_proxy_endpoint_base(ctx["config"]),
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
+        containers=ctx["containers"],
     )
     result = executor.run(job_id)
     if not result.accepted:
@@ -1333,7 +1343,7 @@ def _load_project_workflow(config: Config, project: str, project_path: Path) -> 
 
 
 def _project_dockerfile(config: Config, project: str, project_path: Path) -> Path:
-    return project_dockerfile_path(_project_config(config, project), project_path)
+    return containers.project_dockerfile_path(_project_config(config, project), project_path)
 
 
 def _require_project_dockerfile(config: Config, project: str, *, stop_runtime: bool = False) -> Path:
@@ -1358,14 +1368,14 @@ def _ensure_project_runtime_images(config: Config, project: str) -> None:
     project_path = _project_path(config, project)
     dockerfile = _require_project_dockerfile(config, project)
     workflow = _load_project_workflow(config, project, project_path)
-    worker_ids = project_worker_ids(workflow)
+    worker_ids = containers.project_worker_ids(workflow)
     if not worker_ids:
         console.print(_runtime_log_line(
             "PROJECT_IMAGE_SKIPPED",
             f"project={project} reason=no_worker_transitions",
         ))
         return
-    results = build_project_worker_images(
+    results = containers.build_project_worker_images(
         project=project,
         worker_ids=worker_ids,
         dockerfile=dockerfile,
@@ -1398,10 +1408,10 @@ def _apply_project_runtime_images_if_available(
     dockerfile = _project_dockerfile(config, project, project_path)
     if not dockerfile.is_file():
         return
-    config.runtime = runtime_with_project_images(
+    config.runtime = containers.runtime_with_project_images(
         config.runtime,
         project=project,
-        worker_ids=project_worker_ids(workflow),
+        worker_ids=containers.project_worker_ids(workflow),
     )
 
 
@@ -1475,9 +1485,10 @@ def _runtime_project_context(project: str) -> dict[str, object]:
         "event_store": event_store,
         "journal_store": journal_store,
         "project_path": project_path,
-        "workspace_root": default_shared_workspace_root(config.runtime, app_state),
+        "workspace_root": containers.default_shared_workspace_root(config.runtime, app_state),
         "lease_store": lease_store,
         "model_proxy_sessions": FileModelProxySessionStore(_model_proxy_session_root(config)),
+        "containers": containers,
     }
 
 
