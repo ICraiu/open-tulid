@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from open_tulid.domain.schema import DomainError, ProjectSnapshot, Task, WorkflowDefinition
+from open_tulid.models import Project, ValidationReport
 
 
 class AdapterCapability(str, Enum):
@@ -74,8 +75,22 @@ class StorageAdapter(Protocol):
 
 
 @runtime_checkable
+class TrackerFormat(Protocol):
+    name: str
+
+    def parse_task_row(self, line: str) -> str | None:
+        """Parse one tracker-specific board row into a task reference."""
+
+    def validate_link_file(self, project: Project, path: Path) -> ValidationReport:
+        """Validate one tracker-specific link/board file."""
+
+
+@runtime_checkable
 class StorageAdapterFactory(Protocol):
     adapter_type: str
 
     def build(self, request: AdapterBuildRequest) -> StorageAdapter:
         """Build one storage adapter instance from runtime configuration."""
+
+    def build_tracker_format(self) -> TrackerFormat:
+        """Build the tracker-specific syntax/validation implementation."""

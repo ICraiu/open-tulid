@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from open_tulid.domain import WorkflowDefinition
-from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter, default_adapter_type
+from open_tulid.adapters import (
+    AdapterBuildRequest,
+    build_storage_adapter,
+    build_tracker_format,
+    default_adapter_type,
+)
 from open_tulid.models import Config, Project, ValidationError, ValidationReport
 from open_tulid.runtime import TaskManager, ValidateProject
 from open_tulid.vault.links import validate_kanban_file
@@ -25,6 +30,7 @@ def validate_project(
     report.checked_projects += 1
 
     abs_project = project.path.resolve()
+    selected_tracker_type = tracker_type or default_adapter_type()
 
     for dir_name in REQUIRED_DIRS:
         dir_path = abs_project / dir_name
@@ -44,6 +50,15 @@ def validate_project(
     # Validate kanban directory contents
     kanban_dir = abs_project / "kanban"
     if kanban_dir.is_dir():
+        try:
+            tracker_format = build_tracker_format(selected_tracker_type)
+        except ValueError as exc:
+            report.errors.append(ValidationError(
+                path=project.path,
+                line=None,
+                message=f"tracker.format_unavailable: {exc}",
+            ))
+            return report
         for child in sorted(kanban_dir.iterdir()):
             if child.is_dir():
                 report.errors.append(ValidationError(
@@ -60,7 +75,7 @@ def validate_project(
                     message=f"Non-Markdown file in kanban/: {child.name}",
                 ))
             else:
-                kanban_report = validate_kanban_file(project, child)
+                kanban_report = validate_kanban_file(project, child, tracker_format)
                 report.errors.extend(kanban_report.errors)
                 report.checked_kanban_files += kanban_report.checked_kanban_files
                 report.checked_task_links += kanban_report.checked_task_links
@@ -70,7 +85,7 @@ def validate_project(
             adapter = build_storage_adapter(AdapterBuildRequest(
                 project_id=project.name,
                 project_root=abs_project,
-                tracker_type=tracker_type or default_adapter_type(),
+                tracker_type=selected_tracker_type,
                 workflow=workflow_definition,
             ))
         except ValueError as exc:

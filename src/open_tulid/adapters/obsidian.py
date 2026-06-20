@@ -21,7 +21,6 @@ from open_tulid.domain.schema import (
     Task,
     WorkflowDefinition,
 )
-from open_tulid.vault.links import parse_task_row
 
 from .base import (
     AdapterCapability,
@@ -29,6 +28,7 @@ from .base import (
     ReadTaskResult,
     WriteResult,
 )
+from .obsidian_format import parse_task_row
 
 
 ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
