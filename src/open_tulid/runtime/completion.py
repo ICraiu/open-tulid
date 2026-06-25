@@ -419,6 +419,20 @@ class CompletionService:
             events=events,
         )
         if not transaction.accepted:
+            self.event_store.append(build_event(
+                project_id=job.project_id,
+                actor=EventActor(type="system", id="task-manager-runtime"),
+                event_type="ExecutionCompletionAcceptanceFailed",
+                correlation_id=job.job_id,
+                task_id=job.task_id,
+                job_id=job.job_id,
+                transition_id=job.transition_id,
+                submission_id=submission_id,
+                data={
+                    "message": transaction.message,
+                    "error_codes": tuple(error.code for error in transaction.errors),
+                },
+            ))
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.FAILED,
@@ -844,13 +858,35 @@ def _commit_repo_changes(
     runner,
 ) -> subprocess.CompletedProcess[str]:
     command_runner = runner or _run_repo_command
-    added = command_runner(("git", "add", "--", *paths), repo_root)
+    committable_paths = _git_committable_paths(
+        repo_root=repo_root,
+        paths=paths,
+        runner=command_runner,
+    )
+    if not committable_paths:
+        return subprocess.CompletedProcess(("git", "add", "--", *paths), 0, "", "")
+    added = command_runner(("git", "add", "--", *committable_paths), repo_root)
     if added.returncode != 0:
         return added
-    committed = command_runner(("git", "commit", "-m", message, "--", *paths), repo_root)
+    committed = command_runner(("git", "commit", "-m", message, "--", *committable_paths), repo_root)
     if committed.returncode != 0 and _git_nothing_to_commit(committed):
         return subprocess.CompletedProcess(committed.args, 0, committed.stdout, committed.stderr)
     return committed
+
+
+def _git_committable_paths(
+    *,
+    repo_root: Path,
+    paths: tuple[str, ...],
+    runner,
+) -> tuple[str, ...]:
+    committable: list[str] = []
+    for path in paths:
+        ignored = runner(("git", "check-ignore", "-q", "--", path), repo_root)
+        if ignored.returncode == 0:
+            continue
+        committable.append(path)
+    return tuple(committable)
 
 
 def _git_nothing_to_commit(result: subprocess.CompletedProcess[str]) -> bool:

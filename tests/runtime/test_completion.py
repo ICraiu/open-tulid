@@ -444,6 +444,8 @@ def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path
 
     def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
         calls.append((command, cwd))
+        if command[:3] == ("git", "check-ignore", "-q"):
+            return subprocess.CompletedProcess(command, 1, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     service = CompletionService(
@@ -467,6 +469,7 @@ def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path
 
     assert result.accepted is True
     assert calls == [
+        (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
     ]
@@ -526,6 +529,8 @@ def test_completion_treats_git_nothing_to_commit_as_success(tmp_path: Path):
 
     def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
         calls.append((command, cwd))
+        if command[:3] == ("git", "check-ignore", "-q"):
+            return subprocess.CompletedProcess(command, 1, "", "")
         if command[:2] == ("git", "commit"):
             return subprocess.CompletedProcess(
                 command,
@@ -556,9 +561,101 @@ def test_completion_treats_git_nothing_to_commit_as_success(tmp_path: Path):
 
     assert result.accepted is True
     assert calls == [
+        (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
     ]
+
+
+def test_completion_skips_explicit_ignored_changed_files_for_commit(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    calls: list[tuple[tuple[str, ...], Path | None]] = []
+    (repo / ".git").mkdir(parents=True)
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    (workspace / "release" / "evidence").mkdir(parents=True)
+    (workspace / "release" / "evidence" / "README.md").write_text("evidence\n", encoding="utf-8")
+
+    def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        calls.append((command, cwd))
+        if command[:3] == ("git", "check-ignore", "-q"):
+            ignored = command[-1] == "release/evidence/README.md"
+            return subprocess.CompletedProcess(command, 0 if ignored else 1, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        repo_command_runner=runner,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts", "release/evidence/README.md"),
+        ),
+    )
+
+    assert result.accepted is True
+    assert calls == [
+        (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
+        (("git", "check-ignore", "-q", "--", "release/evidence/README.md"), repo),
+        (("git", "add", "--", "src/main.ts"), repo),
+        (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
+    ]
+
+
+def test_completion_logs_acceptance_failure_when_repo_commit_fails(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    events = JsonlEventStore(tmp_path / "events")
+    (repo / ".git").mkdir(parents=True)
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+
+    def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ("git", "check-ignore", "-q"):
+            return subprocess.CompletedProcess(command, 1, "", "")
+        if command[:2] == ("git", "commit"):
+            return subprocess.CompletedProcess(command, 1, "", "commit failed")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+        repo_root=repo,
+        repo_command_runner=runner,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "repo.commit_failed"
+    loaded = store.get("01J00000000000000000000JOB")
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert [event.event_type for event in events.iter_events()][-1] == "ExecutionCompletionAcceptanceFailed"
 
 
 def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
