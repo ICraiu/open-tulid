@@ -239,51 +239,13 @@ class CompletionService:
             error_count=len(verification.errors),
         )
         if not verification.accepted:
-            current = self.job_store.get(job.job_id)
-            current_job = current.job if current.accepted else None
-            if current_job is not None and _status(current_job.status) in TERMINAL_JOB_STATUSES:
-                self.event_store.append(build_event(
-                    project_id=job.project_id,
-                    actor=EventActor(type="executor", id=job.worker_id),
-                    event_type="ExecutionCompletionIgnored",
-                    correlation_id=job.job_id,
-                    task_id=job.task_id,
-                    job_id=job.job_id,
-                    transition_id=job.transition_id,
-                    submission_id=submission_id,
-                    data={"reason": "terminal_job", "status": _status(current_job.status)},
-                ))
-                return CompletionResult(False, verification=verification, errors=(_error(
-                    "completion.job_terminal",
-                    f"Execution job {job.job_id!r} is terminal: {_status(current_job.status)}.",
-                    job.job_id,
-                ),))
-            metadata = current_job.metadata if current_job is not None else job.metadata
-            self.job_store.update_status(
-                job.job_id,
-                ExecutionJobStatus.COMPLETION_REJECTED,
-                metadata={
-                    "last_verification": verification.message,
-                    "completion_submissions": _record_submission(
-                        metadata,
-                        submission_id,
-                        accepted=False,
-                        feedback=tuple(_error_to_dict(error) for error in verification.errors),
-                    ),
-                },
-            )
-            self.event_store.append(build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="completion-verifier"),
-                event_type=EventType.ExecutionCompletionRejected,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
+            return self._reject_completion(
+                job=job,
                 submission_id=submission_id,
-                data={"feedback": [_error_to_dict(error) for error in verification.errors]},
-            ))
-            return CompletionResult(False, verification=verification, errors=verification.errors)
+                verification=verification,
+                errors=verification.errors,
+                message=verification.message,
+            )
 
         output_dir = Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output")))
         promoted_artifacts = _promotion_plan(
@@ -305,7 +267,13 @@ class CompletionService:
         )
         existing_task_ids, existing_task_errors = self._existing_task_ids(job.task_id) if transition.derives is not None else ((), ())
         if existing_task_errors:
-            return CompletionResult(False, verification=verification, errors=existing_task_errors)
+            return self._reject_completion(
+                job=job,
+                submission_id=submission_id,
+                verification=verification,
+                errors=existing_task_errors,
+                message=_format_errors(existing_task_errors),
+            )
         derived_tasks, derivation_errors = _derived_task_plan(
             output_dir=output_dir,
             transition=transition,
@@ -314,7 +282,13 @@ class CompletionService:
             existing_task_ids=existing_task_ids,
         )
         if derivation_errors:
-            return CompletionResult(False, verification=verification, errors=derivation_errors)
+            return self._reject_completion(
+                job=job,
+                submission_id=submission_id,
+                verification=verification,
+                errors=derivation_errors,
+                message=_format_errors(derivation_errors),
+            )
         events = (
             build_event(
                 project_id=job.project_id,
@@ -468,6 +442,61 @@ class CompletionService:
             },
         )
         return CompletionResult(True, verification=verification)
+
+    def _reject_completion(
+        self,
+        *,
+        job,
+        submission_id: str,
+        verification: VerificationResult,
+        errors: tuple[DomainError, ...],
+        message: str,
+    ) -> CompletionResult:
+        current = self.job_store.get(job.job_id)
+        current_job = current.job if current.accepted else None
+        if current_job is not None and _status(current_job.status) in TERMINAL_JOB_STATUSES:
+            self.event_store.append(build_event(
+                project_id=job.project_id,
+                actor=EventActor(type="executor", id=job.worker_id),
+                event_type="ExecutionCompletionIgnored",
+                correlation_id=job.job_id,
+                task_id=job.task_id,
+                job_id=job.job_id,
+                transition_id=job.transition_id,
+                submission_id=submission_id,
+                data={"reason": "terminal_job", "status": _status(current_job.status)},
+            ))
+            return CompletionResult(False, verification=verification, errors=(_error(
+                "completion.job_terminal",
+                f"Execution job {job.job_id!r} is terminal: {_status(current_job.status)}.",
+                job.job_id,
+            ),))
+        metadata = current_job.metadata if current_job is not None else job.metadata
+        self.job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.COMPLETION_REJECTED,
+            metadata={
+                "last_verification": message,
+                "completion_submissions": _record_submission(
+                    metadata,
+                    submission_id,
+                    accepted=False,
+                    feedback=tuple(_error_to_dict(error) for error in errors),
+                ),
+            },
+        )
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="completion-verifier"),
+            event_type=EventType.ExecutionCompletionRejected,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            submission_id=submission_id,
+            data={"feedback": [_error_to_dict(error) for error in errors]},
+        ))
+        return CompletionResult(False, verification=verification, errors=errors)
 
     def _record_validation_finished(
         self,
@@ -695,6 +724,10 @@ class CompletionService:
                 task_id,
             ),))
         return _EffectApplyResult(True)
+
+
+def _format_errors(errors: tuple[DomainError, ...]) -> str:
+    return "; ".join(f"{error.code}: {error.message}" for error in errors)
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

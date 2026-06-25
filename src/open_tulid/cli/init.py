@@ -30,10 +30,10 @@ runtime:
   image_tag_prefix: open-tulid/agent
   default_timeout_seconds: 7200
   # Wait this long before retrying a failed task transition.
-  failed_job_backoff_seconds: 60
-  # 0 means retry forever. Set a positive number to stop after that many failed jobs
-  # for the same task and transition.
-  max_failed_attempts_per_transition: 0
+  failed_job_backoff_seconds: 900
+  # 0 means retry forever. The default caps repeated failures so one bad task
+  # cannot monopolize an unattended runtime.
+  max_failed_attempts_per_transition: 2
   completion_host: 0.0.0.0
   completion_port: 0
   completion_container_host: host.docker.internal

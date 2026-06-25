@@ -34,6 +34,7 @@ class TestGetBuiltinRegistries:
             "template_sections_present",
             "template_required_fields_present",
             "artifact_has_required_text",
+            "artifacts_match_template",
             "branch_exists",
             "tests_pass",
             "link_target_exists",

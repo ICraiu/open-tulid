@@ -20,12 +20,9 @@ storage:
       - state: Todo
         board: Work
         column: Todo
-      - state: SelfReview1
+      - state: SelfReview
         board: Work
-        column: Self review 1
-      - state: SelfReview2
-        board: Work
-        column: Self review 2
+        column: Self review
       - state: Done
         board: Work
         column: Done
@@ -42,9 +39,7 @@ statements:
   - kind: state
     id: Todo
   - kind: state
-    id: SelfReview1
-  - kind: state
-    id: SelfReview2
+    id: SelfReview
   - kind: state
     id: Done
 
@@ -143,7 +138,7 @@ statements:
     id: ImplementTask
     task_type: ImplementationTask
     from: Todo
-    to: SelfReview1
+    to: SelfReview
     worker: qwen_27b
     default_for_scheduler: true
     requires:
@@ -158,28 +153,9 @@ statements:
             command: npm run build
 
   - kind: transition
-    id: SelfReviewPass1
+    id: SelfReview
     task_type: ImplementationTask
-    from: SelfReview1
-    to: SelfReview2
-    worker: qwen_27b
-    default_for_scheduler: true
-    instructions: [self-review]
-    requires:
-      changed_files:
-        required: true
-      validations:
-        - type: tests_pass
-          args:
-            command: npm test
-        - type: project_build
-          args:
-            command: npm run build
-
-  - kind: transition
-    id: SelfReviewPass2
-    task_type: ImplementationTask
-    from: SelfReview2
+    from: SelfReview
     to: Done
     worker: qwen_27b
     default_for_scheduler: true

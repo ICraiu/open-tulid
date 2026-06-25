@@ -35,6 +35,7 @@ COMPLETION_SETTLE_STATUSES = frozenset({
 })
 
 DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 1800.0
+OPENCODE_TULID_AGENT = "tulid-build"
 _active_containers_service: ContainersService | None = None
 
 
@@ -775,6 +776,8 @@ def _build_runtime_prompt(
         "",
         _render_prompt_paths_section(variant, required_artifacts=required_artifacts),
         "",
+        _render_validation_failure_policy_section(variant),
+        "",
         _render_prompt_completion_section(
             completion_endpoint=completion_endpoint,
             required_artifacts=required_artifacts,
@@ -923,6 +926,21 @@ def _render_prompt_paths_section(variant: str, *, required_artifacts: tuple[str,
             "Write required completion artifacts under `output/`.",
         ))
     return "\n".join(lines)
+
+
+def _render_validation_failure_policy_section(variant: str) -> str:
+    if variant != "implementation":
+        return "## Validation Failure Policy\nUse required validations as evidence for the transition deliverable."
+    return "\n".join((
+        "## Validation Failure Policy",
+        "Use validation failures as diagnosis, not permission to rewrite unrelated code.",
+        "Before changing code because of a failing validation command, decide whether the failure is inside the assigned task boundary.",
+        "If the failure is in scope, make the smallest targeted fix and rerun the narrowest relevant command first.",
+        "If the failure is outside scope, pre-existing, environmental, flaky, or caused by a missing external service, do not chase it with broad edits.",
+        "After one full validation failure, switch to the smallest failing test, module, or command that explains the problem.",
+        "Stop instead of thrashing when the same validation failure remains after two targeted fix attempts, the fix requires files outside scope, or the failure is unrelated to this task.",
+        "When stopping, exit non-zero with a concise blocker summary unless Tulid can accept the transition with precise evidence.",
+    ))
 
 
 def _render_prompt_completion_section(
@@ -1087,6 +1105,17 @@ def _write_opencode_model_config_if_needed(
     config["provider"] = providers
     config["model"] = model_ref
     config["small_model"] = model_ref
+    agents = config.get("agent")
+    if not isinstance(agents, dict):
+        agents = {}
+    agents[OPENCODE_TULID_AGENT] = {
+        "mode": "primary",
+        "permission": {
+            "*": "allow",
+            "doom_loop": "deny",
+        },
+    }
+    config["agent"] = agents
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

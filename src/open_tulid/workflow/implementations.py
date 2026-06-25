@@ -154,6 +154,43 @@ def artifact_has_required_text(context: WorkflowExecutionContext, **kwargs: Any)
     return _validation(bool(content.strip()), "artifact_has_required_text", "Artifact text is non-empty" if content.strip() else "Artifact text is empty")
 
 
+def artifacts_match_template(context: WorkflowExecutionContext, **kwargs: Any) -> ValidationResult:
+    pattern = _first_string(kwargs, "pattern", "glob", "path")
+    if not pattern:
+        return _validation(False, "artifacts_match_template", "pattern is required")
+    root = context.project_root or context.vault_root
+    if root is None:
+        return _validation(False, "artifacts_match_template", "project_root or vault_root is required")
+    matches = sorted(path for path in root.glob(pattern) if path.is_file())
+    if not matches:
+        return _validation(False, "artifacts_match_template", f"No files matched pattern: {pattern}")
+
+    sections = _string_list(kwargs.get("sections") or kwargs.get("required_sections"))
+    fields = _string_list(kwargs.get("fields") or kwargs.get("required_fields"))
+    required_texts = _string_list(kwargs.get("texts") or kwargs.get("required_texts"))
+    problems: list[str] = []
+
+    for path in matches:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append(f"{path.relative_to(root)} unreadable: {exc}")
+            continue
+        missing_sections = _missing_sections(content, sections)
+        if missing_sections:
+            problems.append(f"{path.relative_to(root)} missing sections: {', '.join(missing_sections)}")
+        missing_fields = [field for field in fields if not _field_has_value(content, field)]
+        if missing_fields:
+            problems.append(f"{path.relative_to(root)} missing fields: {', '.join(missing_fields)}")
+        missing_texts = [text for text in required_texts if text not in content]
+        if missing_texts:
+            problems.append(f"{path.relative_to(root)} missing text: {', '.join(missing_texts)}")
+
+    if problems:
+        return _validation(False, "artifacts_match_template", "; ".join(problems))
+    return _validation(True, "artifacts_match_template", f"All files matched required template checks for pattern: {pattern}")
+
+
 def branch_exists(context: WorkflowExecutionContext, **kwargs: Any) -> ValidationResult:
     branch = _first_string(kwargs, "branch", "name")
     if not branch:
@@ -330,6 +367,7 @@ VALIDATION_IMPLEMENTATIONS = {
     "template_sections_present": template_sections_present,
     "template_required_fields_present": template_required_fields_present,
     "artifact_has_required_text": artifact_has_required_text,
+    "artifacts_match_template": artifacts_match_template,
     "branch_exists": branch_exists,
     "tests_pass": tests_pass,
     "link_target_exists": link_target_exists,

@@ -9,6 +9,7 @@ from open_tulid.workflow import get_builtin_registries
 from open_tulid.workflow.implementations import (
     WorkflowExecutionContext,
     artifact_has_required_text,
+    artifacts_match_template,
     copy_file,
     file_exists,
     git_reset_hard,
@@ -64,6 +65,39 @@ class TestValidationImplementations:
         ctx = WorkflowExecutionContext()
 
         result = artifact_has_required_text(ctx, content="build passed", text="passed")
+
+        assert result.passed is True
+
+    def test_artifacts_match_template_checks_all_matching_files(self, tmp_path: Path):
+        output = tmp_path / "output"
+        output.mkdir()
+        (output / "ok.md").write_text("## Purpose\n\nDone\n\nField: yes\n", encoding="utf-8")
+        (output / "bad.md").write_text("## Purpose\n\nDone\n", encoding="utf-8")
+        ctx = WorkflowExecutionContext(project_root=tmp_path)
+
+        result = artifacts_match_template(
+            ctx,
+            pattern="output/*.md",
+            sections=["Purpose"],
+            fields=["Field"],
+        )
+
+        assert result.passed is False
+        assert "bad.md missing fields: Field" in result.message
+
+    def test_artifacts_match_template_passes_when_all_files_match(self, tmp_path: Path):
+        output = tmp_path / "output"
+        output.mkdir()
+        (output / "one.md").write_text("## Purpose\n\nDone\n\nField: yes\n", encoding="utf-8")
+        (output / "two.md").write_text("## Purpose\n\nDone\n\nField: yes\n", encoding="utf-8")
+        ctx = WorkflowExecutionContext(project_root=tmp_path)
+
+        result = artifacts_match_template(
+            ctx,
+            pattern="output/*.md",
+            sections=["Purpose"],
+            fields=["Field"],
+        )
 
         assert result.passed is True
 

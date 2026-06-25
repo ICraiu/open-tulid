@@ -102,7 +102,7 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
         task_body="Do the implementation work.",
         transition_id="ImplementTask",
         from_state="Todo",
-        to_state="SelfReview1",
+        to_state="SelfReview",
         required_artifacts=(),
         required_validations=("tests_pass",),
         required_validation_details=("tests_pass: run `npm test`",),
@@ -122,6 +122,9 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
     assert "Treat existing files under `output/` as read-only context" in prompt
     assert "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files" in prompt
     assert "This implementation transition does not require artifacts, so leave `output/` alone unless Tulid explicitly requires it." in prompt
+    assert "## Validation Failure Policy" in prompt
+    assert "After one full validation failure, switch to the smallest failing test" in prompt
+    assert "same validation failure remains after two targeted fix attempts" in prompt
     assert "## Completion Contract" in prompt
     assert "Required validation commands:" in prompt
     assert "- tests_pass: run `npm test`" in prompt
@@ -1100,6 +1103,8 @@ def test_executor_writes_opencode_config_for_tulid_model_proxy(tmp_path: Path, m
             worker_args={
                 "qwen_27b": (
                     "run",
+                    "--agent",
+                    "tulid-build",
                     "--model",
                     "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf",
                 ),
@@ -1116,9 +1121,16 @@ def test_executor_writes_opencode_config_for_tulid_model_proxy(tmp_path: Path, m
 
     executor.run(JOB_ID)
 
-    assert seen["args"] == ("run", "--model", "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf")
+    assert seen["args"] == (
+        "run",
+        "--agent",
+        "tulid-build",
+        "--model",
+        "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf",
+    )
     assert seen["config"]["model"] == "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf"
     assert seen["config"]["small_model"] == "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf"
+    assert seen["config"]["agent"]["tulid-build"]["permission"]["doom_loop"] == "deny"
     provider = seen["config"]["provider"]["tulid-qwen"]
     assert provider["npm"] == "@ai-sdk/openai-compatible"
     assert provider["options"] == {

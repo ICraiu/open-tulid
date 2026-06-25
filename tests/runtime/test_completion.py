@@ -13,6 +13,7 @@ from open_tulid.domain import (
     EventActor,
     EventType,
     ExecutionJob,
+    ExecutionJobStatus,
     ArtifactTypeDefinition,
     DerivesDefinition,
     ProjectSnapshot,
@@ -720,6 +721,69 @@ def test_completion_derives_child_tasks_after_existing_numeric_ids(tmp_path: Pat
 
     assert result.accepted is True
     assert [task.id for task in adapter.created] == ["8"]
+
+
+def test_completion_rejects_invalid_derived_task_after_validation_passes(tmp_path: Path):
+    store = _job_store(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "child.md").write_text(
+        "---\ntype: ImplementationTaskFile\n---\n# Child\n\nDo child.\n",
+        encoding="utf-8",
+    )
+
+    base = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=base.schema_version,
+        states=base.states,
+        task_types=MappingProxyType({
+            **dict(base.task_types),
+            "chunk": TaskTypeDefinition(id="chunk", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({"child_task": ArtifactTypeDefinition(id="child_task")}),
+        validation_types=base.validation_types,
+        operation_types=base.operation_types,
+        workers=base.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+                derives=DerivesDefinition(task_type="chunk", state="Todo", artifact_type="child_task"),
+            ),
+        }),
+    )
+    events = JsonlEventStore(tmp_path / "events")
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=events,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(ArtifactSubmission(type="child_task", path="child.md"),),
+        ),
+    )
+
+    loaded = store.get("01J00000000000000000000JOB")
+    event_types = [event.event_type for event in events.iter_events()]
+    assert result.accepted is False
+    assert result.verification is not None
+    assert result.verification.accepted is True
+    assert result.errors[0].code == "task.derived_invalid"
+    assert loaded.accepted is True
+    assert loaded.job is not None
+    assert loaded.job.status == ExecutionJobStatus.COMPLETION_REJECTED
+    assert "ExecutionCompletionRejected" in event_types
+    assert "TransitionAccepted" not in event_types
 
 
 def test_completion_requires_changed_files_when_transition_demands_them(tmp_path: Path):

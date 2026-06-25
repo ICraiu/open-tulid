@@ -136,13 +136,13 @@ if transition_id == "ImplementTask":
     })
     sys.exit(0 if status == 200 else 1)
 
-if transition_id == "SelfReviewPass1":
-    append_workspace_file("app.py", "\n# self review pass 1\n")
+if transition_id == "SelfReview":
+    append_workspace_file("app.py", "\n# self review\n")
     if scenario == "self_review_reject_once":
         rejected = submit({
-            "submission_id": "self-review-1-missing-changed-files",
+            "submission_id": "self-review-missing-changed-files",
             "attempt": 1,
-            "summary": "self review pass 1 omitted changed files first",
+            "summary": "self review omitted changed files first",
             "artifacts": [],
             "changed_files": [],
             "validation_evidence": {
@@ -154,24 +154,9 @@ if transition_id == "SelfReviewPass1":
             print("expected missing changed_files submission to be rejected", file=sys.stderr)
             sys.exit(1)
     status = submit({
-        "submission_id": "self-review-1",
+        "submission_id": "self-review",
         "attempt": 2 if scenario == "self_review_reject_once" else 1,
-        "summary": "self review pass 1 completed by scripted worker",
-        "artifacts": [],
-        "changed_files": ["app.py"],
-        "validation_evidence": {
-            "tests_pass": "passed",
-            "project_build": "passed",
-        },
-    })
-    sys.exit(0 if status == 200 else 1)
-
-if transition_id == "SelfReviewPass2":
-    append_workspace_file("app.py", "# self review pass 2\n")
-    status = submit({
-        "submission_id": "self-review-2",
-        "attempt": 1,
-        "summary": "self review pass 2 completed by scripted worker",
+        "summary": "self review completed by scripted worker",
         "artifacts": [],
         "changed_files": ["app.py"],
         "validation_evidence": {

@@ -130,8 +130,10 @@ def test_runtime_start_writes_background_process_state(tmp_path: Path, monkeypat
     assert seen["calls"][0][0][-4:] == [sys.executable, "-m", "open_tulid", "model-proxy", "serve"][-4:]
     assert seen["calls"][1][0][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "5.0"][-7:]
     assert state["scheduler_pid"] == 9876
+    assert state["command"][-7:] == [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "5.0"][-7:]
     proxy_state = json.loads((tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").read_text(encoding="utf-8"))
     assert proxy_state["proxy_pid"] == 4321
+    assert proxy_state["command"][-4:] == [sys.executable, "-m", "open_tulid", "model-proxy", "serve"][-4:]
     assert state["project"] == "Agent"
     assert state["interval"] == 5.0
 
@@ -295,6 +297,84 @@ def test_runtime_start_fails_active_jobs_from_dead_prior_scheduler(tmp_path: Pat
     assert "job=01J00000000000000000000JOB prior_status=running" in result.output
     assert loaded.job is not None
     assert loaded.job.status == "failed"
+
+
+def test_runtime_start_replaces_state_when_scheduler_pid_belongs_to_other_process(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
+    state_path.parent.mkdir()
+    state_path.write_text('{"scheduler_pid": 9876, "project": "Agent", "interval": 5.0}', encoding="utf-8")
+
+    processes = iter((type("ProxyProcess", (), {"pid": 4321})(), type("SchedulerProcess", (), {"pid": 6543})()))
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {9876, 4321, 6543})
+    monkeypatch.setattr("open_tulid.cli.main._process_cmdline", lambda pid: ["python", "-m", "unrelated"] if pid == 9876 else None)
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: next(processes))
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
+    monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start"])
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert result.exit_code == 0
+    assert "SCHEDULER_STARTED project=Agent pid=6543" in result.output
+    assert state["scheduler_pid"] == 6543
+
+
+def test_runtime_start_replaces_state_when_proxy_pid_belongs_to_other_process(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    proxy_state_path = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
+    proxy_state_path.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+
+    processes = iter((type("ProxyProcess", (), {"pid": 4321})(), type("SchedulerProcess", (), {"pid": 6543})()))
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {9876, 4321, 6543})
+    monkeypatch.setattr("open_tulid.cli.main._process_cmdline", lambda pid: ["python", "-m", "unrelated"] if pid == 9876 else None)
+    monkeypatch.setattr("open_tulid.cli.main.subprocess.Popen", lambda *args, **kwargs: next(processes))
+    monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
+    monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
+    monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["runtime", "start"])
+
+    proxy_state = json.loads(proxy_state_path.read_text(encoding="utf-8"))
+    assert result.exit_code == 0
+    assert "MODEL_PROXY_STARTED pid=4321" in result.output
+    assert proxy_state["proxy_pid"] == 4321
+
+
+def test_runtime_state_process_rejects_reused_pid_with_different_start_time(monkeypatch):
+    state = {
+        "scheduler_pid": 4321,
+        "pid_start_time": 100,
+        "command": [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "30.0"],
+    }
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value == 4321)
+    monkeypatch.setattr("open_tulid.cli.main._process_start_time_ticks", lambda pid: 200)
+
+    assert cli_main._state_process_is_running(
+        state,
+        "scheduler_pid",
+        expected_command=state["command"],
+    ) is False
+
+
+def test_runtime_state_process_accepts_matching_start_time_when_cmdline_unavailable(monkeypatch):
+    state = {
+        "scheduler_pid": 4321,
+        "pid_start_time": 100,
+        "command": [sys.executable, "-m", "open_tulid", "jobs", "daemon", "Agent", "--interval", "30.0"],
+    }
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value == 4321)
+    monkeypatch.setattr("open_tulid.cli.main._process_start_time_ticks", lambda pid: 100)
+    monkeypatch.setattr("open_tulid.cli.main._process_cmdline", lambda pid: [])
+
+    assert cli_main._state_process_is_running(
+        state,
+        "scheduler_pid",
+        expected_command=state["command"],
+    ) is True
 
 
 def test_runtime_start_fails_active_jobs_even_without_prior_state_file(tmp_path: Path, monkeypatch):

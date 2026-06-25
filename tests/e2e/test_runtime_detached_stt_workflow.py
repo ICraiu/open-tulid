@@ -100,8 +100,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
             "ImplementTask",
-            "SelfReviewPass1",
-            "SelfReviewPass2",
+            "SelfReview",
         }
 
         def accepted_transition_ids() -> set[str]:
@@ -124,8 +123,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
             "ImplementTask",
-            "SelfReviewPass1",
-            "SelfReviewPass2",
+            "SelfReview",
         ):
             assert f"transition={transition_id}" in scheduler_stdout
         assert "SCHEDULER_SKIPPED project=Agent" in scheduler_stdout
@@ -138,7 +136,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         assert "transition=DraftDirection" in compact_log
         assert "TRANSITION_ACCEPTED task=1 transition=ApproveDirection" in compact_log
         assert "TRANSITION_ACCEPTED task=2 job=" in compact_log
-        assert "transition=SelfReviewPass2" in compact_log
+        assert "transition=SelfReview" in compact_log
 
         implementation_job = _job_payload_for_transition(project, "ImplementTask")
         implementation_workspace = Path(implementation_job["workspace_path"])
@@ -204,17 +202,17 @@ def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits
             if isinstance(feedback, dict)
         )
 
-        review_job = _job_payload_for_transition(project, "SelfReviewPass1")
+        review_job = _job_payload_for_transition(project, "SelfReview")
         assert review_job["status"] == "accepted"
         review_stdout = _job_stdout(review_job)
         assert (
-            "scripted runtime worker scenario=self_review_reject_once transition=SelfReviewPass1"
+            "scripted runtime worker scenario=self_review_reject_once transition=SelfReview"
             in review_stdout
         )
         assert "completion status=400" in review_stdout
         assert "completion status=200" in review_stdout
         assert (project.repo / "app.py").read_text(encoding="utf-8").endswith(
-            "\n# self review pass 1\n# self review pass 2\n",
+            "\n# self review\n",
         )
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")

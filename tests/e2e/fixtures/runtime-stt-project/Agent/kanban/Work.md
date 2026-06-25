@@ -9,8 +9,6 @@
 
 ## Todo
 
-## Self review 1
-
-## Self review 2
+## Self review
 
 ## Done

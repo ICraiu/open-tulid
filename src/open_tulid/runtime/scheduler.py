@@ -49,6 +49,7 @@ class Scheduler:
         serial_repo_execution: bool = True,
         failed_job_backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
         max_failed_attempts_per_transition: int = 0,
+        runtime_session_started_at: datetime | None = None,
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
     ) -> None:
@@ -61,6 +62,11 @@ class Scheduler:
         self.serial_repo_execution = serial_repo_execution
         self.failed_job_backoff_seconds = failed_job_backoff_seconds
         self.max_failed_attempts_per_transition = max_failed_attempts_per_transition
+        self.runtime_session_started_at = (
+            runtime_session_started_at.astimezone(timezone.utc)
+            if runtime_session_started_at is not None
+            else None
+        )
         self.event_store = event_store
         self.journal_store = journal_store
 
@@ -139,6 +145,7 @@ class Scheduler:
                     project_id,
                     task.id,
                     transition.id,
+                    since=self.runtime_session_started_at,
                 )
                 if not failed_attempts.accepted:
                     return ScheduleResult(
@@ -163,6 +170,7 @@ class Scheduler:
                 project_id,
                 task.id,
                 transition.id,
+                since=self.runtime_session_started_at,
                 backoff_seconds=self.failed_job_backoff_seconds,
             )
             if not recent_failure.accepted:
@@ -401,12 +409,14 @@ def _find_recent_failed_job(
     transition_id: str,
     *,
     now: datetime | None = None,
+    since: datetime | None = None,
     backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
 ) -> JobStoreResult:
     listed = job_store.list()
     if not listed.accepted:
         return listed
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=backoff_seconds)
+    session_cutoff = since.astimezone(timezone.utc) if since is not None else None
     recent = tuple(
         job for job in listed.jobs
         if job.project_id == project_id
@@ -415,6 +425,7 @@ def _find_recent_failed_job(
         and _status_value(job.status) == ExecutionJobStatus.FAILED.value
         and (updated_at := _job_timestamp(job)) is not None
         and updated_at >= cutoff
+        and (session_cutoff is None or updated_at >= session_cutoff)
     )
     if not recent:
         return JobStoreResult(jobs=())
@@ -429,16 +440,23 @@ def _find_failed_jobs(
     project_id: str,
     task_id: str,
     transition_id: str,
+    *,
+    since: datetime | None = None,
 ) -> JobStoreResult:
     listed = job_store.list()
     if not listed.accepted:
         return listed
+    session_cutoff = since.astimezone(timezone.utc) if since is not None else None
     failed = tuple(
         job for job in listed.jobs
         if job.project_id == project_id
         and job.task_id == task_id
         and job.transition_id == transition_id
         and _status_value(job.status) == ExecutionJobStatus.FAILED.value
+        and (
+            session_cutoff is None
+            or ((updated_at := _job_timestamp(job)) is not None and updated_at >= session_cutoff)
+        )
     )
     return JobStoreResult(jobs=failed)
 

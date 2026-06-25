@@ -404,6 +404,7 @@ def schedule_job(
     """Schedule the next runnable task and create one execution job."""
     _require_project_dockerfile(_load_cli_config(), project)
     ctx = _runtime_project_context(project)
+    runtime_session_started_at = datetime.now(UTC)
     scheduler = Scheduler(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
@@ -414,6 +415,7 @@ def schedule_job(
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+        runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -647,6 +649,7 @@ def run_one_job(
     """Schedule and run one runnable task."""
     _ensure_project_runtime_images(_load_cli_config(), project)
     ctx = _runtime_project_context(project)
+    runtime_session_started_at = datetime.now(UTC)
     scheduler = Scheduler(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
@@ -657,6 +660,7 @@ def run_one_job(
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+        runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
     )
@@ -681,6 +685,7 @@ def jobs_daemon(
 ) -> None:
     """Continuously schedule and run runnable jobs."""
     completed = 0
+    runtime_session_started_at = datetime.now(UTC)
     while True:
         _require_project_dockerfile(_load_cli_config(), project, stop_runtime=True)
         ctx = _runtime_project_context(project)
@@ -694,6 +699,7 @@ def jobs_daemon(
             serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
             failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
             max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+            runtime_session_started_at=runtime_session_started_at,
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
         )
@@ -747,12 +753,21 @@ def runtime_start(
     projects = _resolve_projects(config, project)
     proxy_state_path = _proxy_state_path(config)
     proxy_state = _load_runtime_state(proxy_state_path)
-    proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
+    proxy_command = _self_cli_command("model-proxy", "serve")
+    proxy_running = proxy_state is not None and _state_process_is_running(
+        proxy_state,
+        "proxy_pid",
+        expected_command=proxy_command,
+    )
     scheduler_states: dict[str, tuple[Path, dict[str, object] | None, bool]] = {}
     for project_name in projects:
         state_path = _runtime_state_path(config, project_name)
         state = _load_runtime_state(state_path)
-        scheduler_running = state is not None and _pid_is_running(state.get("scheduler_pid"))
+        scheduler_running = state is not None and _state_process_is_running(
+            state,
+            "scheduler_pid",
+            expected_command=_scheduler_command_from_state(project_name, state, interval),
+        )
         scheduler_states[project_name] = (state_path, state, scheduler_running)
         if not scheduler_running:
             _fail_orphaned_runtime_jobs(config, project_name)
@@ -794,7 +809,7 @@ def runtime_start(
         proxy_process = _spawn_runtime_process(
             config,
             "model-proxy",
-            _self_cli_command("model-proxy", "serve"),
+            proxy_command,
         )
         if not _process_survived_startup(proxy_process):
             console.print(_runtime_log_line("MODEL_PROXY_START_FAILED", f"pid={proxy_process.pid}"))
@@ -806,10 +821,11 @@ def runtime_start(
         proxy_pid = proxy_process.pid
         started_new_proxy = True
         proxy_state_path.parent.mkdir(parents=True, exist_ok=True)
-        proxy_state_path.write_text(json.dumps({
-            "proxy_pid": proxy_pid,
-            "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        }, sort_keys=True), encoding="utf-8")
+        proxy_state_path.write_text(json.dumps(_runtime_process_state(
+            pid_key="proxy_pid",
+            pid=proxy_pid,
+            command=proxy_command,
+        ), sort_keys=True), encoding="utf-8")
         console.print(_runtime_log_line("MODEL_PROXY_STARTED", f"pid={proxy_pid}"))
     scheduler_failures = False
     active_schedulers = 0
@@ -822,23 +838,20 @@ def runtime_start(
                 f"project={project_name} pid={state['scheduler_pid']}",
             ))
             continue
-        scheduler_process = _spawn_runtime_process(
-            config,
-            f"scheduler-{project_name}",
-            _self_cli_command("jobs", "daemon", project_name, "--interval", str(interval)),
-        )
+        scheduler_command = _scheduler_command(project_name, interval)
+        scheduler_process = _spawn_runtime_process(config, f"scheduler-{project_name}", scheduler_command)
         if not _process_survived_startup(scheduler_process):
             scheduler_failures = True
             console.print(_runtime_log_line("SCHEDULER_START_FAILED", f"project={project_name} pid={scheduler_process.pid}"))
             continue
         active_schedulers += 1
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps({
-            "scheduler_pid": scheduler_process.pid,
-            "project": project_name,
-            "interval": interval,
-            "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        }, sort_keys=True), encoding="utf-8")
+        state_path.write_text(json.dumps(_runtime_process_state(
+            pid_key="scheduler_pid",
+            pid=scheduler_process.pid,
+            command=scheduler_command,
+            extra={"project": project_name, "interval": interval},
+        ), sort_keys=True), encoding="utf-8")
         console.print(_runtime_log_line(
             "SCHEDULER_STARTED",
             f"project={project_name} pid={scheduler_process.pid} interval={interval}",
@@ -868,7 +881,11 @@ def runtime_stop(
         stopped_any = True
         for key in ("scheduler_pid",):
             pid = state.get(key)
-            if _pid_is_running(pid):
+            if _state_process_is_running(
+                state,
+                key,
+                expected_command=_scheduler_command_from_state(project_name, state, None),
+            ):
                 os.kill(int(pid), signal.SIGTERM)
                 if not _wait_for_pid_exit(int(pid)):
                     console.print(_runtime_log_line(
@@ -887,7 +904,11 @@ def runtime_stop(
     if not _any_scheduler_running(config):
         proxy_state_path = _proxy_state_path(config)
         proxy_state = _load_runtime_state(proxy_state_path)
-        if proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid")):
+        if proxy_state is not None and _state_process_is_running(
+            proxy_state,
+            "proxy_pid",
+            expected_command=_self_cli_command("model-proxy", "serve"),
+        ):
             os.kill(int(proxy_state["proxy_pid"]), signal.SIGTERM)
             if not _wait_for_pid_exit(int(proxy_state["proxy_pid"])):
                 console.print(_runtime_log_line(
@@ -913,7 +934,11 @@ def runtime_status(
     """Show whether the detached runtime processes are running."""
     config = _load_cli_config()
     proxy_state = _load_runtime_state(_proxy_state_path(config))
-    proxy_running = proxy_state is not None and _pid_is_running(proxy_state.get("proxy_pid"))
+    proxy_running = proxy_state is not None and _state_process_is_running(
+        proxy_state,
+        "proxy_pid",
+        expected_command=_self_cli_command("model-proxy", "serve"),
+    )
     projects = _resolve_projects(config, project)
     lines: list[str] = []
     for project_name in projects:
@@ -922,7 +947,11 @@ def runtime_status(
         if state is None:
             lines.append(f"Runtime not running for {project_name}")
             continue
-        scheduler_running = _pid_is_running(state.get("scheduler_pid"))
+        scheduler_running = _state_process_is_running(
+            state,
+            "scheduler_pid",
+            expected_command=_scheduler_command_from_state(project_name, state, None),
+        )
         if scheduler_running and proxy_running:
             lines.append(
                 f"Runtime running for {project_name} "
@@ -1721,6 +1750,43 @@ def _self_cli_command(*args: str) -> list[str]:
     return [sys.executable, "-m", "open_tulid", *args]
 
 
+def _runtime_process_state(
+    *,
+    pid_key: str,
+    pid: int,
+    command: list[str],
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        pid_key: pid,
+        "command": command,
+        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+    start_time = _process_start_time_ticks(pid)
+    if start_time is not None:
+        state["pid_start_time"] = start_time
+    if extra is not None:
+        state.update(extra)
+    return state
+
+
+def _scheduler_command(project: str, interval: object) -> list[str]:
+    return _self_cli_command("jobs", "daemon", project, "--interval", str(interval))
+
+
+def _scheduler_command_from_state(
+    project: str,
+    state: dict[str, object] | None,
+    default_interval: float | None,
+) -> list[str]:
+    interval = default_interval
+    if state is not None and state.get("interval") is not None:
+        interval = state["interval"]
+    if interval is None:
+        interval = 30.0
+    return _scheduler_command(project, interval)
+
+
 def _process_survived_startup(process: subprocess.Popen, *, delay: float = 0.1) -> bool:
     time.sleep(delay)
     poll = getattr(process, "poll", None)
@@ -1756,7 +1822,11 @@ def _proxy_listener_ready(
 def _any_scheduler_running(config: Config) -> bool:
     for project in config.projects:
         state = _load_runtime_state(_runtime_state_path(config, project))
-        if state is not None and _pid_is_running(state.get("scheduler_pid")):
+        if state is not None and _state_process_is_running(
+            state,
+            "scheduler_pid",
+            expected_command=_scheduler_command_from_state(project, state, None),
+        ):
             return True
     return False
 
@@ -1869,6 +1939,66 @@ def _pid_is_running(value: object) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _state_process_is_running(
+    state: dict[str, object],
+    pid_key: str,
+    *,
+    expected_command: list[str],
+) -> bool:
+    pid = state.get(pid_key)
+    if not _pid_is_running(pid):
+        return False
+    if not isinstance(pid, int):
+        return False
+    state_start_time = state.get("pid_start_time")
+    if isinstance(state_start_time, int):
+        current_start_time = _process_start_time_ticks(pid)
+        if current_start_time is not None:
+            return current_start_time == state_start_time
+    state_command = state.get("command")
+    if isinstance(state_command, list) and all(isinstance(arg, str) for arg in state_command):
+        expected_command = state_command
+    return _pid_matches_command(pid, expected_command)
+
+
+def _pid_matches_command(pid: int, expected_command: list[str]) -> bool:
+    cmdline = _process_cmdline(pid)
+    if cmdline is None:
+        return True
+    if not cmdline:
+        return True
+    return cmdline == expected_command
+
+
+def _process_start_time_ticks(pid: int) -> int | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+    end = raw.rfind(")")
+    if end == -1:
+        return None
+    fields = raw[end + 2:].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _process_cmdline(pid: int) -> list[str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError:
+        return None
+    if not raw:
+        return []
+    return [part.decode("utf-8", errors="surrogateescape") for part in raw.rstrip(b"\0").split(b"\0")]
 
 
 def _wait_for_pid_exit(pid: int, *, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:

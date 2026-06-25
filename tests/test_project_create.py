@@ -127,8 +127,8 @@ class TestInitCommand:
         assert "runtime:" in text
         assert "# Tulid stores tracker projects" in text
         assert "projects: {}" in text
-        assert "failed_job_backoff_seconds: 60" in text
-        assert "max_failed_attempts_per_transition: 0" in text
+        assert "failed_job_backoff_seconds: 900" in text
+        assert "max_failed_attempts_per_transition: 2" in text
         assert not (config_path.parent / "workflow.yaml").exists()
 
     def test_init_refuses_existing_config(self, tmp_path: Path):

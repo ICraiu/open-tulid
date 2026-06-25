@@ -373,6 +373,94 @@ def test_scheduler_can_stop_after_configured_failed_attempts(tmp_path: Path):
     assert result.skipped[0].code == "job.retry_limit_reached"
 
 
+def test_scheduler_ignores_retry_limit_failures_before_runtime_session(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    session_started_at = datetime.now(timezone.utc)
+    for index in range(2):
+        assert store.create(ExecutionJob(
+            job_id=f"01J00000000000000000000J{index:02d}",
+            project_id="Agent",
+            task_id=TASK_ID,
+            transition_id="implement",
+            worker_id="codex",
+            workspace_path=str(tmp_path / f"work-{index}"),
+            status="failed",
+            metadata={"updated_at": (session_started_at - timedelta(seconds=1)).isoformat()},
+        )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        max_failed_attempts_per_transition=2,
+        runtime_session_started_at=session_started_at,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+
+
+def test_scheduler_counts_retry_limit_failures_in_runtime_session(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    session_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    for index in range(2):
+        assert store.create(ExecutionJob(
+            job_id=f"01J00000000000000000000J{index:02d}",
+            project_id="Agent",
+            task_id=TASK_ID,
+            transition_id="implement",
+            worker_id="codex",
+            workspace_path=str(tmp_path / f"work-{index}"),
+            status="failed",
+            metadata={"updated_at": (session_started_at + timedelta(seconds=index + 1)).isoformat()},
+        )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        max_failed_attempts_per_transition=2,
+        runtime_session_started_at=session_started_at,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.retry_limit_reached"
+
+
+def test_scheduler_ignores_recent_failures_before_runtime_session(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    session_started_at = datetime.now(timezone.utc)
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": (session_started_at - timedelta(seconds=1)).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        runtime_session_started_at=session_started_at,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+
+
 def test_scheduler_retries_after_failed_job_backoff_expires(tmp_path: Path):
     store = FileExecutionJobStore(tmp_path / "jobs")
     assert store.create(ExecutionJob(
