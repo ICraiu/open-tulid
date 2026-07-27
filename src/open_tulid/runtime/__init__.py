@@ -21,7 +21,12 @@ from .instructions import (
     PromptPacket,
     PromptPacketResult,
 )
-from .scheduler import ScheduleResult, Scheduler, recover_job_creation_transactions
+from .scheduler import (
+    ScheduleResult,
+    Scheduler,
+    recover_job_creation_transactions,
+    select_scheduler_transition,
+)
 from .resources import FileResourceLeaseStore, ResourceLease, ResourceLeaseResult
 from .model_proxy import (
     LocalModelAdapter,
@@ -45,7 +50,12 @@ from .completion_http import (
     make_completion_handler,
     serve_completion_endpoint,
 )
-from .executor import ExecutorRunResult, JobExecutor
+from .executor import (
+    ExecutorRunResult,
+    JobExecutor,
+    PromptRenderResult,
+    render_execution_prompt,
+)
 from .verifier import (
     ArtifactSubmission,
     CompletionSubmission,
@@ -98,6 +108,7 @@ __all__ = [
     "ScheduleResult",
     "Scheduler",
     "recover_job_creation_transactions",
+    "select_scheduler_transition",
     "FileResourceLeaseStore",
     "ResourceLease",
     "ResourceLeaseResult",
@@ -122,6 +133,8 @@ __all__ = [
     "serve_completion_endpoint",
     "ExecutorRunResult",
     "JobExecutor",
+    "PromptRenderResult",
+    "render_execution_prompt",
     "ArtifactSubmission",
     "CompletionSubmission",
     "DeterministicVerifier",

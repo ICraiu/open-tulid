@@ -13,6 +13,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 from open_tulid.cli.init import init as init_cmd
 from open_tulid.cli.uninstall import _do_uninstall
@@ -21,7 +22,15 @@ from open_tulid.containers import (
     build_containers_service,
 )
 from open_tulid.adapters import AdapterBuildRequest, build_storage_adapter
-from open_tulid.domain import EventActor, EventType, ExecutionJobStatus, WorkflowDefinition
+from open_tulid.domain import (
+    DomainError,
+    EventActor,
+    EventType,
+    ExecutionJobStatus,
+    Task,
+    TransitionDefinition,
+    WorkflowDefinition,
+)
 from open_tulid.models import Config, ProjectConfig, ValidationReport
 from open_tulid.runtime import (
     ArtifactSubmission,
@@ -46,6 +55,8 @@ from open_tulid.runtime import (
     cleanup_job_workspaces,
     recover_job_creation_transactions,
     recover_completion_transactions,
+    render_execution_prompt,
+    select_scheduler_transition,
     serve_completion_endpoint,
     serve_model_proxy,
     TransactionJournalStore,
@@ -144,6 +155,9 @@ app.add_typer(jobs_app, name="jobs")
 
 tasks_app = typer.Typer()
 app.add_typer(tasks_app, name="tasks")
+
+prompts_app = typer.Typer()
+app.add_typer(prompts_app, name="prompts")
 
 agents_app = typer.Typer()
 app.add_typer(agents_app, name="agents")
@@ -1187,6 +1201,192 @@ def job_logs(
     console.print(log_path.read_text(encoding="utf-8"), end="")
 
 
+@prompts_app.command("render")
+def render_prompt(
+    project: str = typer.Argument(..., help="Configured project name."),
+    task_id: str = typer.Argument(..., help="Task id to preview."),
+    transition_id: str | None = typer.Option(
+        None,
+        "--transition",
+        "-t",
+        help=(
+            "Transition to preview, including a historical transition for a completed task. "
+            "Defaults to the transition the scheduler would select."
+        ),
+    ),
+    job_id: str = typer.Option(
+        "PROMPT_PREVIEW",
+        "--job-id",
+        help="Job id rendered into the preview prompt.",
+    ),
+) -> None:
+    """Render the exact prompt packet for a task without scheduling or running it."""
+    config, workflow = _load_cli_context(project)
+    if workflow is None:
+        console.print(Panel(f"workflow.yaml is required in project {project!r}.", style="red"))
+        raise typer.Exit(2)
+    project_path = _project_path(config, project)
+    adapter = build_storage_adapter(AdapterBuildRequest(
+        project_id=project,
+        project_root=project_path,
+        tracker_type=config.tracker_type,
+        workflow=workflow,
+    ))
+    loaded = adapter.read_task(task_id)
+    task = loaded.task if loaded.accepted else None
+    if task is None and transition_id is not None:
+        task, snapshot_job_id = _load_prompt_task_snapshot(
+            config=config,
+            project=project,
+            task_id=task_id,
+            transition_id=transition_id,
+        )
+        if task is not None and snapshot_job_id is not None:
+            typer.echo(
+                (
+                    "Warning: live task data could not be loaded; rendering the task snapshot "
+                    f"from job {snapshot_job_id} with the current workflow and instructions."
+                ),
+                err=True,
+            )
+    if task is None:
+        _print_domain_errors(loaded.errors)
+        raise typer.Exit(1)
+
+    if transition_id is None:
+        selected = select_scheduler_transition(task, workflow)
+        if isinstance(selected, DomainError):
+            _print_domain_errors((_prompt_selection_error(task, workflow, selected),))
+            raise typer.Exit(1)
+        transition = selected
+    else:
+        transition = workflow.transitions.get(transition_id)
+        error = _prompt_transition_error(task, transition_id, transition)
+        if error is not None:
+            _print_domain_errors((error,))
+            raise typer.Exit(1)
+        assert transition is not None
+
+    assert transition.worker is not None
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=adapter,
+        task=task,
+        transition=transition,
+        worker_id=transition.worker,
+        job_id=job_id,
+        completion_endpoint=f"http://preview.invalid/jobs/{job_id}/complete",
+    )
+    if not rendered.accepted:
+        _print_domain_errors(rendered.errors)
+        raise typer.Exit(1)
+    typer.echo(rendered.text)
+
+
+def _prompt_transition_error(
+    task: Task,
+    transition_id: str,
+    transition: TransitionDefinition | None,
+) -> DomainError | None:
+    if transition is None:
+        return DomainError(
+            "transition.not_found",
+            f"Transition {transition_id!r} is not defined.",
+            transition_id,
+        )
+    if transition.task_type != task.task_type:
+        return DomainError(
+            "transition.task_type_mismatch",
+            f"Transition {transition.id!r} expects task type {transition.task_type!r}.",
+            task.id,
+        )
+    if transition.worker is None:
+        return DomainError(
+            "transition.worker_missing",
+            f"Transition {transition.id!r} has no worker.",
+            transition.id,
+        )
+    return None
+
+
+def _prompt_selection_error(
+    task: Task,
+    workflow: WorkflowDefinition,
+    scheduler_error: DomainError,
+) -> DomainError:
+    if scheduler_error.code != "scheduler.no_transition":
+        return scheduler_error
+    candidates = tuple(
+        transition.id
+        for transition in workflow.transitions.values()
+        if transition.task_type == task.task_type and transition.worker is not None
+    )
+    if not candidates:
+        return scheduler_error
+    choices = ", ".join(sorted(candidates))
+    return DomainError(
+        "prompt.transition_required",
+        (
+            f"Task {task.id!r} has no runnable transition from state {task.current_state!r}. "
+            f"To inspect a historical prompt, pass --transition with one of: {choices}."
+        ),
+        task.id,
+    )
+
+
+def _load_prompt_task_snapshot(
+    *,
+    config: Config,
+    project: str,
+    task_id: str,
+    transition_id: str,
+) -> tuple[Task | None, str | None]:
+    app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
+    listed = FileExecutionJobStore(app_state / "jobs" / project).list()
+    if not listed.accepted:
+        return None, None
+    candidates = sorted(
+        (
+            job
+            for job in listed.jobs
+            if job.task_id == task_id and job.transition_id == transition_id
+        ),
+        key=lambda job: job.job_id,
+        reverse=True,
+    )
+    for job in candidates:
+        context_path = Path(job.workspace_path) / ".open-tulid" / "job-context.json"
+        try:
+            payload = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_payload = payload.get("task") if isinstance(payload, dict) else None
+        task = _task_from_job_context(task_payload)
+        if task is not None and task.id == task_id:
+            return task, job.job_id
+    return None, None
+
+
+def _task_from_job_context(payload) -> Task | None:
+    if not isinstance(payload, dict):
+        return None
+    required = ("id", "title", "path", "type", "state", "body")
+    if any(not isinstance(payload.get(key), str) for key in required):
+        return None
+    dependencies = payload.get("dependencies", [])
+    if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies):
+        return None
+    return Task(
+        id=payload["id"],
+        title=payload["title"],
+        path=payload["path"],
+        current_state=payload["state"],
+        task_type=payload["type"],
+        dependencies=tuple(dependencies),
+        body=payload["body"],
+    )
+
+
 @tasks_app.command("list")
 def list_tasks(
     project: str | None = typer.Argument(None, help="Configured project name."),
@@ -1545,8 +1745,18 @@ def _print_domain_errors(errors) -> None:
     for error in errors:
         if error is None:
             continue
-        location = f" [{error.location}]" if error.location else ""
-        console.print(f"[red]{error.code}[/red]{location}: {error.message}")
+        location = ""
+        if error.location:
+            location_text = str(error.location)
+            location = (
+                f" {location_text}"
+                if location_text.startswith("[") and location_text.endswith("]")
+                else f" [{location_text}]"
+            )
+        line = Text()
+        line.append(error.code, style="red")
+        line.append(f"{location}: {error.message}")
+        console.print(line)
 
 
 def _model_proxy_session_root(config: Config) -> Path:

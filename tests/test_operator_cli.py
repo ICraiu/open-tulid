@@ -15,8 +15,8 @@ from open_tulid.cli import main as cli_main
 from open_tulid.cli.main import app
 from open_tulid.config import CONFIG_DIRNAME, CONFIG_FILENAME
 from open_tulid.runtime.scheduler import ScheduleResult
-from open_tulid.domain import ExecutionJob
-from open_tulid.runtime import FileExecutionJobStore
+from open_tulid.domain import DomainError, ExecutionJob
+from open_tulid.runtime import FileExecutionJobStore, PromptRenderResult
 from open_tulid.models import ResourceConfig
 
 
@@ -841,3 +841,292 @@ def test_tasks_list_without_project_lists_all_projects_grouped(tmp_path: Path, m
         "Beta:\n"
         "  2  state=Done  type=ProductIdea  title=Ship beta\n"
     )
+
+
+def test_prompts_render_uses_scheduler_transition_and_prints_raw_packet(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    task = SimpleNamespace(
+        id="1",
+        current_state="Todo",
+        task_type="ImplementationTask",
+    )
+    transition = SimpleNamespace(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        worker="qwen_27b",
+    )
+    workflow = SimpleNamespace(transitions={"ImplementTask": transition})
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=task_id == "1",
+        task=task if task_id == "1" else None,
+        errors=(),
+    ))
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path",
+        lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter",
+        lambda request: adapter,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.select_scheduler_transition",
+        lambda selected_task, selected_workflow: transition,
+    )
+
+    def fake_render(**kwargs):
+        seen.update(kwargs)
+        return PromptRenderResult(text="# exact prompt\n\nTask packet.")
+
+    monkeypatch.setattr("open_tulid.cli.main.render_execution_prompt", fake_render)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["prompts", "render", "Agent", "1"])
+
+    assert result.exit_code == 0
+    assert result.output == "# exact prompt\n\nTask packet.\n"
+    assert seen["task"] is task
+    assert seen["transition"] is transition
+    assert seen["worker_id"] == "qwen_27b"
+    assert seen["job_id"] == "PROMPT_PREVIEW"
+    assert seen["completion_endpoint"] == "http://preview.invalid/jobs/PROMPT_PREVIEW/complete"
+
+
+def test_prompts_render_allows_explicit_historical_transition_for_done_task(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    task = SimpleNamespace(
+        id="1",
+        current_state="Done",
+        task_type="ImplementationTask",
+    )
+    transition = SimpleNamespace(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        worker="qwen_27b",
+    )
+    workflow = SimpleNamespace(transitions={"ImplementTask": transition})
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=True,
+        task=task,
+        errors=(),
+    ))
+
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path",
+        lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter",
+        lambda request: adapter,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.render_execution_prompt",
+        lambda **kwargs: PromptRenderResult(text="# historical prompt"),
+    )
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(
+            app,
+            ["prompts", "render", "Agent", "1", "--transition", "ImplementTask"],
+        )
+
+    assert result.exit_code == 0
+    assert result.output == "# historical prompt\n"
+
+
+def test_prompts_render_done_task_without_transition_lists_historical_choices(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    task = SimpleNamespace(
+        id="1",
+        current_state="Done",
+        task_type="ImplementationTask",
+    )
+    transitions = {
+        "ImplementTask": SimpleNamespace(
+            id="ImplementTask",
+            task_type="ImplementationTask",
+            from_state="Todo",
+            worker="qwen_27b",
+        ),
+        "SelfReview": SimpleNamespace(
+            id="SelfReview",
+            task_type="ImplementationTask",
+            from_state="SelfReview",
+            worker="qwen_27b",
+        ),
+    }
+    workflow = SimpleNamespace(transitions=transitions)
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=True,
+        task=task,
+        errors=(),
+    ))
+
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path",
+        lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter",
+        lambda request: adapter,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.select_scheduler_transition",
+        lambda selected_task, selected_workflow: DomainError(
+            "scheduler.no_transition",
+            "No transition.",
+            selected_task.id,
+        ),
+    )
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["prompts", "render", "Agent", "1"])
+
+    assert result.exit_code == 1
+    assert "prompt.transition_required" in result.output
+    assert "--transition" in result.output
+    assert "ImplementTask, SelfReview" in result.output
+
+
+def test_prompts_render_prints_bracketed_task_error_without_rich_markup_crash(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_config(tmp_path)
+    workflow = SimpleNamespace(transitions={})
+    task_error = DomainError(
+        "obsidian.task_not_found",
+        "Task file was not found.",
+        "[/vault/Agent/kanban/Work.md:6]",
+    )
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=False,
+        task=None,
+        errors=(task_error,),
+    ))
+
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path",
+        lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter",
+        lambda request: adapter,
+    )
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(app, ["prompts", "render", "Agent", "missing"])
+
+    assert result.exit_code == 1
+    assert "obsidian.task_not_found" in result.output
+    assert "[/vault/Agent/kanban/Work.md:6]" in result.output
+    assert "Task file was not" in result.output
+    assert "found." in result.output
+    assert "Traceback" not in result.output
+
+
+def test_prompts_render_recovers_deleted_task_from_latest_matching_job_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_config(tmp_path)
+    app_state = tmp_path / CONFIG_DIRNAME
+    workspace = tmp_path / "workspace"
+    context_dir = workspace / ".open-tulid"
+    context_dir.mkdir(parents=True)
+    (context_dir / "job-context.json").write_text(
+        json.dumps({
+            "task": {
+                "id": "2",
+                "title": "Package and CLI Scaffold",
+                "path": "tasks/2-package-and-cli-scaffold.md",
+                "type": "ImplementationTask",
+                "state": "Todo",
+                "dependencies": [],
+                "body": "# Package and CLI Scaffold\n\nBuild the CLI.",
+            },
+        }),
+        encoding="utf-8",
+    )
+    job_store = FileExecutionJobStore(app_state / "jobs" / "Agent")
+    saved = job_store.save(ExecutionJob(
+        job_id="01J00000000000000000000002",
+        project_id="Agent",
+        task_id="2",
+        transition_id="ImplementTask",
+        worker_id="qwen_27b",
+        workspace_path=str(workspace),
+        status="accepted",
+    ))
+    assert saved.accepted
+
+    transition = SimpleNamespace(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        worker="qwen_27b",
+    )
+    workflow = SimpleNamespace(transitions={"ImplementTask": transition})
+    task_error = DomainError("task.not_found", "Task 2 was not found.", "2")
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=False,
+        task=None,
+        errors=(task_error,),
+    ))
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (
+            SimpleNamespace(tracker_type="obsidian", config_dir=app_state),
+            workflow,
+        ),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path",
+        lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter",
+        lambda request: adapter,
+    )
+
+    def fake_render(**kwargs):
+        seen.update(kwargs)
+        return PromptRenderResult(text="# recovered prompt")
+
+    monkeypatch.setattr("open_tulid.cli.main.render_execution_prompt", fake_render)
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(
+            app,
+            ["prompts", "render", "Agent", "2", "--transition", "ImplementTask"],
+        )
+
+    assert result.exit_code == 0
+    assert result.stdout == "# recovered prompt\n"
+    assert "rendering the task snapshot from job 01J00000000000000000000002" in result.stderr
+    recovered_task = seen["task"]
+    assert recovered_task.id == "2"
+    assert recovered_task.title == "Package and CLI Scaffold"
+    assert recovered_task.body == "# Package and CLI Scaffold\n\nBuild the CLI."

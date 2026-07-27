@@ -11,13 +11,22 @@ from typing import Mapping
 
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.containers import AgentRunResult, ContainerMount, ContainersService, build_containers_service
-from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, ValidationCallDefinition, WorkflowDefinition
+from open_tulid.domain import (
+    DomainError,
+    EventActor,
+    EventType,
+    ExecutionJobStatus,
+    Task,
+    TransitionDefinition,
+    ValidationCallDefinition,
+    WorkflowDefinition,
+)
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime.completion import CompletionService
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
 from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
 from open_tulid.runtime.jobs import FileExecutionJobStore
-from open_tulid.runtime.instructions import AgentInstructionResolver
+from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
@@ -44,6 +53,85 @@ class ExecutorRunResult:
     accepted: bool
     run: AgentRunResult | None = None
     errors: tuple[DomainError, ...] = ()
+
+
+@dataclass(frozen=True)
+class PromptRenderResult:
+    text: str = ""
+    instruction_packet: PromptPacket | None = None
+    errors: tuple[DomainError, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return not self.errors
+
+
+def render_execution_prompt(
+    *,
+    workflow: WorkflowDefinition,
+    adapter: StorageAdapter,
+    task: Task,
+    transition: TransitionDefinition,
+    worker_id: str,
+    job_id: str,
+    completion_endpoint: str,
+) -> PromptRenderResult:
+    """Render the exact model prompt for an execution job without running it."""
+    worker = workflow.workers.get(worker_id)
+    task_type = workflow.task_types.get(transition.task_type)
+    prompt_text = _build_runtime_prompt(
+        job_id=job_id,
+        task_title=task.title,
+        task_body=sanitize_task_body_for_runtime(task.body),
+        transition_id=transition.id,
+        from_state=transition.from_state,
+        to_state=transition.to_state,
+        required_artifacts=transition.requires.artifacts,
+        required_validations=_validation_ids(transition.requires.validations),
+        required_validation_details=_validation_details(transition.requires.validations),
+        changed_files_required=transition.requires.changed_files_required,
+        derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
+        completion_endpoint=completion_endpoint,
+    )
+    prompt_packet = None
+    project_root = _adapter_project_root(adapter)
+    if project_root is not None:
+        parent_tasks = _load_parent_tasks(adapter, task)
+        task_for_context = _task_for_prompt_context(task, transition)
+        prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
+        context_result = LinkedContextResolver(project_root).build_context_packet(
+            task_for_context,
+            parent_tasks=parent_tasks,
+        )
+        if not context_result.accepted:
+            return PromptRenderResult(errors=context_result.errors)
+        context_packet = context_result.packet
+        if context_packet is not None and context_packet.text:
+            prompt_text = f"{prompt_text}\n\n{context_packet.text}"
+        prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
+            worker=worker,
+            task_type=task_type,
+            transition=transition,
+        )
+        if not prompt_result.accepted:
+            return PromptRenderResult(errors=prompt_result.errors or (_error(
+                "instructions.invalid",
+                "Prompt instructions failed.",
+            ),))
+        prompt_packet = prompt_result.packet
+        if prompt_packet is not None:
+            prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
+    prompt_text = _append_final_completion_reminder(
+        prompt_text,
+        required_artifacts=transition.requires.artifacts,
+        required_validations=_validation_ids(transition.requires.validations),
+        required_validation_details=_validation_details(transition.requires.validations),
+        changed_files_required=transition.requires.changed_files_required,
+    )
+    return PromptRenderResult(
+        text=prompt_text,
+        instruction_packet=prompt_packet,
+    )
 
 
 class JobExecutor:
@@ -102,7 +190,6 @@ class JobExecutor:
         if transition is None:
             return ExecutorRunResult(False, errors=(_error("transition.not_found", "Transition was not found."),))
         worker = self.workflow.workers.get(job.worker_id)
-        task_type = self.workflow.task_types.get(transition.task_type)
         task_result = self.adapter.read_task(job.task_id)
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
@@ -141,63 +228,20 @@ class JobExecutor:
                     prepared.error or _error("workspace.prepare_failed", "Workspace failed."),
                 )
 
-            prompt_packet = None
-            prompt_text = _build_runtime_prompt(
+            rendered_prompt = render_execution_prompt(
+                workflow=self.workflow,
+                adapter=self.adapter,
+                task=task_result.task,
+                transition=transition,
+                worker_id=job.worker_id,
                 job_id=job.job_id,
-                task_title=task_result.task.title,
-                task_body=sanitize_task_body_for_runtime(task_result.task.body),
-                transition_id=transition.id,
-                from_state=transition.from_state,
-                to_state=transition.to_state,
-                required_artifacts=transition.requires.artifacts,
-                required_validations=_validation_ids(transition.requires.validations),
-                required_validation_details=_validation_details(transition.requires.validations),
-                changed_files_required=transition.requires.changed_files_required,
-                derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
                 completion_endpoint=endpoint.url,
             )
-            project_root = _adapter_project_root(self.adapter)
-            if project_root is not None:
-                parent_tasks = _load_parent_tasks(self.adapter, task_result.task)
-                task_for_context = _task_for_prompt_context(task_result.task, transition)
-                prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
-                context_result = LinkedContextResolver(project_root).build_context_packet(
-                    task_for_context,
-                    parent_tasks=parent_tasks,
-                )
-                if not context_result.accepted:
-                    endpoint.stop()
-                    return self._fail_before_run(
-                        job,
-                        context_result.errors[0],
-                    )
-                context_packet = context_result.packet
-                if context_packet is not None and context_packet.text:
-                    prompt_text = f"{prompt_text}\n\n{context_packet.text}"
-                prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
-                    worker=worker,
-                    task_type=task_type,
-                    transition=transition,
-                )
-                if not prompt_result.accepted:
-                    endpoint.stop()
-                    return self._fail_before_run(
-                        job,
-                        prompt_result.errors[0] if prompt_result.errors else _error(
-                            "instructions.invalid",
-                            "Prompt instructions failed.",
-                        ),
-                    )
-                prompt_packet = prompt_result.packet
-                if prompt_packet is not None:
-                    prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
-            prompt_text = _append_final_completion_reminder(
-                prompt_text,
-                required_artifacts=transition.requires.artifacts,
-                required_validations=_validation_ids(transition.requires.validations),
-                required_validation_details=_validation_details(transition.requires.validations),
-                changed_files_required=transition.requires.changed_files_required,
-            )
+            if not rendered_prompt.accepted:
+                endpoint.stop()
+                return self._fail_before_run(job, rendered_prompt.errors[0])
+            prompt_text = rendered_prompt.text
+            prompt_packet = rendered_prompt.instruction_packet
             prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
 
             self.job_store.update_status(

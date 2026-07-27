@@ -28,7 +28,7 @@ from open_tulid.domain import (
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
-from open_tulid.runtime.executor import _build_runtime_prompt
+from open_tulid.runtime.executor import _build_runtime_prompt, render_execution_prompt
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 from socket_utils import can_bind_localhost
 
@@ -182,6 +182,28 @@ def test_build_runtime_prompt_for_derived_transition_requires_artifact_submissio
     assert "You are executing a planning or artifact-producing workflow transition for this project." in prompt
     assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in prompt
     assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in prompt
+
+
+def test_render_execution_prompt_builds_complete_packet_without_running_job():
+    workflow = _workflow()
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=FakeAdapter(),
+        task=_task(),
+        transition=workflow.transitions["code"],
+        worker_id="codex",
+        job_id="PROMPT_PREVIEW",
+        completion_endpoint="http://preview.invalid/jobs/PROMPT_PREVIEW/complete",
+    )
+
+    assert rendered.accepted is True
+    assert rendered.instruction_packet is None
+    assert "Job: PROMPT_PREVIEW" in rendered.text
+    assert "Task: Implement thing" in rendered.text
+    assert "Transition: code (Todo -> CodeReview)" in rendered.text
+    assert "Make the thing work." in rendered.text
+    assert "$OPEN_TULID_COMPLETION_ENDPOINT" in rendered.text
+    assert "## Final Required Step" in rendered.text
 
 
 def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(

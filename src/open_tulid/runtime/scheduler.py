@@ -118,7 +118,7 @@ class Scheduler:
                 skipped.append(dependency_error)
                 continue
 
-            transition_result = _select_transition(task, self.workflow)
+            transition_result = select_scheduler_transition(task, self.workflow)
             if isinstance(transition_result, DomainError):
                 skipped.append(transition_result)
                 continue
@@ -534,7 +534,8 @@ def _has_scheduler_eligible_transition(task: Task, workflow: WorkflowDefinition)
     )
 
 
-def _select_transition(task: Task, workflow: WorkflowDefinition) -> TransitionDefinition | DomainError:
+def select_scheduler_transition(task: Task, workflow: WorkflowDefinition) -> TransitionDefinition | DomainError:
+    """Select the worker-backed transition the scheduler would use for a task."""
     transitions = tuple(
         transition for transition in workflow.transitions.values()
         if transition.task_type == task.task_type
