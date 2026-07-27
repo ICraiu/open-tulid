@@ -5,6 +5,7 @@ from types import MappingProxyType
 
 from open_tulid.domain import ExecutionJob, RequirementDefinition, Task, TransitionDefinition
 from open_tulid.runtime import WorkspacePreparer
+from open_tulid.runtime.task_contracts import task_source_intent_sha256
 
 
 def test_workspace_preparer_copies_repo_and_writes_job_context(tmp_path: Path):
@@ -24,12 +25,17 @@ def test_workspace_preparer_copies_repo_and_writes_job_context(tmp_path: Path):
             worker_id="codex",
             workspace_path=str(workspace),
         ),
-        task=Task(
+        task=(task := Task(
             id="01J00000000000000000000001",
             title="Task",
             path="tasks/task.md",
             current_state="Todo",
-        ),
+            task_type="ImplementationTask",
+            artifact_links=("docs/spec.md",),
+            parent_id="parent-1",
+            metadata={"priority": "high"},
+            body="Free-form body.",
+        )),
         transition=TransitionDefinition(
             id="code",
             task_type="task",
@@ -48,3 +54,7 @@ def test_workspace_preparer_copies_repo_and_writes_job_context(tmp_path: Path):
     context = (workspace / ".open-tulid" / "job-context.json").read_text(encoding="utf-8")
     assert '"job_id": "01J00000000000000000000JOB"' in context
     assert '"required_artifacts": [' in context
+    assert f'"source_intent_sha256": "{task_source_intent_sha256(task)}"' in context
+    assert '"artifact_links": [' in context
+    assert '"parent_id": "parent-1"' in context
+    assert '"priority": "high"' in context

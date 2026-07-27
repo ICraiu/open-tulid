@@ -99,6 +99,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "ApproveDirection",
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
+            "PrepareExecutionContract",
             "ImplementTask",
             "SelfReview",
         }
@@ -122,6 +123,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "DraftDirection",
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
+            "PrepareExecutionContract",
             "ImplementTask",
             "SelfReview",
         ):
@@ -147,12 +149,16 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         assert "## Primary Objective" in implementation_prompt
         assert "## Context Priority" in implementation_prompt
         assert "## Read-Only And Writable Paths" in implementation_prompt
-        assert "The current task body is the authoritative scope boundary for this job." in implementation_prompt
+        assert "The current task is authoritative for the user-requested outcome." in implementation_prompt
+        assert "A generated execution contract, when present, is binding" in implementation_prompt
         assert (
             "This implementation transition does not require artifacts, so leave `output/` alone"
             in implementation_prompt
         )
         assert "## Parent Context 1" in implementation_prompt
+        assert "Generated Execution Contract: artifacts/" in implementation_prompt
+        assert "/ImplementationContract/implementation-contract-" in implementation_prompt
+        assert "schema: tulid.implementation/v1" in implementation_prompt
         assert "## Parent Task" not in implementation_prompt
         assert "## Derived tasks" not in implementation_prompt
         assert not any((implementation_workspace / "output").glob("*"))
@@ -161,7 +167,7 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         _print_system_logs(project, capsys)
 
 
-def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits(
+def test_runtime_self_review_accepts_no_change_with_fresh_validation(
     tmp_path: Path,
     scripted_runtime_worker_image: str,
     capsys: pytest.CaptureFixture[str],
@@ -169,7 +175,7 @@ def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits
     project = _make_runtime_project(
         tmp_path,
         scripted_runtime_worker_image,
-        scenario="self_review_reject_once",
+        scenario="self_review_no_change",
     )
 
     try:
@@ -185,7 +191,7 @@ def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits
 
         _wait_for(
             lambda: _task_state(project.project, "2") == "Done",
-            "implementation task to recover from rejected self-review and finish",
+            "implementation task to pass a no-change self-review",
             timeout=40.0,
         )
 
@@ -194,25 +200,18 @@ def test_runtime_self_review_rejects_missing_changed_files_then_worker_resubmits
             for event in JsonlEventStore(project.project / "events").iter_events()
             if event.event_type == "ExecutionCompletionRejected"
         ]
-        assert rejected_events
-        assert any(
-            feedback.get("code") == "completion.changed_files_missing"
-            for event in rejected_events
-            for feedback in event.data.get("feedback", [])
-            if isinstance(feedback, dict)
-        )
+        assert rejected_events == []
 
         review_job = _job_payload_for_transition(project, "SelfReview")
         assert review_job["status"] == "accepted"
         review_stdout = _job_stdout(review_job)
         assert (
-            "scripted runtime worker scenario=self_review_reject_once transition=SelfReview"
+            "scripted runtime worker scenario=self_review_no_change transition=SelfReview"
             in review_stdout
         )
-        assert "completion status=400" in review_stdout
         assert "completion status=200" in review_stdout
-        assert (project.repo / "app.py").read_text(encoding="utf-8").endswith(
-            "\n# self review\n",
+        assert (project.repo / "app.py").read_text(encoding="utf-8") == (
+            "def healthz():\n    return 'ok'\n"
         )
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")

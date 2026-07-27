@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from open_tulid.workflow.implementations import (
     copy_file,
     file_exists,
     git_reset_hard,
+    implementation_contract_valid,
     template_required_fields_present,
     template_sections_present,
     write_file,
@@ -100,6 +102,103 @@ class TestValidationImplementations:
         )
 
         assert result.passed is True
+
+    def test_implementation_contract_valid_binds_artifact_to_job_task(self, tmp_path: Path):
+        context_dir = tmp_path / ".open-tulid"
+        context_dir.mkdir()
+        context_dir.joinpath("job-context.json").write_text(
+            json.dumps({
+                "source_intent_sha256": "a" * 64,
+                "task": {"id": "task-1"},
+            }),
+            encoding="utf-8",
+        )
+        output = tmp_path / "output"
+        output.mkdir()
+        output.joinpath("implementation-contract.yaml").write_text(
+            """\
+schema: tulid.implementation/v1
+source:
+  task_id: task-1
+  source_intent_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+profile: code_change
+objective: Make health observable.
+change_surface:
+  add: []
+  edit: [app.py]
+  forbidden: []
+requirements: [The endpoint returns ok.]
+checks:
+  focused:
+    - id: health
+      argv: [python, check_repo.py, tests]
+  invariants: []
+""",
+            encoding="utf-8",
+        )
+        ctx = WorkflowExecutionContext(project_root=tmp_path)
+
+        result = implementation_contract_valid(
+            ctx,
+            path="output/implementation-contract.yaml",
+        )
+
+        assert result.passed is True
+        assert result.data["profile"] == "code_change"
+
+    def test_implementation_contract_valid_reports_stale_hash(self, tmp_path: Path):
+        context_dir = tmp_path / ".open-tulid"
+        context_dir.mkdir()
+        context_dir.joinpath("job-context.json").write_text(
+            json.dumps({
+                "source_intent_sha256": "b" * 64,
+                "task": {"id": "task-1"},
+            }),
+            encoding="utf-8",
+        )
+        output = tmp_path / "output"
+        output.mkdir()
+        output.joinpath("implementation-contract.yaml").write_text(
+            """\
+schema: tulid.implementation/v1
+source:
+  task_id: task-1
+  source_intent_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+profile: code_change
+objective: Make health observable.
+change_surface:
+  add: []
+  edit: [app.py]
+  forbidden: []
+requirements: [The endpoint returns ok.]
+checks:
+  focused:
+    - id: health
+      argv: [python, check_repo.py, tests]
+  invariants: []
+""",
+            encoding="utf-8",
+        )
+        ctx = WorkflowExecutionContext(project_root=tmp_path)
+
+        result = implementation_contract_valid(
+            ctx,
+            path="output/implementation-contract.yaml",
+        )
+
+        assert result.passed is False
+        assert "contract.source_hash_mismatch" in result.data["error_codes"]
+
+    def test_implementation_contract_valid_rejects_workspace_escape(self, tmp_path: Path):
+        ctx = WorkflowExecutionContext(project_root=tmp_path / "workspace")
+
+        result = implementation_contract_valid(
+            ctx,
+            path="../implementation-contract.yaml",
+        )
+
+        assert result.passed is False
+        assert result.data["error_codes"] == ["contract.path_escape"]
 
 
 class TestOperationImplementations:

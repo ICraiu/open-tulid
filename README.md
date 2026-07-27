@@ -231,6 +231,28 @@ tulid tasks runnable
 tulid tasks runnable <project>
 ```
 
+Inspect the exact prompt Tulid would send for a task, without scheduling a job
+or starting a model:
+
+```bash
+tulid prompts render <project> <task-id>
+tulid prompts render <project> <task-id> --transition <transition-id>
+tulid prompts render <project> <task-id> > prompt.md
+```
+
+Without `--transition`, Tulid uses the same task-state transition selection as
+the scheduler. For a completed task, pass `--transition` to inspect a historical
+implementation or review prompt; explicit prompt inspection does not require
+the task to still be in that transition's source state. The preview uses
+`PROMPT_PREVIEW` as its synthetic job id; use `--job-id` when a particular value
+is useful for comparison. The command prints the raw prompt to standard output,
+including task text, parent and linked context, resolved agent instructions,
+artifact and validation requirements, and the final completion reminder.
+If a completed task is no longer present in the tracker, an explicit transition
+allows Tulid to recover the task body from the newest matching job snapshot. It
+reports the selected snapshot on standard error and renders it using the current
+workflow and agent instructions.
+
 Run the scheduler:
 
 ```bash

@@ -1,0 +1,4 @@
+[analyzer]
+source_roots = ["src"]
+include_external_references = false
+ignore_files = ["__init__.py"]

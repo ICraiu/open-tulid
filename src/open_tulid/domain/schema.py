@@ -94,6 +94,7 @@ class EventType(str, Enum):
     OperationStarted = "OperationStarted"
     OperationFinished = "OperationFinished"
     OperationFailed = "OperationFailed"
+    ContractInvalidated = "ContractInvalidated"
 
 
 class ExecutionJobStatus(str, Enum):

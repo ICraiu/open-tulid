@@ -18,6 +18,9 @@ storage:
     - state: Todo
       board: Work
       column: Todo
+    - state: ReadyToImplement
+      board: Work
+      column: Ready to implement
     - state: SelfReview
       board: Work
       column: Self review
@@ -36,6 +39,8 @@ statements:
   - kind: state
     id: Todo
   - kind: state
+    id: ReadyToImplement
+  - kind: state
     id: SelfReview
   - kind: state
     id: Done
@@ -45,6 +50,11 @@ statements:
   - kind: task_type
     id: ImplementationTask
     instructions: [default]
+    requirements:
+      ReadyToImplement:
+        artifacts: [ImplementationContract]
+      SelfReview:
+        artifacts: [ImplementationContract]
   - kind: validation_type
     id: tests_pass
     args:
@@ -55,6 +65,12 @@ statements:
     args:
       command:
         type: string
+  - kind: validation_type
+    id: implementation_contract_valid
+    args:
+      path:
+        type: string
+        required: true
   - kind: artifact_type
     id: ProductSpec
     template: product-spec.md
@@ -66,6 +82,9 @@ statements:
     template: implementation-spec.md
   - kind: artifact_type
     id: ImplementationTaskFile
+  - kind: artifact_type
+    id: ImplementationContract
+    template: implementation-contract.yaml
   - kind: worker
     id: codex_direction
     type: codex
@@ -76,6 +95,10 @@ statements:
     instructions: [default]
   - kind: worker
     id: codex_breakdown
+    type: codex
+    instructions: [default]
+  - kind: worker
+    id: codex_contract
     type: codex
     instructions: [default]
   - kind: worker
@@ -117,9 +140,22 @@ statements:
       state: Todo
       artifact_type: ImplementationTaskFile
   - kind: transition
-    id: ImplementTask
+    id: PrepareExecutionContract
     task_type: ImplementationTask
     from: Todo
+    to: ReadyToImplement
+    worker: codex_contract
+    default_for_scheduler: true
+    requires:
+      artifacts: [ImplementationContract]
+      validations:
+        - type: implementation_contract_valid
+          args:
+            path: output/implementation-contract.yaml
+  - kind: transition
+    id: ImplementTask
+    task_type: ImplementationTask
+    from: ReadyToImplement
     to: SelfReview
     worker: qwen_27b
     default_for_scheduler: true
@@ -141,8 +177,6 @@ statements:
     worker: qwen_27b
     default_for_scheduler: true
     requires:
-      changed_files:
-        required: true
       validations:
         - type: tests_pass
           args:
@@ -150,3 +184,13 @@ statements:
         - type: project_build
           args:
             command: python check_repo.py build
+  - kind: transition
+    id: InvalidateExecutionContract
+    task_type: ImplementationTask
+    from: ReadyToImplement
+    to: Todo
+  - kind: transition
+    id: InvalidateReviewedExecutionContract
+    task_type: ImplementationTask
+    from: SelfReview
+    to: Todo

@@ -64,12 +64,31 @@ class TestProjectCreation:
         workflow_text = (tmp_vault / "Engine" / "workflow.yaml").read_text(encoding="utf-8")
         assert "DraftDirection" in workflow_text
         assert "STT" not in workflow_text
+        assert "npm test" not in workflow_text
+        assert "npm run build" not in workflow_text
         loaded_workflow = load_workflow_definition(tmp_vault / "Engine" / "workflow.yaml")
         assert loaded_workflow.valid is True
         assert loaded_workflow.definition is not None
         assert "ProductIdea" in loaded_workflow.definition.task_types
+        assert "ReadyToImplement" in loaded_workflow.definition.states
+        prepare = loaded_workflow.definition.transitions["PrepareExecutionContract"]
+        assert prepare.from_state == "Todo"
+        assert prepare.to_state == "ReadyToImplement"
+        assert prepare.worker == "codex_contract"
+        assert prepare.requires.artifacts == ("ImplementationContract",)
+        assert [call.type for call in prepare.requires.validations] == [
+            "implementation_contract_valid",
+        ]
+        assert loaded_workflow.definition.transitions["ImplementTask"].from_state == "ReadyToImplement"
+        assert loaded_workflow.definition.transitions["ImplementTask"].requires.validations == ()
+        assert loaded_workflow.definition.transitions["ImplementTask"].requires.changed_files_required is True
+        assert loaded_workflow.definition.transitions["SelfReview"].requires.validations == ()
+        assert loaded_workflow.definition.transitions["SelfReview"].requires.changed_files_required is False
         assert (tmp_vault / "Engine" / "kanban" / "Work.md").is_file()
         assert "## Idea" in (tmp_vault / "Engine" / "kanban" / "Work.md").read_text(encoding="utf-8")
+        assert "## Ready to implement" in (
+            tmp_vault / "Engine" / "kanban" / "Work.md"
+        ).read_text(encoding="utf-8")
         assert (tmp_vault / "Engine" / "Docker.tulid").is_file()
         assert "FROM ${TULID_AGENT_IMAGE}" in (tmp_vault / "Engine" / "Docker.tulid").read_text(encoding="utf-8")
         assert (tmp_vault / "Engine" / "agents" / "default.agent.md").is_file()
@@ -79,6 +98,10 @@ class TestProjectCreation:
         )
         assert "STT" not in agent_text
         assert "repository files" in agent_text
+        assert agent_text.count("## Validation Failure Policy") == 0
+        assert "Edit or create a Markdown file only when it is inside the allowed change surface" in agent_text
+        assert "The user may structure the task in any way." in agent_text
+        assert "output/implementation-contract.yaml" in agent_text
 
     def test_project_fails_when_exists(self, valid_config: Config):
         create_project(valid_config, "Engine")

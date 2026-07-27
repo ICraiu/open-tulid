@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from multiprocessing import get_context
@@ -29,6 +29,7 @@ from open_tulid.runtime import (
     TransactionJournalStore,
     recover_job_creation_transactions,
 )
+from open_tulid.runtime.task_contracts import task_source_intent_sha256
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -39,6 +40,7 @@ class FakeAdapter:
     snapshot: ProjectSnapshot
     name: str = "fake"
     capabilities: frozenset[AdapterCapability] = frozenset({AdapterCapability.LOAD_PROJECT})
+    moves: list[tuple[str, str]] = field(default_factory=list)
 
     def load_project(self) -> LoadProjectResult:
         return LoadProjectResult(snapshot=self.snapshot)
@@ -51,6 +53,15 @@ class FakeAdapter:
         return WriteResult(path=task.path)
 
     def move_task(self, task_id: str, state: str) -> WriteResult:
+        self.moves.append((task_id, state))
+        task = self.snapshot.tasks.get(task_id)
+        if task is not None:
+            tasks = dict(self.snapshot.tasks)
+            tasks[task_id] = replace(task, current_state=state)
+            self.snapshot = replace(
+                self.snapshot,
+                tasks=MappingProxyType(tasks),
+            )
         return WriteResult(path=state)
 
     def append_event(self, event: Mapping[str, Any]) -> WriteResult:
@@ -108,6 +119,106 @@ def _workflow(*, ambiguous: bool = False, review: bool = False) -> WorkflowDefin
         workers=MappingProxyType({}),
         transitions=MappingProxyType(transitions),
     )
+
+
+def _contract_workflow() -> WorkflowDefinition:
+    return WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            "Todo": StateDefinition(id="Todo"),
+            "ReadyToImplement": StateDefinition(id="ReadyToImplement"),
+            "SelfReview": StateDefinition(id="SelfReview"),
+        }),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(
+                id="task",
+                requirements_by_state=MappingProxyType({
+                    "ReadyToImplement": RequirementDefinition(
+                        artifacts=("ImplementationContract",),
+                    ),
+                    "SelfReview": RequirementDefinition(
+                        artifacts=("ImplementationContract",),
+                    ),
+                }),
+            ),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType({
+            "prepare": TransitionDefinition(
+                id="prepare",
+                task_type="task",
+                from_state="Todo",
+                to_state="ReadyToImplement",
+                worker="codex",
+                requires=RequirementDefinition(
+                    artifacts=("ImplementationContract",),
+                ),
+                transaction=None,
+                default_for_scheduler=True,
+            ),
+            "implement": TransitionDefinition(
+                id="implement",
+                task_type="task",
+                from_state="ReadyToImplement",
+                to_state="SelfReview",
+                worker="qwen",
+                requires=RequirementDefinition(),
+                transaction=None,
+                default_for_scheduler=True,
+            ),
+            "invalidate": TransitionDefinition(
+                id="invalidate",
+                task_type="task",
+                from_state="ReadyToImplement",
+                to_state="Todo",
+                worker=None,
+                requires=RequirementDefinition(),
+                transaction=None,
+            ),
+            "invalidate_review": TransitionDefinition(
+                id="invalidate_review",
+                task_type="task",
+                from_state="SelfReview",
+                to_state="Todo",
+                worker=None,
+                requires=RequirementDefinition(),
+                transaction=None,
+            ),
+        }),
+    )
+
+
+def _write_contract(project_root: Path, task: Task, *, source_hash: str) -> Task:
+    relative = Path(
+        "artifacts"
+    ) / task.id / "ImplementationContract" / "implementation-contract.yaml"
+    path = project_root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        f"""\
+schema: tulid.implementation/v1
+source:
+  task_id: "{task.id}"
+  source_intent_sha256: "{source_hash}"
+profile: code_change
+objective: Add a health endpoint.
+change_surface:
+  add: []
+  edit: [app.py]
+  forbidden: []
+requirements: [The endpoint returns ok.]
+checks:
+  focused:
+    - id: health
+      argv: [python, check_repo.py, tests]
+  invariants: []
+""",
+        encoding="utf-8",
+    )
+    return replace(task, artifact_links=(str(relative),))
 
 
 def _snapshot(*tasks: Task) -> ProjectSnapshot:
@@ -266,6 +377,74 @@ def test_scheduler_creates_first_runnable_job_in_board_order(tmp_path: Path):
     assert [event.event_type for event in result.events] == ["ExecutionJobCreated"]
     assert store.get(result.job.job_id).accepted is True
     assert [skip.code for skip in result.skipped] == ["task.dependency_missing"]
+
+
+def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: Path):
+    project_root = tmp_path / "project"
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="ReadyToImplement",
+        task_type="task",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    task = _write_contract(
+        project_root,
+        task,
+        source_hash=task_source_intent_sha256(task),
+    )
+    scheduler = Scheduler(
+        workflow=_contract_workflow(),
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        project_root=project_root,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.transition_id == "implement"
+    assert result.job is not None
+    assert result.job.worker_id == "qwen"
+
+
+def test_scheduler_invalidates_stale_contract_before_qwen_is_scheduled(tmp_path: Path):
+    project_root = tmp_path / "project"
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="ReadyToImplement",
+        task_type="task",
+        body="Please add healthz and preserve metrics.",
+    )
+    task = _write_contract(project_root, task, source_hash="0" * 64)
+    adapter = FakeAdapter(_snapshot(task))
+    event_store = JsonlEventStore(project_root / "events")
+    scheduler = Scheduler(
+        workflow=_contract_workflow(),
+        adapter=adapter,
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        event_store=event_store,
+        project_root=project_root,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.transition_id == "invalidate"
+    assert result.skipped[-1].code == "task.contract_invalidated"
+    assert adapter.moves == [(TASK_ID, "Todo")]
+    assert result.events_persisted is True
+    events = event_store.iter_events()
+    assert [event.event_type for event in events] == ["ContractInvalidated"]
+    assert events[0].data["error_codes"] == ["contract.source_hash_mismatch"]
+    assert FileExecutionJobStore(tmp_path / "jobs").list().jobs == ()
 
 
 def test_scheduler_skips_when_active_job_exists(tmp_path: Path):

@@ -1,0 +1,24 @@
+ARG TULID_AGENT_IMAGE
+ARG PANALYZER_IMAGE=open-tulid/panalyzer:latest
+
+FROM ${PANALYZER_IMAGE} AS panalyzer
+
+FROM ${TULID_AGENT_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=panalyzer /opt/panalyzer-wheelhouse /opt/panalyzer-wheelhouse
+
+RUN python3 -m venv /opt/panalyzer-venv \
+    && /opt/panalyzer-venv/bin/pip install --no-index --find-links=/opt/panalyzer-wheelhouse project-analyzer \
+    && ln -sf /opt/panalyzer-venv/bin/panalyzer /usr/local/bin/panalyzer \
+    && ln -sf /opt/panalyzer-venv/bin/pyright-langserver /usr/local/bin/pyright-langserver
+
+WORKDIR /workspace/project
+
+RUN panalyzer --help >/tmp/panalyzer-help.txt

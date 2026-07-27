@@ -23,6 +23,7 @@ VALIDATION_IDS = [
     "artifacts_match_template",
     "branch_exists",
     "tests_pass",
+    "implementation_contract_valid",
     "link_target_exists",
 ]
 

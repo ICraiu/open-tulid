@@ -17,6 +17,10 @@ from open_tulid.domain import (
 )
 
 from .events import build_event, new_ulid
+from .task_contracts import (
+    implementation_contract_required,
+    validate_task_implementation_contract,
+)
 
 
 @dataclass(frozen=True)
@@ -68,10 +72,12 @@ class TaskManager:
         workflow: WorkflowDefinition,
         adapter: StorageAdapter,
         job_store: object | None = None,
+        project_root: Path | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
         self.job_store = job_store
+        self.project_root = project_root
 
     def handle(
         self,
@@ -207,6 +213,13 @@ class TaskManager:
                 f"Transition {transition.id!r} has no worker.",
                 transition.id,
             ),))
+        if (
+            self.project_root is not None
+            and implementation_contract_required(task, self.workflow)
+        ):
+            contract = validate_task_implementation_contract(self.project_root, task)
+            if not contract.accepted:
+                return CommandResult(accepted=False, errors=contract.errors)
         job_id = command.job_id or new_ulid()
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"

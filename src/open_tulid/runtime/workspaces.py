@@ -8,6 +8,7 @@ from typing import Mapping
 
 from open_tulid.domain import DomainError, ExecutionJob, Task, TransitionDefinition
 from open_tulid.runtime.context import sanitize_task_body_for_runtime
+from open_tulid.runtime.task_contracts import task_source_intent_sha256
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,7 @@ def _write_context(
         "workspace_path": str(workspace),
         "output_path": str(output_dir),
         "container_output_path": "/workspace/project/output",
+        "source_intent_sha256": task_source_intent_sha256(task),
         "task": {
             "id": task.id,
             "title": task.title,
@@ -144,6 +146,9 @@ def _write_context(
             "type": task.task_type,
             "state": task.current_state,
             "dependencies": list(task.dependencies),
+            "artifact_links": list(task.artifact_links),
+            "parent_id": task.parent_id,
+            "metadata": dict(task.metadata),
             "body": sanitize_task_body_for_runtime(task.body),
         },
     }

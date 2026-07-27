@@ -139,3 +139,50 @@ def test_linked_context_dedupes_equal_content(tmp_path: Path):
     assert result.accepted is True
     assert result.packet is not None
     assert [doc.ref for doc in result.packet.documents] == ["a"]
+
+
+def test_linked_context_marks_generated_execution_contract_as_binding(tmp_path: Path):
+    contract_path = (
+        tmp_path
+        / "artifacts"
+        / "task-1"
+        / "ImplementationContract"
+        / "implementation-contract.yaml"
+    )
+    contract_path.parent.mkdir(parents=True)
+    contract_path.write_text(
+        "schema: tulid.implementation/v1\nobjective: Add healthz.\n",
+        encoding="utf-8",
+    )
+    ref = str(contract_path.relative_to(tmp_path))
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=(ref,)),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert result.packet.documents[0].is_execution_contract is True
+    assert f"Generated Execution Contract: {ref}" in result.packet.text
+    assert "binding for implementation scope, interfaces, requirements, and checks" in result.packet.text
+
+
+def test_linked_context_includes_only_latest_generated_contract_version(tmp_path: Path):
+    contract_dir = tmp_path / "artifacts" / "task-1" / "ImplementationContract"
+    contract_dir.mkdir(parents=True)
+    old = contract_dir / "implementation-contract-old.yaml"
+    current = contract_dir / "implementation-contract-current.yaml"
+    old.write_text("objective: Old intent.\n", encoding="utf-8")
+    current.write_text("objective: Current intent.\n", encoding="utf-8")
+    old_ref = str(old.relative_to(tmp_path))
+    current_ref = str(current.relative_to(tmp_path))
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=(old_ref, current_ref)),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert [document.ref for document in result.packet.documents] == [current_ref]
+    assert "Current intent" in result.packet.text
+    assert "Old intent" not in result.packet.text

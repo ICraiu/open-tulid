@@ -432,6 +432,7 @@ def schedule_job(
         runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
+        project_root=ctx.get("project_path"),
     )
     result = scheduler.schedule_one(project)
     if not result.accepted:
@@ -474,11 +475,13 @@ def create_job(
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
+        project_root=ctx.get("project_path"),
     )
     manager = TaskManager(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
         job_store=None,
+        project_root=ctx.get("project_path"),
     )
     command = CreateExecutionJob(
         project_id=project,
@@ -677,6 +680,7 @@ def run_one_job(
         runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
+        project_root=ctx.get("project_path"),
     )
     scheduled = scheduler.schedule_one(project)
     if not scheduled.accepted:
@@ -716,6 +720,7 @@ def jobs_daemon(
             runtime_session_started_at=runtime_session_started_at,
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
+            project_root=ctx.get("project_path"),
         )
         scheduled = scheduler.schedule_one(project)
         if not scheduled.accepted:
@@ -1376,6 +1381,17 @@ def _task_from_job_context(payload) -> Task | None:
     dependencies = payload.get("dependencies", [])
     if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies):
         return None
+    artifact_links = payload.get("artifact_links", [])
+    if not isinstance(artifact_links, list) or not all(
+        isinstance(value, str) for value in artifact_links
+    ):
+        return None
+    parent_id = payload.get("parent_id")
+    if parent_id is not None and not isinstance(parent_id, str):
+        return None
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return None
     return Task(
         id=payload["id"],
         title=payload["title"],
@@ -1383,6 +1399,9 @@ def _task_from_job_context(payload) -> Task | None:
         current_state=payload["state"],
         task_type=payload["type"],
         dependencies=tuple(dependencies),
+        artifact_links=tuple(artifact_links),
+        parent_id=parent_id,
+        metadata=metadata,
         body=payload["body"],
     )
 

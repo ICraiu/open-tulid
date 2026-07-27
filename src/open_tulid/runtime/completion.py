@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import re
 import subprocess
@@ -766,6 +767,13 @@ def _promotion_plan(
     for artifact in artifacts:
         source = output_dir / artifact.path
         file_name = Path(artifact.path).name
+        if artifact.type == "ImplementationContract":
+            try:
+                content_hash = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+            except OSError:
+                content_hash = "unreadable"
+            source_name = Path(file_name)
+            file_name = f"{source_name.stem}-{content_hash}{source_name.suffix}"
         target = artifact_root / task_id / artifact.type / file_name
         planned.append({
             "artifact_type": artifact.type,

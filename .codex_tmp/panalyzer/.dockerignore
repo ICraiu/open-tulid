@@ -1,0 +1,13 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+dist
+build
+*.egg-info
+tests
+docs
+TODO.md
+uv.lock
+restart.sh
+install.sh

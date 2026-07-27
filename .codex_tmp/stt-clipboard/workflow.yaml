@@ -20,12 +20,12 @@ storage:
       - state: Todo
         board: Work
         column: Todo
-      - state: ReadyToImplement
+      - state: SelfReview1
         board: Work
-        column: Ready to implement
-      - state: SelfReview
+        column: Self review 1
+      - state: SelfReview2
         board: Work
-        column: Self review
+        column: Self review 2
       - state: Done
         board: Work
         column: Done
@@ -42,9 +42,9 @@ statements:
   - kind: state
     id: Todo
   - kind: state
-    id: ReadyToImplement
+    id: SelfReview1
   - kind: state
-    id: SelfReview
+    id: SelfReview2
   - kind: state
     id: Done
 
@@ -59,12 +59,7 @@ statements:
 
   - kind: task_type
     id: ImplementationTask
-    instructions: [default]
-    requirements:
-      ReadyToImplement:
-        artifacts: [ImplementationContract]
-      SelfReview:
-        artifacts: [ImplementationContract]
+    instructions: [qwen-implementation]
 
   - kind: validation_type
     id: tests_pass
@@ -76,16 +71,6 @@ statements:
     args:
       command:
         type: string
-  - kind: validation_type
-    id: implementation_contract_valid
-    args:
-      path:
-        type: string
-        required: true
-
-  # Validation capabilities are generic, but commands are project-specific.
-  # Add compatible validation calls to implementation transitions after the
-  # target repository's language, manifests, and test entrypoints are known.
 
   - kind: artifact_type
     id: ProductSpec
@@ -98,9 +83,6 @@ statements:
     template: implementation-spec.md
   - kind: artifact_type
     id: ImplementationTaskFile
-  - kind: artifact_type
-    id: ImplementationContract
-    template: implementation-contract.yaml
 
   - kind: worker
     id: codex_direction
@@ -109,15 +91,11 @@ statements:
   - kind: worker
     id: codex_spec
     type: codex
-    instructions: [default, implementation-spec, implementation-spec-template, diagram-requirements]
+    instructions: [default, implementation-spec, implementation-spec-template, diagram-requirements, panalyzer-spec]
   - kind: worker
     id: codex_breakdown
     type: codex
-    instructions: [default, task-breakdown]
-  - kind: worker
-    id: codex_contract
-    type: codex
-    instructions: [default, execution-contract-authoring]
+    instructions: [default, task-breakdown, task-contract-format]
   - kind: worker
     id: qwen_27b
     type: local_llm
@@ -162,47 +140,57 @@ statements:
       artifact_type: ImplementationTaskFile
 
   - kind: transition
-    id: PrepareExecutionContract
-    task_type: ImplementationTask
-    from: Todo
-    to: ReadyToImplement
-    worker: codex_contract
-    default_for_scheduler: true
-    requires:
-      artifacts: [ImplementationContract]
-      validations:
-        - type: implementation_contract_valid
-          args:
-            path: output/implementation-contract.yaml
-
-  - kind: transition
     id: ImplementTask
     task_type: ImplementationTask
-    from: ReadyToImplement
-    to: SelfReview
+    from: Todo
+    to: SelfReview1
     worker: qwen_27b
     default_for_scheduler: true
     requires:
       changed_files:
         required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build
 
   - kind: transition
-    id: InvalidateExecutionContract
+    id: SelfReviewPass1
     task_type: ImplementationTask
-    from: ReadyToImplement
-    to: Todo
+    from: SelfReview1
+    to: SelfReview2
+    worker: qwen_27b
+    default_for_scheduler: true
+    instructions: [self-review]
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build
 
   - kind: transition
-    id: InvalidateReviewedExecutionContract
+    id: SelfReviewPass2
     task_type: ImplementationTask
-    from: SelfReview
-    to: Todo
-
-  - kind: transition
-    id: SelfReview
-    task_type: ImplementationTask
-    from: SelfReview
+    from: SelfReview2
     to: Done
     worker: qwen_27b
     default_for_scheduler: true
     instructions: [self-review]
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: npm test
+        - type: project_build
+          args:
+            command: npm run build

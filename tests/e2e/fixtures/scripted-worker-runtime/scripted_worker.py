@@ -118,6 +118,54 @@ if transition_id == "BreakDownImplementationSpec":
     })
     sys.exit(0 if status == 200 else 1)
 
+if transition_id == "PrepareExecutionContract":
+    write_output(
+        "implementation-contract.yaml",
+        (
+            "schema: tulid.implementation/v1\n"
+            "source:\n"
+            f'  task_id: "{task_id}"\n'
+            f'  source_intent_sha256: "{context["source_intent_sha256"]}"\n'
+            "profile: code_change\n"
+            "objective: Add a deterministic healthz entrypoint that returns ok.\n"
+            "change_surface:\n"
+            "  add: []\n"
+            "  edit: [app.py]\n"
+            "  forbidden: []\n"
+            "interfaces:\n"
+            "  - name: app.healthz\n"
+            "    behavior: Return the string ok.\n"
+            "requirements:\n"
+            "  - Preserve the repository's deterministic test and build checks.\n"
+            "failure_behavior: []\n"
+            "non_goals: []\n"
+            "checks:\n"
+            "  focused:\n"
+            "    - id: tests_pass\n"
+            "      argv: [python, check_repo.py, tests]\n"
+            "      timeout_seconds: 120\n"
+            "      expect:\n"
+            "        exit_code: 0\n"
+            "  invariants: []\n"
+        ),
+    )
+    status = submit({
+        "submission_id": "prepare-execution-contract",
+        "attempt": 1,
+        "summary": "execution contract prepared by scripted worker",
+        "artifacts": [
+            {
+                "type": "ImplementationContract",
+                "path": "implementation-contract.yaml",
+            },
+        ],
+        "changed_files": [],
+        "validation_evidence": {
+            "implementation_contract_valid": "contract matches task identity and source intent",
+        },
+    })
+    sys.exit(0 if status == 200 else 1)
+
 if transition_id == "ImplementTask":
     (workspace / "app.py").write_text(
         "def healthz():\n    return 'ok'\n",
@@ -137,12 +185,11 @@ if transition_id == "ImplementTask":
     sys.exit(0 if status == 200 else 1)
 
 if transition_id == "SelfReview":
-    append_workspace_file("app.py", "\n# self review\n")
-    if scenario == "self_review_reject_once":
-        rejected = submit({
-            "submission_id": "self-review-missing-changed-files",
+    if scenario == "self_review_no_change":
+        status = submit({
+            "submission_id": "self-review-no-change",
             "attempt": 1,
-            "summary": "self review omitted changed files first",
+            "summary": "self review found no in-scope defect",
             "artifacts": [],
             "changed_files": [],
             "validation_evidence": {
@@ -150,12 +197,12 @@ if transition_id == "SelfReview":
                 "project_build": "passed",
             },
         })
-        if rejected == 200:
-            print("expected missing changed_files submission to be rejected", file=sys.stderr)
-            sys.exit(1)
+        sys.exit(0 if status == 200 else 1)
+
+    append_workspace_file("app.py", "\n# self review\n")
     status = submit({
         "submission_id": "self-review",
-        "attempt": 2 if scenario == "self_review_reject_once" else 1,
+        "attempt": 1,
         "summary": "self review completed by scripted worker",
         "artifacts": [],
         "changed_files": ["app.py"],

@@ -28,7 +28,11 @@ from open_tulid.domain import (
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
-from open_tulid.runtime.executor import _build_runtime_prompt, render_execution_prompt
+from open_tulid.runtime.executor import (
+    _append_completion_submission,
+    _build_runtime_prompt,
+    render_execution_prompt,
+)
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 from socket_utils import can_bind_localhost
 
@@ -96,27 +100,32 @@ class FakeAdapter:
 
 
 def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_read_only():
-    prompt = _build_runtime_prompt(
-        job_id=JOB_ID,
-        task_title="Implement CLI",
-        task_body="Do the implementation work.",
-        transition_id="ImplementTask",
-        from_state="Todo",
-        to_state="SelfReview",
+    prompt = _append_completion_submission(
+        _build_runtime_prompt(
+            job_id=JOB_ID,
+            task_title="Implement CLI",
+            task_body="Do the implementation work.",
+            transition_id="ImplementTask",
+            from_state="Todo",
+            to_state="SelfReview",
+            required_artifacts=(),
+            derived_artifact_type=None,
+        ),
         required_artifacts=(),
         required_validations=("tests_pass",),
         required_validation_details=("tests_pass: run `npm test`",),
         changed_files_required=True,
         derived_artifact_type=None,
-        completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
 
     assert "## Role" in prompt
     assert "You are implementing one already-derived scoped task inside an existing plan." in prompt
     assert "## Primary Objective" in prompt
     assert "Success for this transition is not producing new planning artifacts." in prompt
+    assert prompt.index("## Task Body") < prompt.index("## Context Priority")
     assert "## Context Priority" in prompt
-    assert "The current task body is the authoritative scope boundary for this job." in prompt
+    assert "The current task is authoritative for the user-requested outcome." in prompt
+    assert "A generated execution contract, when present, is binding" in prompt
     assert "## Read-Only And Writable Paths" in prompt
     assert "No artifacts are required for this transition. Submit an empty `artifacts` array." in prompt
     assert "Treat existing files under `output/` as read-only context" in prompt
@@ -125,31 +134,37 @@ def test_build_runtime_prompt_for_non_artifact_transition_marks_output_context_r
     assert "## Validation Failure Policy" in prompt
     assert "After one full validation failure, switch to the smallest failing test" in prompt
     assert "same validation failure remains after two targeted fix attempts" in prompt
-    assert "## Completion Contract" in prompt
+    assert "## Completion Submission" in prompt
     assert "Required validation commands:" in prompt
     assert "- tests_pass: run `npm test`" in prompt
     assert "`changed_files` is required for this transition." in prompt
     assert "Completion is not implied by process exit code or workspace edits alone." in prompt
-    assert "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`." in prompt
+    assert "When the work and required validations are complete" in prompt
     assert "curl -sS -X POST \\" in prompt
     assert "--data-binary @- <<'JSON'" in prompt
     assert '"artifacts": [],' in prompt
+    assert '"validation_evidence": {"tests_pass": "command/result evidence"}' in prompt
+    assert prompt.count("curl -sS -X POST") == 1
+    assert prompt.count("tests_pass: run `npm test`") == 1
 
 
 def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
-    prompt = _build_runtime_prompt(
-        job_id=JOB_ID,
-        task_title="Write implementation spec",
-        task_body="Produce the implementation spec.",
-        transition_id="WriteImplementationSpec",
-        from_state="DirectionApproved",
-        to_state="SpecReady",
+    prompt = _append_completion_submission(
+        _build_runtime_prompt(
+            job_id=JOB_ID,
+            task_title="Write implementation spec",
+            task_body="Produce the implementation spec.",
+            transition_id="WriteImplementationSpec",
+            from_state="DirectionApproved",
+            to_state="SpecReady",
+            required_artifacts=("ImplementationSpec",),
+            derived_artifact_type=None,
+        ),
         required_artifacts=("ImplementationSpec",),
         required_validations=(),
         required_validation_details=(),
         changed_files_required=False,
         derived_artifact_type=None,
-        completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
 
     assert "## Role" in prompt
@@ -161,27 +176,32 @@ def test_build_runtime_prompt_for_planning_transition_uses_planning_framing():
     assert "Treat repository source files as read-only context for planning transitions" in prompt
     assert "Write required completion artifacts under `output/`." in prompt
     assert "Only create the artifact files explicitly required for this transition." in prompt
+    assert prompt.count("curl -sS -X POST") == 1
 
 
 def test_build_runtime_prompt_for_derived_transition_requires_artifact_submission_per_file():
-    prompt = _build_runtime_prompt(
-        job_id=JOB_ID,
-        task_title="Break down spec",
-        task_body="Generate child tasks.",
-        transition_id="BreakDownImplementationSpec",
-        from_state="ReadyForBreakdown",
-        to_state="Done",
+    prompt = _append_completion_submission(
+        _build_runtime_prompt(
+            job_id=JOB_ID,
+            task_title="Break down spec",
+            task_body="Generate child tasks.",
+            transition_id="BreakDownImplementationSpec",
+            from_state="ReadyForBreakdown",
+            to_state="Done",
+            required_artifacts=(),
+            derived_artifact_type="ImplementationTaskFile",
+        ),
         required_artifacts=(),
         required_validations=(),
         required_validation_details=(),
         changed_files_required=False,
         derived_artifact_type="ImplementationTaskFile",
-        completion_endpoint="http://127.0.0.1/jobs/test/complete",
     )
 
     assert "You are executing a planning or artifact-producing workflow transition for this project." in prompt
     assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in prompt
     assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in prompt
+    assert prompt.count("curl -sS -X POST") == 1
 
 
 def test_render_execution_prompt_builds_complete_packet_without_running_job():
@@ -203,7 +223,8 @@ def test_render_execution_prompt_builds_complete_packet_without_running_job():
     assert "Transition: code (Todo -> CodeReview)" in rendered.text
     assert "Make the thing work." in rendered.text
     assert "$OPEN_TULID_COMPLETION_ENDPOINT" in rendered.text
-    assert "## Final Required Step" in rendered.text
+    assert "## Completion Submission" in rendered.text
+    assert rendered.text.count("curl -sS -X POST") == 1
 
 
 def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
@@ -284,10 +305,12 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     assert seen["prompt"] == "/workspace/project/.open-tulid/prompt-packet.md"
     assert (workspace / ".open-tulid" / "prompt-packet.md").is_file()
     prompt = (workspace / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
-    assert "## Final Required Step" in prompt
-    assert "ULTRA IMPORTANT: before exiting successfully, submit completion evidence with `curl` exactly as shown below." in prompt
+    assert "## Completion Submission" in prompt
+    assert "When the work and required validations are complete, submit completion evidence with `curl`." in prompt
     assert "curl -sS -X POST \\" in prompt
-    assert prompt.rstrip().endswith("A zero exit code without this curl completion submission is a failed Tulid job.")
+    assert prompt.rstrip().endswith(
+        "A zero exit code without an accepted completion submission is a failed Tulid job."
+    )
     assert adapter.moved_to == "CodeReview"
     loaded = store.get(JOB_ID)
     assert loaded.job is not None
@@ -644,6 +667,8 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         assert "Linked Reference Context: artifacts/spec.md" in prompt
         assert "supports implementation decisions but does not redefine the assigned task scope" in prompt
         assert "Default instructions." in prompt
+        assert prompt.count("curl -sS -X POST") == 1
+        assert prompt.index("Default instructions.") < prompt.index("## Completion Submission")
         return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=17)
 
     monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)

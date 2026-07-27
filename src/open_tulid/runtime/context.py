@@ -20,6 +20,7 @@ class ContextDocument:
     path: Path
     content: str
     sha256: str
+    is_execution_contract: bool = False
 
 
 @dataclass(frozen=True)
@@ -54,12 +55,15 @@ class LinkedContextResolver:
         total_bytes = 0
 
         queue: list[tuple[str, int, bool]] = []
-        queue.extend((link, 0, True) for link in task.artifact_links)
+        queue.extend(
+            (link, 0, True)
+            for link in _active_artifact_links(task.artifact_links)
+        )
         queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(task.body)))
         for parent_task in parent_tasks:
             queue.extend(
                 (link, 0, True)
-                for link in parent_task.artifact_links
+                for link in _active_artifact_links(parent_task.artifact_links)
                 if not _is_implementation_task_file_link(link)
             )
             queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(parent_task.body)))
@@ -116,19 +120,13 @@ class LinkedContextResolver:
                 path=path,
                 content=content,
                 sha256=content_hash,
+                is_execution_contract=_is_implementation_contract_link(ref),
             ))
             queue.extend((link, depth + 1, False) for link in _wiki_links(content))
 
         if errors:
             return ContextPacketResult(errors=tuple(errors))
-        text = "\n\n".join(
-            f"# Linked Reference Context: {doc.ref}\n"
-            "This document is background reference material. It supports implementation decisions but does not redefine the assigned task scope.\n"
-            f"Source: {doc.path}\n"
-            f"SHA256: {doc.sha256}\n\n"
-            f"{doc.content.strip()}"
-            for doc in docs
-        )
+        text = "\n\n".join(_render_context_document(doc) for doc in docs)
         return ContextPacketResult(packet=ContextPacket(
             documents=tuple(docs),
             text=text,
@@ -169,6 +167,54 @@ def _wiki_links(text: str) -> tuple[str, ...]:
 
 def _is_implementation_task_file_link(ref: str) -> bool:
     return "ImplementationTaskFile" in Path(_clean_ref(ref)).parts
+
+
+def _is_implementation_contract_link(ref: str) -> bool:
+    clean = Path(_clean_ref(ref))
+    return (
+        "ImplementationContract" in clean.parts
+        or clean.name == "implementation-contract.yaml"
+    )
+
+
+def _active_artifact_links(links: tuple[str, ...]) -> tuple[str, ...]:
+    latest_contract_index = next(
+        (
+            index
+            for index in range(len(links) - 1, -1, -1)
+            if _is_implementation_contract_link(links[index])
+        ),
+        None,
+    )
+    return tuple(
+        link
+        for index, link in enumerate(links)
+        if not _is_implementation_contract_link(link)
+        or index == latest_contract_index
+    )
+
+
+def _render_context_document(document: ContextDocument) -> str:
+    if document.is_execution_contract:
+        heading = f"# Generated Execution Contract: {document.ref}"
+        policy = (
+            "This validated contract is binding for implementation scope, interfaces, "
+            "requirements, and checks. It refines the user-requested outcome but must "
+            "never broaden or replace it."
+        )
+    else:
+        heading = f"# Linked Reference Context: {document.ref}"
+        policy = (
+            "This document is background reference material. It supports implementation "
+            "decisions but does not redefine the assigned task scope."
+        )
+    return (
+        f"{heading}\n"
+        f"{policy}\n"
+        f"Source: {document.path}\n"
+        f"SHA256: {document.sha256}\n\n"
+        f"{document.content.strip()}"
+    )
 
 
 def sanitize_task_body_for_runtime(text: str) -> str:

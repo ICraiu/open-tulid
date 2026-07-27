@@ -9,6 +9,8 @@
 
 ## Todo
 
+## Ready to implement
+
 ## Self review
 
 ## Done

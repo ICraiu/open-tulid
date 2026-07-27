@@ -28,6 +28,10 @@ from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, 
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
+from open_tulid.runtime.task_contracts import (
+    implementation_contract_required,
+    validate_task_implementation_contract,
+)
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
 from open_tulid.runtime.workspaces import WorkspacePreparer
@@ -87,11 +91,7 @@ def render_execution_prompt(
         from_state=transition.from_state,
         to_state=transition.to_state,
         required_artifacts=transition.requires.artifacts,
-        required_validations=_validation_ids(transition.requires.validations),
-        required_validation_details=_validation_details(transition.requires.validations),
-        changed_files_required=transition.requires.changed_files_required,
         derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
-        completion_endpoint=completion_endpoint,
     )
     prompt_packet = None
     project_root = _adapter_project_root(adapter)
@@ -121,12 +121,13 @@ def render_execution_prompt(
         prompt_packet = prompt_result.packet
         if prompt_packet is not None:
             prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
-    prompt_text = _append_final_completion_reminder(
+    prompt_text = _append_completion_submission(
         prompt_text,
         required_artifacts=transition.requires.artifacts,
         required_validations=_validation_ids(transition.requires.validations),
         required_validation_details=_validation_details(transition.requires.validations),
         changed_files_required=transition.requires.changed_files_required,
+        derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
     )
     return PromptRenderResult(
         text=prompt_text,
@@ -193,6 +194,20 @@ class JobExecutor:
         task_result = self.adapter.read_task(job.task_id)
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
+        project_root = _adapter_project_root(self.adapter)
+        if (
+            project_root is not None
+            and implementation_contract_required(
+                task_result.task,
+                self.workflow,
+            )
+        ):
+            contract = validate_task_implementation_contract(
+                project_root,
+                task_result.task,
+            )
+            if not contract.accepted:
+                return self._fail_before_run(job, contract.errors[0])
 
         required_resources = self.runtime.worker_resources.get(job.worker_id, ())
         lease_acquired = False
@@ -792,19 +807,13 @@ def _build_runtime_prompt(
     from_state: str,
     to_state: str,
     required_artifacts: tuple[str, ...],
-    required_validations: tuple[str, ...],
-    required_validation_details: tuple[str, ...],
-    changed_files_required: bool,
     derived_artifact_type: str | None,
-    completion_endpoint: str,
 ) -> str:
     variant = _runtime_prompt_variant(
         transition_id=transition_id,
         required_artifacts=required_artifacts,
         derived_artifact_type=derived_artifact_type,
     )
-    artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
-    validations = ", ".join(required_validations) if required_validations else "none"
     sections: list[str] = [
         "# Open Tulid Job",
         "",
@@ -816,65 +825,39 @@ def _build_runtime_prompt(
         "",
         _render_prompt_primary_objective_section(variant),
         "",
+        "## Task Body",
+        task_body.strip(),
+        "",
         _render_prompt_priority_section(variant),
         "",
         _render_prompt_paths_section(variant, required_artifacts=required_artifacts),
         "",
         _render_validation_failure_policy_section(variant),
-        "",
-        _render_prompt_completion_section(
-            completion_endpoint=completion_endpoint,
-            required_artifacts=required_artifacts,
-            required_validations=required_validations,
-            required_validation_details=required_validation_details,
-            changed_files_required=changed_files_required,
-            derived_artifact_type=derived_artifact_type,
-            artifacts=artifacts,
-            validations=validations,
-        ),
-        "",
-        "## Task Body",
-        task_body.strip(),
     ]
     return "\n".join(sections)
 
 
-def _append_final_completion_reminder(
+def _append_completion_submission(
     prompt_text: str,
     *,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
     required_validation_details: tuple[str, ...],
     changed_files_required: bool,
+    derived_artifact_type: str | None,
 ) -> str:
+    artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
     validations = ", ".join(required_validations) if required_validations else "none"
-    lines = [
-        "## Final Required Step",
-        "ULTRA IMPORTANT: do not stop after editing files, running tests, or building the project.",
-        "ULTRA IMPORTANT: before exiting successfully, submit completion evidence with `curl` exactly as shown below.",
-        "ULTRA IMPORTANT: if `curl` is missing or the request fails, treat that as a blocking runtime error and report it instead of exiting successfully.",
-        "",
-        "```sh",
-        "curl -sS -X POST \\",
-        "  -H \"content-type: application/json\" \\",
-        "  -H \"x-open-tulid-completion-token: $OPEN_TULID_COMPLETION_TOKEN\" \\",
-        "  \"$OPEN_TULID_COMPLETION_ENDPOINT\" \\",
-        "  --data-binary @- <<'JSON'",
-        "{",
-        "    \"summary\": \"what changed\",",
-        _completion_artifacts_line(required_artifacts),
-        "    \"changed_files\": [\"relative/workspace/path\"],",
-        "    \"validation_evidence\": {\"validation-id\": \"command/result evidence\"}",
-        "}",
-        "JSON",
-        "```",
-        "",
-        f"Required validations to report: {validations}.",
-        *_render_validation_detail_lines(required_validation_details),
-        *_render_changed_files_required_lines(changed_files_required),
-        "A zero exit code without this curl completion submission is a failed Tulid job.",
-    ]
-    return f"{prompt_text.rstrip()}\n\n" + "\n".join(lines)
+    completion = _render_prompt_completion_section(
+        required_artifacts=required_artifacts,
+        required_validations=required_validations,
+        required_validation_details=required_validation_details,
+        changed_files_required=changed_files_required,
+        derived_artifact_type=derived_artifact_type,
+        artifacts=artifacts,
+        validations=validations,
+    )
+    return f"{prompt_text.rstrip()}\n\n{completion}"
 
 
 def _runtime_prompt_variant(
@@ -914,7 +897,7 @@ def _render_prompt_primary_objective_section(variant: str) -> str:
     if variant == "implementation":
         lines = (
             "## Primary Objective",
-            "Complete the implementation work defined by the current task body in this workspace.",
+            "Complete the user-requested outcome defined by the current task and its generated execution contract when present.",
             "Make the required code or test changes, satisfy the required validations, and submit explicit completion evidence.",
             "Success for this transition is not producing new planning artifacts.",
         )
@@ -931,10 +914,11 @@ def _render_prompt_priority_section(variant: str) -> str:
     if variant == "implementation":
         lines = (
             "## Context Priority",
-            "1. The current task body is the authoritative scope boundary for this job.",
-            "2. Required validations and completion requirements are mandatory.",
-            "3. Parent and linked context are background reference material only.",
-            "4. If reference material suggests broader project work, stay within the current task instead of expanding scope.",
+            "1. The current task is authoritative for the user-requested outcome.",
+            "2. A generated execution contract, when present, is binding for the resolved objective, change surface, interfaces, requirements, and checks; it may refine but never broaden that outcome.",
+            "3. Required validations and completion requirements are mandatory.",
+            "4. Other parent and linked context is background reference material only.",
+            "5. If reference material suggests broader project work, stay within the task and contract instead of expanding scope.",
         )
     else:
         lines = (
@@ -989,7 +973,6 @@ def _render_validation_failure_policy_section(variant: str) -> str:
 
 def _render_prompt_completion_section(
     *,
-    completion_endpoint: str,
     required_artifacts: tuple[str, ...],
     required_validations: tuple[str, ...],
     required_validation_details: tuple[str, ...],
@@ -999,7 +982,7 @@ def _render_prompt_completion_section(
     validations: str,
 ) -> str:
     lines = [
-        "## Completion Contract",
+        "## Completion Submission",
         f"Required artifacts: {artifacts}",
         f"Required validations: {validations}",
     ]
@@ -1025,8 +1008,9 @@ def _render_prompt_completion_section(
         *_render_validation_detail_lines(required_validation_details),
         *_render_changed_files_required_lines(changed_files_required),
         "",
-        "ULTRA IMPORTANT: when ready, submit completion evidence with `curl`.",
-        "Do not exit successfully until the curl request has been made and accepted.",
+        "When the work and required validations are complete, submit completion evidence with `curl`.",
+        "Do not exit successfully until this request has been made and accepted.",
+        "If `curl` is unavailable or the request fails, treat that as a blocking runtime error.",
         "If the response says `completion.in_progress`, remain active and wait for the final completion response instead of exiting.",
         "",
         "```sh",
@@ -1039,13 +1023,14 @@ def _render_prompt_completion_section(
         "    \"summary\": \"what changed\",",
         _completion_artifacts_line(required_artifacts),
         "    \"changed_files\": [\"relative/workspace/path\"],",
-        "    \"validation_evidence\": {\"validation-id\": \"command/result evidence\"}",
+        _completion_validation_evidence_line(required_validations),
         "}",
         "JSON",
         "```",
         "",
         "If completion is rejected, use the returned errors as feedback, fix the workspace, and submit again.",
         "If completion is still in progress, remain active and wait for the final completion response instead of exiting.",
+        "A zero exit code without an accepted completion submission is a failed Tulid job.",
     ))
     return "\n".join(lines)
 
@@ -1074,6 +1059,16 @@ def _completion_artifacts_line(required_artifacts: tuple[str, ...]) -> str:
         return '    "artifacts": [],'
     artifact_example = f'{{"type": "{required_artifacts[0]}", "path": "relative/path/in/output"}}'
     return f'    "artifacts": [{artifact_example}],'
+
+
+def _completion_validation_evidence_line(required_validations: tuple[str, ...]) -> str:
+    if not required_validations:
+        return '    "validation_evidence": {}'
+    entries = ", ".join(
+        f'"{validation}": "command/result evidence"'
+        for validation in required_validations
+    )
+    return f'    "validation_evidence": {{{entries}}}'
 
 
 def _worker_args(

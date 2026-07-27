@@ -207,6 +207,92 @@ def tests_pass(context: WorkflowExecutionContext, **kwargs: Any) -> ValidationRe
     )
 
 
+def implementation_contract_valid(
+    context: WorkflowExecutionContext,
+    **kwargs: Any,
+) -> ValidationResult:
+    from open_tulid.runtime.task_contracts import parse_implementation_contract_file
+
+    path = _path_arg(
+        context,
+        kwargs,
+        "path",
+        fallback_keys=("artifact", "file"),
+    )
+    if path is None:
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            "path is required",
+        )
+    project_root = context.project_root
+    if project_root is None:
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            "project_root is required",
+        )
+    resolved_root = project_root.resolve()
+    resolved_path = path.resolve()
+    if resolved_root != resolved_path and resolved_root not in resolved_path.parents:
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            "Implementation contract path must stay inside the job workspace.",
+            {"error_codes": ["contract.path_escape"]},
+        )
+    context_path = project_root / ".open-tulid" / "job-context.json"
+    try:
+        job_context = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            f"Cannot read job context: {exc}",
+        )
+    task_payload = job_context.get("task")
+    task_id = task_payload.get("id") if isinstance(task_payload, Mapping) else None
+    source_hash = job_context.get("source_intent_sha256")
+    if not isinstance(task_id, str) or not isinstance(source_hash, str):
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            "Job context is missing task identity or source intent hash.",
+        )
+    parsed = parse_implementation_contract_file(
+        path,
+        expected_task_id=task_id,
+        expected_source_intent_sha256=source_hash,
+    )
+    if not parsed.accepted:
+        message = "; ".join(
+            f"{error.code}: {error.message}"
+            for error in parsed.errors
+        )
+        return _validation(
+            False,
+            "implementation_contract_valid",
+            message,
+            {"error_codes": [error.code for error in parsed.errors]},
+        )
+    contract = parsed.contract
+    assert contract is not None
+    return _validation(
+        True,
+        "implementation_contract_valid",
+        (
+            f"Implementation contract is valid for task {contract.source_task_id} "
+            f"with profile {contract.profile}."
+        ),
+        {
+            "schema": contract.schema,
+            "profile": contract.profile,
+            "focused_checks": [check.id for check in contract.focused_checks],
+            "invariants": list(contract.invariants),
+        },
+    )
+
+
 def link_target_exists(context: WorkflowExecutionContext, **kwargs: Any) -> ValidationResult:
     link = _first_string(kwargs, "link", "target", "path")
     if not link:
@@ -370,6 +456,7 @@ VALIDATION_IMPLEMENTATIONS = {
     "artifacts_match_template": artifacts_match_template,
     "branch_exists": branch_exists,
     "tests_pass": tests_pass,
+    "implementation_contract_valid": implementation_contract_valid,
     "link_target_exists": link_target_exists,
 }
 
