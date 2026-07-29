@@ -409,6 +409,13 @@ def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: P
     assert result.transition_id == "implement"
     assert result.job is not None
     assert result.job.worker_id == "qwen"
+    assert result.job.metadata["execution_contract_sha256"]
+    assert result.job.metadata["execution_contract"]["source"]["task"]["body"] == (
+        "Please add healthz in whatever structure is appropriate."
+    )
+    assert result.events[0].data["execution_contract_sha256"] == (
+        result.job.metadata["execution_contract_sha256"]
+    )
 
 
 def test_scheduler_invalidates_stale_contract_before_qwen_is_scheduled(tmp_path: Path):

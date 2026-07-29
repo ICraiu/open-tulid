@@ -53,6 +53,7 @@ from open_tulid.runtime import (
     build_event,
     check_backend_readiness,
     cleanup_job_workspaces,
+    compile_task_execution_contract,
     recover_job_creation_transactions,
     recover_completion_transactions,
     render_execution_prompt,
@@ -63,6 +64,7 @@ from open_tulid.runtime import (
     human_event_type,
     new_ulid,
 )
+from open_tulid.runtime.task_contracts import find_implementation_contract_path
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
 from open_tulid.workflow.runtime import load_workflow_definition
@@ -433,6 +435,7 @@ def schedule_job(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         project_root=ctx.get("project_path"),
+        repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )
     result = scheduler.schedule_one(project)
     if not result.accepted:
@@ -476,12 +479,14 @@ def create_job(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         project_root=ctx.get("project_path"),
+        repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )
     manager = TaskManager(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
         job_store=None,
         project_root=ctx.get("project_path"),
+        repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )
     command = CreateExecutionJob(
         project_id=project,
@@ -681,6 +686,7 @@ def run_one_job(
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         project_root=ctx.get("project_path"),
+        repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )
     scheduled = scheduler.schedule_one(project)
     if not scheduled.accepted:
@@ -721,6 +727,7 @@ def jobs_daemon(
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
             project_root=ctx.get("project_path"),
+            repo_root=getattr(ctx.get("project_config"), "repo_root", None),
         )
         scheduled = scheduler.schedule_one(project)
         if not scheduled.accepted:
@@ -1273,6 +1280,30 @@ def render_prompt(
         assert transition is not None
 
     assert transition.worker is not None
+    execution_contract = None
+    task_type = getattr(workflow, "task_types", {}).get(task.task_type)
+    source_requirements = (
+        task_type.requirements_by_state.get(transition.from_state)
+        if task_type is not None
+        else None
+    )
+    if (
+        source_requirements is not None
+        and "ImplementationContract" in source_requirements.artifacts
+        and find_implementation_contract_path(project_path, task) is not None
+    ):
+        compiled = compile_task_execution_contract(
+            project_root=project_path,
+            repo_root=_project_config(config, project).repo_root,
+            task=task,
+            transition=transition,
+        )
+        if not compiled.accepted or compiled.contract is None:
+            _print_domain_errors(compiled.errors)
+            raise typer.Exit(1)
+        execution_contract = compiled.contract
+        task = execution_contract.source_task
+        transition = execution_contract.transition
     rendered = render_execution_prompt(
         workflow=workflow,
         adapter=adapter,
@@ -1281,6 +1312,7 @@ def render_prompt(
         worker_id=transition.worker,
         job_id=job_id,
         completion_endpoint=f"http://preview.invalid/jobs/{job_id}/complete",
+        execution_contract=execution_contract,
     )
     if not rendered.accepted:
         _print_domain_errors(rendered.errors)

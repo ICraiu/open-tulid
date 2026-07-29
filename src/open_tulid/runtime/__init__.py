@@ -15,6 +15,25 @@ from .events import (
 )
 from .operation_log import OperationEventLogger
 from .jobs import ACTIVE_JOB_STATUSES, FileExecutionJobStore, JobStoreResult
+from .execution_contracts import (
+    EXECUTION_CONTRACT_SCHEMA,
+    ExecutionContract,
+    ExecutionContractResult,
+    ResolvedCheck,
+    compile_task_execution_contract,
+    execution_contract_to_dict,
+    load_job_execution_contract,
+)
+from .repository_facts import (
+    BASELINE_MANIFEST_SCHEMA,
+    REPOSITORY_FACTS_SCHEMA,
+    BaselineManifest,
+    FileManifestEntry,
+    RepositoryFacts,
+    RepositorySnapshot,
+    RepositorySnapshotResult,
+    capture_repository_snapshot,
+)
 from .instructions import (
     AgentInstructionResolver,
     InstructionDocument,
@@ -101,6 +120,21 @@ __all__ = [
     "ACTIVE_JOB_STATUSES",
     "FileExecutionJobStore",
     "JobStoreResult",
+    "EXECUTION_CONTRACT_SCHEMA",
+    "ExecutionContract",
+    "ExecutionContractResult",
+    "ResolvedCheck",
+    "compile_task_execution_contract",
+    "execution_contract_to_dict",
+    "load_job_execution_contract",
+    "BASELINE_MANIFEST_SCHEMA",
+    "REPOSITORY_FACTS_SCHEMA",
+    "BaselineManifest",
+    "FileManifestEntry",
+    "RepositoryFacts",
+    "RepositorySnapshot",
+    "RepositorySnapshotResult",
+    "capture_repository_snapshot",
     "AgentInstructionResolver",
     "InstructionDocument",
     "PromptPacket",

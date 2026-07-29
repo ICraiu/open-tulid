@@ -17,9 +17,12 @@ from open_tulid.domain import (
 )
 
 from .events import build_event, new_ulid
+from .execution_contracts import (
+    compile_task_execution_contract,
+    execution_contract_to_dict,
+)
 from .task_contracts import (
     implementation_contract_required,
-    validate_task_implementation_contract,
 )
 
 
@@ -73,11 +76,13 @@ class TaskManager:
         adapter: StorageAdapter,
         job_store: object | None = None,
         project_root: Path | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
         self.job_store = job_store
         self.project_root = project_root
+        self.repo_root = repo_root
 
     def handle(
         self,
@@ -213,13 +218,23 @@ class TaskManager:
                 f"Transition {transition.id!r} has no worker.",
                 transition.id,
             ),))
-        if (
-            self.project_root is not None
-            and implementation_contract_required(task, self.workflow)
-        ):
-            contract = validate_task_implementation_contract(self.project_root, task)
-            if not contract.accepted:
-                return CommandResult(accepted=False, errors=contract.errors)
+        frozen_contract = None
+        if implementation_contract_required(task, self.workflow):
+            if self.project_root is None:
+                return CommandResult(accepted=False, errors=(_error(
+                    "execution_contract.project_root_missing",
+                    "Contract-backed execution requires a project tracker root.",
+                    task.id,
+                ),))
+            compiled = compile_task_execution_contract(
+                project_root=self.project_root,
+                repo_root=self.repo_root,
+                task=task,
+                transition=transition,
+            )
+            if not compiled.accepted or compiled.contract is None:
+                return CommandResult(accepted=False, errors=compiled.errors)
+            frozen_contract = compiled.contract
         job_id = command.job_id or new_ulid()
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
@@ -233,6 +248,14 @@ class TaskManager:
             metadata={
                 "completion_token": secrets.token_urlsafe(24),
                 "output_path": str(output_path),
+                **(
+                    {
+                        "execution_contract": execution_contract_to_dict(frozen_contract),
+                        "execution_contract_sha256": frozen_contract.sha256,
+                    }
+                    if frozen_contract is not None
+                    else {}
+                ),
             },
         )
         if self.job_store is not None:
@@ -252,7 +275,15 @@ class TaskManager:
                 task_id=command.task_id,
                 transition_id=command.transition_id,
                 job_id=job.job_id,
-                data={"worker_id": job.worker_id, "workspace_path": job.workspace_path},
+                data={
+                    "worker_id": job.worker_id,
+                    "workspace_path": job.workspace_path,
+                    **(
+                        {"execution_contract_sha256": frozen_contract.sha256}
+                        if frozen_contract is not None
+                        else {}
+                    ),
+                },
             ),
         )
         effects = ({"type": "create_execution_job", "job": _job_to_dict(job)},)

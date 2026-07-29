@@ -8,6 +8,17 @@ from typing import Mapping
 
 from open_tulid.domain import DomainError, ExecutionJob, Task, TransitionDefinition
 from open_tulid.runtime.context import sanitize_task_body_for_runtime
+from open_tulid.runtime.execution_contracts import (
+    ExecutionContract,
+    execution_contract_to_dict,
+    load_job_execution_contract,
+)
+from open_tulid.runtime.repository_facts import (
+    EXCLUDED_DIRECTORY_NAMES,
+    baseline_manifest_to_dict,
+    capture_repository_snapshot,
+    repository_facts_to_dict,
+)
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
 
 
@@ -46,6 +57,9 @@ class WorkspacePreparer:
     ) -> WorkspacePrepareResult:
         workspace = Path(job.workspace_path)
         output_dir = workspace / "output"
+        frozen = load_job_execution_contract(job)
+        if not frozen.accepted:
+            return WorkspacePrepareResult(error=frozen.errors[0])
         try:
             workspace.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -57,6 +71,30 @@ class WorkspacePreparer:
                         location=str(self.repo_root),
                     ))
                 _copy_repo(self.repo_root, workspace)
+            if frozen.contract is not None:
+                copied = capture_repository_snapshot(workspace)
+                if not copied.accepted or copied.snapshot is None:
+                    return WorkspacePrepareResult(error=(
+                        copied.errors[0]
+                        if copied.errors
+                        else DomainError(
+                            code="workspace.baseline_capture_failed",
+                            message="Cannot capture the prepared workspace baseline.",
+                            location=str(workspace),
+                        )
+                    ))
+                if (
+                    copied.snapshot.baseline.sha256
+                    != frozen.contract.baseline_manifest.sha256
+                ):
+                    return WorkspacePrepareResult(error=DomainError(
+                        code="workspace.baseline_mismatch",
+                        message=(
+                            "Repository contents changed after this job's execution "
+                            "contract was frozen."
+                        ),
+                        location=str(workspace),
+                    ))
             _write_context(
                 workspace=workspace,
                 job=job,
@@ -64,6 +102,7 @@ class WorkspacePreparer:
                 transition=transition,
                 output_dir=output_dir,
                 completion_endpoint=completion_endpoint,
+                execution_contract=frozen.contract,
             )
         except OSError as exc:
             return WorkspacePrepareResult(error=DomainError(
@@ -99,7 +138,7 @@ def cleanup_job_workspaces(jobs: tuple[ExecutionJob, ...]) -> WorkspaceCleanupRe
 
 def _copy_repo(source: Path, target: Path) -> None:
     for child in source.iterdir():
-        if child.name in {".git", ".open-tulid", "__pycache__"}:
+        if child.name in EXCLUDED_DIRECTORY_NAMES:
             continue
         destination = target / child.name
         if child.is_dir():
@@ -107,7 +146,7 @@ def _copy_repo(source: Path, target: Path) -> None:
                 child,
                 destination,
                 dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"),
+                ignore=shutil.ignore_patterns(*EXCLUDED_DIRECTORY_NAMES),
             )
         else:
             shutil.copy2(child, destination)
@@ -121,6 +160,7 @@ def _write_context(
     transition: TransitionDefinition,
     output_dir: Path,
     completion_endpoint: str | None,
+    execution_contract: ExecutionContract | None,
 ) -> None:
     context_dir = workspace / ".open-tulid"
     context_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +179,26 @@ def _write_context(
         "output_path": str(output_dir),
         "container_output_path": "/workspace/project/output",
         "source_intent_sha256": task_source_intent_sha256(task),
+        "execution_contract_sha256": (
+            execution_contract.sha256
+            if execution_contract is not None
+            else None
+        ),
+        "execution_contract_path": (
+            ".open-tulid/execution-contract.json"
+            if execution_contract is not None
+            else None
+        ),
+        "repository_facts_path": (
+            ".open-tulid/repository-facts.json"
+            if execution_contract is not None
+            else None
+        ),
+        "baseline_manifest_path": (
+            ".open-tulid/baseline-manifest.json"
+            if execution_contract is not None
+            else None
+        ),
         "task": {
             "id": task.id,
             "title": task.title,
@@ -153,6 +213,26 @@ def _write_context(
         },
     }
     (context_dir / "job-context.json").write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    if execution_contract is not None:
+        _write_json(
+            context_dir / "execution-contract.json",
+            execution_contract_to_dict(execution_contract),
+        )
+        _write_json(
+            context_dir / "repository-facts.json",
+            repository_facts_to_dict(execution_contract.repository_facts),
+        )
+        _write_json(
+            context_dir / "baseline-manifest.json",
+            baseline_manifest_to_dict(execution_contract.baseline_manifest),
+        )
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.write_text(
         json.dumps(payload, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )

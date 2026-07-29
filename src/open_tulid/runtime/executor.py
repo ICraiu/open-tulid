@@ -25,6 +25,10 @@ from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, R
 from open_tulid.runtime.completion import CompletionService
 from open_tulid.runtime.completion_http import CompletionEndpointConfig, serve_completion_endpoint
 from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, build_event
+from open_tulid.runtime.execution_contracts import (
+    ExecutionContract,
+    load_job_execution_contract,
+)
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
@@ -63,6 +67,7 @@ class ExecutorRunResult:
 class PromptRenderResult:
     text: str = ""
     instruction_packet: PromptPacket | None = None
+    execution_contract_sha256: str | None = None
     errors: tuple[DomainError, ...] = ()
 
     @property
@@ -79,6 +84,7 @@ def render_execution_prompt(
     worker_id: str,
     job_id: str,
     completion_endpoint: str,
+    execution_contract: ExecutionContract | None = None,
 ) -> PromptRenderResult:
     """Render the exact model prompt for an execution job without running it."""
     worker = workflow.workers.get(worker_id)
@@ -132,6 +138,11 @@ def render_execution_prompt(
     return PromptRenderResult(
         text=prompt_text,
         instruction_packet=prompt_packet,
+        execution_contract_sha256=(
+            execution_contract.sha256
+            if execution_contract is not None
+            else None
+        ),
     )
 
 
@@ -187,16 +198,32 @@ class JobExecutor:
                 f"Execution job {job.job_id!r} is terminal: {job_status}.",
                 job.job_id,
             ),))
-        transition = self.workflow.transitions.get(job.transition_id)
+        frozen = load_job_execution_contract(job)
+        if not frozen.accepted:
+            return self._fail_before_run(job, frozen.errors[0])
+        transition = (
+            frozen.contract.transition
+            if frozen.contract is not None
+            else self.workflow.transitions.get(job.transition_id)
+        )
         if transition is None:
-            return ExecutorRunResult(False, errors=(_error("transition.not_found", "Transition was not found."),))
+            return ExecutorRunResult(False, errors=(_error(
+                "transition.not_found",
+                "Transition was not found.",
+            ),))
         worker = self.workflow.workers.get(job.worker_id)
         task_result = self.adapter.read_task(job.task_id)
         if not task_result.accepted or task_result.task is None:
             return ExecutorRunResult(False, errors=task_result.errors or (_error("task.not_found", "Task was not found."),))
+        execution_task = (
+            frozen.contract.source_task
+            if frozen.contract is not None
+            else task_result.task
+        )
         project_root = _adapter_project_root(self.adapter)
         if (
-            project_root is not None
+            frozen.contract is None
+            and project_root is not None
             and implementation_contract_required(
                 task_result.task,
                 self.workflow,
@@ -232,7 +259,7 @@ class JobExecutor:
             endpoint = self._start_completion_endpoint(job.job_id)
             prepared = WorkspacePreparer(repo_root=self.project_config.repo_root).prepare(
                 job=job,
-                task=task_result.task,
+                task=execution_task,
                 transition=transition,
                 completion_endpoint=endpoint.url,
             )
@@ -246,11 +273,12 @@ class JobExecutor:
             rendered_prompt = render_execution_prompt(
                 workflow=self.workflow,
                 adapter=self.adapter,
-                task=task_result.task,
+                task=execution_task,
                 transition=transition,
                 worker_id=job.worker_id,
                 job_id=job.job_id,
                 completion_endpoint=endpoint.url,
+                execution_contract=frozen.contract,
             )
             if not rendered_prompt.accepted:
                 endpoint.stop()

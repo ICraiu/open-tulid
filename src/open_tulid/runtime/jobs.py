@@ -24,6 +24,11 @@ ACTIVE_JOB_STATUSES = frozenset({
     ExecutionJobStatus.STALE.value,
 })
 
+IMMUTABLE_JOB_METADATA_KEYS = frozenset({
+    "execution_contract",
+    "execution_contract_sha256",
+})
+
 
 @dataclass(frozen=True)
 class JobStoreResult:
@@ -138,7 +143,19 @@ class FileExecutionJobStore:
         job = loaded.job
         now = utc_now()
         merged_metadata = dict(job.metadata)
-        merged_metadata.update(dict(metadata or {}))
+        updates = dict(metadata or {})
+        for key in IMMUTABLE_JOB_METADATA_KEYS:
+            if (
+                key in updates
+                and key in merged_metadata
+                and updates[key] != merged_metadata[key]
+            ):
+                return JobStoreResult(error=DomainError(
+                    code="job.immutable_metadata",
+                    message=f"Execution job metadata field {key!r} is immutable.",
+                    location=job_id,
+                ))
+        merged_metadata.update(updates)
         merged_metadata["updated_at"] = now
         updated = ExecutionJob(
             job_id=job.job_id,

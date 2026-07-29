@@ -15,6 +15,7 @@ from ruamel.yaml import YAML
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, WorkflowDefinition
 from open_tulid.runtime.events import JsonlEventStore, build_event, new_ulid, utc_now
+from open_tulid.runtime.execution_contracts import load_job_execution_contract
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
@@ -159,7 +160,14 @@ class CompletionService:
                 job_id,
             ),))
 
-        transition = self.workflow.transitions.get(job.transition_id)
+        frozen = load_job_execution_contract(job)
+        if not frozen.accepted:
+            return CompletionResult(False, errors=frozen.errors)
+        transition = (
+            frozen.contract.transition
+            if frozen.contract is not None
+            else self.workflow.transitions.get(job.transition_id)
+        )
         if transition is None:
             return CompletionResult(False, errors=(_error(
                 "transition.not_found",
@@ -217,6 +225,7 @@ class CompletionService:
                 output_dir=Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
                 transition=transition,
                 submission=submission,
+                execution_contract=frozen.contract,
             )
         except Exception as exc:
             duration_seconds = round(time.monotonic() - validation_started, 3)
@@ -416,6 +425,7 @@ class CompletionService:
             project_id=job.project_id,
             task_id=job.task_id,
             transition_id=job.transition_id,
+            expected_to_state=transition.to_state,
             effects=effects,
             events=events,
         )
@@ -571,6 +581,7 @@ class CompletionService:
         project_id: str,
         task_id: str,
         transition_id: str,
+        expected_to_state: str,
         effects: tuple[Mapping[str, object], ...],
         events: tuple[object, ...],
     ) -> _EffectApplyResult:
@@ -589,7 +600,10 @@ class CompletionService:
             events=self.event_store,
             apply_effect=self._apply_effect,
             compensate_effect=self._compensate_effect,
-            validate_final_state=lambda: self._validate_final_state(task_id, transition_id),
+            validate_final_state=lambda: self._validate_final_state(
+                task_id,
+                expected_to_state,
+            ),
         )
         applied = runtime.apply(
             project_id=project_id,
@@ -717,14 +731,11 @@ class CompletionService:
                     return _EffectApplyResult(False, "artifact link compensation failed", written.errors)
         return _EffectApplyResult(True)
 
-    def _validate_final_state(self, task_id: str, transition_id: str) -> _EffectApplyResult:
-        transition = self.workflow.transitions.get(transition_id)
-        if transition is None:
-            return _EffectApplyResult(False, "transition missing after apply", (_error(
-                "transition.not_found",
-                f"Transition {transition_id!r} is not defined.",
-                transition_id,
-            ),))
+    def _validate_final_state(
+        self,
+        task_id: str,
+        expected_to_state: str,
+    ) -> _EffectApplyResult:
         loaded = self.adapter.read_task(task_id)
         if not loaded.accepted or loaded.task is None:
             return _EffectApplyResult(False, "task missing after apply", loaded.errors or (_error(
@@ -732,10 +743,13 @@ class CompletionService:
                 f"Task {task_id!r} was not found after mutation.",
                 task_id,
             ),))
-        if loaded.task.current_state != transition.to_state:
+        if loaded.task.current_state != expected_to_state:
             return _EffectApplyResult(False, "task final state mismatch", (_error(
                 "transaction.final_state_invalid",
-                f"Task {task_id!r} ended in {loaded.task.current_state!r}, expected {transition.to_state!r}.",
+                (
+                    f"Task {task_id!r} ended in {loaded.task.current_state!r}, "
+                    f"expected {expected_to_state!r}."
+                ),
                 task_id,
             ),))
         return _EffectApplyResult(True)
@@ -1145,7 +1159,18 @@ def recover_completion_transactions(
                 break
         if not all_effects_ok:
             continue
-        final = service._validate_final_state(record.task_id, record.transition_id)
+        expected_to_state = next(
+            (
+                str(effect.get("to_state", ""))
+                for effect in record.effects
+                if effect.get("type") == "move_task"
+                and str(effect.get("task_id", "")) == record.task_id
+            ),
+            "",
+        )
+        if not expected_to_state:
+            continue
+        final = service._validate_final_state(record.task_id, expected_to_state)
         if not final.accepted:
             continue
         missing_events = tuple(event for event in record.events if event.event_id not in existing_event_ids)

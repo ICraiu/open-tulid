@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 from open_tulid.domain import DomainError, TransitionDefinition
+from open_tulid.runtime.execution_contracts import ExecutionContract
 
 
 @dataclass(frozen=True)
@@ -60,8 +61,18 @@ class DeterministicVerifier:
         output_dir: Path | None = None,
         transition: TransitionDefinition,
         submission: CompletionSubmission,
+        execution_contract: ExecutionContract | None = None,
     ) -> VerificationResult:
         errors: list[DomainError] = []
+        if (
+            execution_contract is not None
+            and execution_contract.transition != transition
+        ):
+            errors.append(_error(
+                "execution_contract.transition_mismatch",
+                "Verifier transition does not match the frozen execution contract.",
+                transition.id,
+            ))
         output_root = output_dir or workspace / "output"
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         duplicate_artifact_types = _duplicates(artifact.type for artifact in submitted_artifacts)

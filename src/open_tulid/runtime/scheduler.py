@@ -68,6 +68,7 @@ class Scheduler:
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
         project_root: Path | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -86,6 +87,7 @@ class Scheduler:
         self.event_store = event_store
         self.journal_store = journal_store
         self.project_root = project_root
+        self.repo_root = repo_root
 
     def schedule_one(self, project_id: str) -> ScheduleResult:
         with self._locked():
@@ -282,6 +284,7 @@ class Scheduler:
                 adapter=self.adapter,
                 job_store=None if self._transactional_creation_enabled else self.job_store,
                 project_root=self.project_root,
+                repo_root=self.repo_root,
             )
             create_command = CreateExecutionJob(
                 project_id=project_id,
