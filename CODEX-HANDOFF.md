@@ -1,6 +1,6 @@
 # Open Tulid / Qwen Contract Work — Codex Handoff
 
-Updated: 2026-07-29
+Updated: 2026-07-29 — post acceptance-profile foundation
 
 ## Start here
 
@@ -15,9 +15,9 @@ The intended loop is:
 5. Tulid independently checks the resulting diff, scope, budgets, and behavior.
 6. Tulid either promotes the change or starts a bounded repair/planning transition.
 
-The first third of that system is committed. A substantial second slice—repository facts, baseline capture, and immutable job execution contracts—is implemented and tested but **not committed**. Preserve the current working tree.
+The first third of that system is committed. The working tree additionally contains the repository-facts/execution-contract slice and the structured prompt compiler. Both are uncommitted; preserve the working tree.
 
-The next implementation slice is the **structured prompt compiler** described below. Do not jump directly to verifier enforcement: execution and prompt preview first need to consume one compact, deterministic packet compiled from the frozen execution contract.
+The working tree now also contains the bounded-repair slice. Prompt compilation, trusted enforcement, selected acceptance profiles, and repairs consume the same frozen execution contract.
 
 ## Repository state
 
@@ -139,14 +139,12 @@ Legacy jobs that do not use generated implementation contracts remain compatible
 
 ### Current verifier behavior
 
-The verifier currently checks that the transition being verified matches the frozen execution contract.
+The verifier checks that the transition being verified matches the frozen execution contract, captures the post-worker manifest, and derives add/edit/remove/rename changes from the frozen baseline. It enforces allowed add/edit paths, forbidden paths, no-delete/no-rename policy, and optional `max_files` and `max_changed_lines` contract budgets. It runs frozen command checks as argv data and emits a `tulid.verification/v1` report with check output and baseline/environment/contract/implementation classification. Completion persists that report in job metadata and its validation-finished event.
 
 It does **not yet**:
 
-- Compare the post-worker repository manifest with the frozen baseline.
-- Enforce allowed/forbidden paths, file counts, line budgets, deletion rules, rename rules, or generated-file rules.
-- Independently run all focused checks frozen in the execution contract.
-- Produce a complete machine-readable acceptance report.
+- Support generated-file rules beyond the ordinary allowed-path boundary.
+- Run reusable acceptance profiles or deterministic vertical slices.
 
 Do not describe the current verifier as full contract enforcement.
 
@@ -184,62 +182,29 @@ The final focused run covers the tiny changes made after the full-suite run; a f
 
 The sandbox may make the default uv cache read-only. If that happens, rerun the same test command with the required execution approval. The repository `.venv/bin/python` does not currently provide pytest directly.
 
-## Exact next slice: structured prompt compiler
+## Structured prompt compiler: implemented and verified
 
-Implement Workstream D and the remaining prompt-context parts of Workstream E from `docs/runtime-prompt-architecture-plan.md`.
+`src/open_tulid/runtime/prompts.py` now compiles a deterministic contract-backed packet with the required eight ordered singleton sections and a 6,000-character total limit. It carries a manifest with section hashes, sizes, truncation decisions, packet hash, and execution-contract hash. Model text excludes audit hashes and absolute paths.
 
-### Goal
+The implementation contract accepts explicit `context_excerpts` (`artifact` plus Markdown `heading`). Contract compilation resolves one linked artifact, extracts the heading through its next equal-or-higher heading, hashes and freezes the result in `tulid.execution/v1`. It does not recursively inject parents or source documents.
 
-For every contract-backed implementation/review job, compile one deterministic, compact prompt packet from the already frozen `ExecutionContract`. The executor and CLI preview must render the same packet. Audit metadata should be persisted alongside the packet but not waste model context.
+At job creation, Tulid persists the packet, packet hash, and manifest as immutable metadata. Runtime validates and uses that stored packet; CLI preview compiles from the same frozen execution contract. Legacy and planning prompts retain the prior path.
 
-Planning prompts can remain on their existing path during this slice.
+Focused prompt/runtime coverage and the full repository suite pass. Before committing, add targeted coverage for exact preview-versus-runtime hash equality, live-file mutation, explicit-excerpt bounds, and malformed persisted-packet rejection.
 
-### Required implementation
+## Acceptance-profile foundation
 
-1. Add `src/open_tulid/runtime/prompts.py`.
-2. Introduce typed prompt structures, at minimum:
-   - `PromptSection`
-   - a compiled prompt/packet result
-   - a prompt manifest containing section identities, hashes, sizes, truncation decisions, and execution-contract hash
-3. Render contract-backed prompts in this exact order:
-   - Mission
-   - Repository Facts
-   - Execution Contract
-   - Optional Panalyzer Context
-   - Selected Context Excerpts
-   - Required Validation
-   - Execution Procedure
-   - Completion Submission
-4. Apply deterministic section budgets from the detailed plan:
-   - mission/task: 2,500 characters
-   - repository facts: 300
-   - execution contract: 800
-   - Panalyzer context: 2,000
-   - completion submission: 500
-   - total packet: 6,000
-5. Resolve context by explicit artifact and heading, then freeze the selected excerpt and its hash. Do not recursively inject full parent documents.
-6. Freeze instruction/context hashes in the execution contract at job creation. Because `tulid.execution/v1` is still uncommitted, its schema can be completed now without a migration, but compiler-version and fixture expectations must be updated consistently.
-7. Keep logical labels and model-relevant text in the prompt. Put absolute paths, artifact paths, hashes, byte counts, and truncation/audit details in the prompt manifest.
-8. Ensure exactly one completion command and one fenced `curl` example appear in the final packet.
-9. Make runtime execution and `tulid prompts render` call the same compiler.
-10. Persist the rendered packet and manifest with the job so historical rendering uses frozen content rather than live task/instruction files.
+The profile foundation is implemented: `acceptance.yaml` declares project-owned `unit`, `build`, `static`, `component`, `vertical_slice`, and `host_smoke` argv profiles. Task contracts select them in `checks.profiles`; Tulid validates and freezes them as resolved checks, runs them without a shell, and includes them in the verification report.
 
-### Acceptance checks for this slice
+Remaining profile work is fixture/readiness/action/assertion orchestration, host-capability gating, and the product-facing vertical-slice-or-exemption policy.
 
-Add tests proving:
+## Bounded convergence and repair: implemented
 
-- Section ordering and singleton sections are deterministic.
-- Repeated compilation from the same execution contract is byte-identical.
-- Runtime execution and CLI preview produce the same packet hash.
-- Changing live task or instruction files after job creation does not change the packet.
-- Selected heading excerpts are deterministic and bounded.
-- Full parent documents are absent from implementation prompts.
-- Per-section and total character budgets are enforced deterministically.
-- The packet contains one completion command and one fenced `curl` block.
-- Absolute paths, hashes, and other audit-only metadata are absent from model text and present in the manifest.
-- Legacy/planning prompt behavior remains covered.
+Implementation failures now create a bounded `tulid.repair/v1` packet containing only the authoritative verification report, normalized failed-check evidence, error codes, and current diff summary. The scheduler resumes the existing job in its existing workspace; repair execution keeps the frozen contract and never recopies the repository over the worker's diff.
 
-Run focused prompt, executor, scheduler, and completion tests first, then the full suite and `git diff --check`.
+`runtime.max_repair_attempts` defaults to two. Every rejected submission retains its classification, report, error codes, and repair disposition in `repair_history`. Contract, environment, and baseline failures remain rejected and do not consume a repair attempt.
+
+The next run should execute focused repair/completion/scheduler/executor tests, then the complete suite and `git diff --check` before committing the combined slice.
 
 ## Known design gaps after the prompt slice
 
@@ -300,4 +265,3 @@ The most relevant code entry points are:
 - `tests/runtime/test_execution_contracts.py`
 - `tests/runtime/test_repository_facts.py`
 - `tests/runtime/test_jobs_scheduler.py`
-

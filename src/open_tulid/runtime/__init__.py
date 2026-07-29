@@ -34,12 +34,20 @@ from .repository_facts import (
     RepositorySnapshotResult,
     capture_repository_snapshot,
 )
+from .acceptance_profiles import (
+    ACCEPTANCE_PROFILES_SCHEMA,
+    AcceptanceProfile,
+    AcceptanceProfileResult,
+    load_acceptance_profiles,
+)
 from .instructions import (
     AgentInstructionResolver,
     InstructionDocument,
     PromptPacket,
     PromptPacketResult,
 )
+from .prompts import CompiledPrompt, PromptManifest, PromptSection, compile_execution_prompt
+from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairPlan, build_repair_packet, plan_repair
 from .scheduler import (
     ScheduleResult,
     Scheduler,
@@ -79,6 +87,8 @@ from .verifier import (
     ArtifactSubmission,
     CompletionSubmission,
     DeterministicVerifier,
+    VerificationCheckResult,
+    VerificationReport,
     VerificationResult,
     normalize_artifacts,
     submission_from_mapping,
@@ -135,10 +145,22 @@ __all__ = [
     "RepositorySnapshot",
     "RepositorySnapshotResult",
     "capture_repository_snapshot",
+    "ACCEPTANCE_PROFILES_SCHEMA",
+    "AcceptanceProfile",
+    "AcceptanceProfileResult",
+    "load_acceptance_profiles",
     "AgentInstructionResolver",
     "InstructionDocument",
     "PromptPacket",
     "PromptPacketResult",
+    "CompiledPrompt",
+    "PromptManifest",
+    "PromptSection",
+    "compile_execution_prompt",
+    "DEFAULT_MAX_REPAIR_ATTEMPTS",
+    "RepairPlan",
+    "build_repair_packet",
+    "plan_repair",
     "ScheduleResult",
     "Scheduler",
     "recover_job_creation_transactions",
@@ -172,6 +194,8 @@ __all__ = [
     "ArtifactSubmission",
     "CompletionSubmission",
     "DeterministicVerifier",
+    "VerificationCheckResult",
+    "VerificationReport",
     "VerificationResult",
     "normalize_artifacts",
     "submission_from_mapping",

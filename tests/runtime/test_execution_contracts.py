@@ -17,8 +17,10 @@ from open_tulid.runtime.execution_contracts import (
     load_job_execution_contract,
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
+from open_tulid.runtime.prompts import TOTAL_BUDGET, compile_execution_prompt
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
 from open_tulid.runtime.workspaces import WorkspacePreparer
+from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
 
 
 TASK_ID = "task-1"
@@ -280,3 +282,115 @@ def test_workspace_writes_frozen_contract_files_and_rejects_repo_drift(tmp_path)
     assert drifted.accepted is False
     assert drifted.error is not None
     assert drifted.error.code == "workspace.baseline_mismatch"
+
+
+def test_compiled_prompt_is_deterministic_compact_and_has_single_completion_example(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.contract is not None
+
+    first = compile_execution_prompt(compiled.contract)
+    second = compile_execution_prompt(compiled.contract)
+
+    assert first.text == second.text
+    assert first.manifest.packet_sha256 == second.manifest.packet_sha256
+    assert [section.heading for section in first.sections] == [
+        "Mission", "Repository Facts", "Execution Contract", "Panalyzer Context",
+        "Selected Context Excerpts", "Required Validation", "Execution Procedure",
+        "Completion Submission",
+    ]
+    assert len(first.text) <= TOTAL_BUDGET
+    assert first.text.count("curl -sS -X POST") == 1
+    assert first.text.count("```sh") == 1
+    assert str(project_root) not in first.text
+    assert compiled.contract.sha256 not in first.text
+    assert first.manifest.execution_contract_sha256 == compiled.contract.sha256
+
+
+def test_verifier_enforces_manifest_surface_and_runs_frozen_checks(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    contract_path = project_root / task.artifact_links[0]
+    contract_path.write_text(contract_path.read_text(encoding="utf-8").replace("invariants: [project_build]", "invariants: []"), encoding="utf-8")
+    repo = _repo(tmp_path)
+    transition = replace(_transition(), requires=RequirementDefinition(changed_files_required=True))
+    compiled = compile_task_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=transition,
+    )
+    assert compiled.contract is not None
+    repo.joinpath("app.py").write_text("def healthz():\n    return 'ok'\n", encoding="utf-8")
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(changed_files=("app.py",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is True
+    assert result.report is not None
+    assert result.report.edited == ("app.py",)
+    assert [check.status for check in result.report.checks] == ["passed"]
+
+
+def test_verifier_rejects_unapproved_files_and_reports_contract_failure(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    contract_path = project_root / task.artifact_links[0]
+    contract_path.write_text(contract_path.read_text(encoding="utf-8").replace("invariants: [project_build]", "invariants: []"), encoding="utf-8")
+    repo = _repo(tmp_path)
+    transition = replace(_transition(), requires=RequirementDefinition(changed_files_required=True))
+    compiled = compile_task_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=transition,
+    )
+    assert compiled.contract is not None
+    repo.joinpath("secrets.txt").write_text("do not leak\n", encoding="utf-8")
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(changed_files=("secrets.txt",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is False
+    assert {error.code for error in result.errors} == {"verification.path_add_forbidden"}
+    assert result.report is not None
+    assert result.report.classification == "contract_failure"
+    assert result.report.to_dict()["changes"]["added"] == ["secrets.txt"]
+
+
+def test_verifier_enforces_frozen_change_budgets(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    contract_path = project_root / task.artifact_links[0]
+    contract_path.write_text(
+        contract_path.read_text(encoding="utf-8")
+        .replace("invariants: [project_build]", "invariants: []")
+        .replace("forbidden: [secrets/]", "forbidden: [secrets/]\n  max_files: 1\n  max_changed_lines: 1"),
+        encoding="utf-8",
+    )
+    repo = _repo(tmp_path)
+    transition = replace(_transition(), requires=RequirementDefinition(changed_files_required=True))
+    compiled = compile_task_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=transition,
+    )
+    assert compiled.contract is not None
+    repo.joinpath("app.py").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = DeterministicVerifier().verify(
+        workspace=repo, transition=transition,
+        submission=CompletionSubmission(changed_files=("app.py",)), execution_contract=compiled.contract,
+    )
+
+    assert {error.code for error in result.errors} == {"verification.changed_line_budget_exceeded"}

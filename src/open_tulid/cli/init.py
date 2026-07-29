@@ -34,6 +34,8 @@ runtime:
   # 0 means retry forever. The default caps repeated failures so one bad task
   # cannot monopolize an unattended runtime.
   max_failed_attempts_per_transition: 2
+  # Targeted retries after a deterministic implementation failure.
+  max_repair_attempts: 2
   completion_host: 0.0.0.0
   completion_port: 0
   completion_container_host: host.docker.internal

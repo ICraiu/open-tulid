@@ -116,6 +116,14 @@ class Scheduler:
                 return ScheduleResult(scheduled=False, errors=(focused,))
             if focused is not None:
                 if focused.active_jobs:
+                    repair_job = _repair_ready_job(focused.active_jobs)
+                    if repair_job is not None:
+                        return ScheduleResult(
+                            scheduled=True,
+                            job=repair_job,
+                            task_id=repair_job.task_id,
+                            transition_id=repair_job.transition_id,
+                        )
                     skipped.append(_error(
                         "repo_lane.active_job_exists",
                         (
@@ -219,6 +227,15 @@ class Scheduler:
                     skipped=tuple(skipped),
                 )
             if active.jobs:
+                repair_job = _repair_ready_job(active.jobs)
+                if repair_job is not None:
+                    return ScheduleResult(
+                        scheduled=True,
+                        job=repair_job,
+                        task_id=repair_job.task_id,
+                        transition_id=repair_job.transition_id,
+                        skipped=tuple(skipped),
+                    )
                 skipped.append(_error(
                     "job.active_exists",
                     f"Task {task.id!r} already has an active job for transition {transition.id!r}.",
@@ -489,6 +506,16 @@ def _serial_repo_lane_focus(
         ):
             return _SerialRepoLaneFocus(task=task)
     return None
+
+
+def _repair_ready_job(jobs: tuple[ExecutionJob, ...]) -> ExecutionJob | None:
+    """A rejected implementation job resumes in-place; it is never recreated."""
+    ready = [
+        job for job in jobs
+        if _status_value(job.status) == ExecutionJobStatus.COMPLETION_REJECTED.value
+        and job.metadata.get("repair_ready") is True
+    ]
+    return max(ready, key=_job_timestamp) if ready else None
 
 
 def _find_recent_failed_job(

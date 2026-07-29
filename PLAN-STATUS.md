@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-27  
 **Baseline:** commit `ba05496` — “implemented 1/3 of the local llm contract”  
-**Current position:** contract preparation and immutable job contracts work; post-worker acceptance enforcement is next.
+**Current position:** contract preparation, immutable job contracts, compact frozen prompt compilation, trusted post-worker enforcement, and reusable frozen acceptance profiles are implemented.
 
 ## Destination
 
@@ -37,11 +37,13 @@ The next slice now compiles a content-addressed `tulid.execution/v1` contract at
 
 **Remaining:** add Panalyzer identities, proposal coverage, path/symbol budgets, deterministic context excerpts, and instruction/context hashes.
 
-### 3. Add reusable runnable acceptance profiles — Not implemented
+### 3. Add reusable runnable acceptance profiles — Foundation implemented
 
 Projects should declare named `unit`, `build`, `static`, `component`, `vertical_slice`, and optional `host_smoke` profiles. A profile defines command arguments, timeout, allowed environment, fixtures, readiness, action, and observable assertions. Product-facing tasks require a deterministic vertical slice or an explicit exemption.
 
-**Today:** contracts can declare focused command arrays and invariant IDs, but there is no general profile system or contract-driven vertical-slice runner.
+**Done now:** projects may declare `acceptance.yaml` profiles of type unit, build, static, component, vertical_slice, or host_smoke. Generated contracts select them by ID; Tulid validates, freezes, independently runs, and reports their argv checks.
+
+**Remaining:** fixture/readiness/action/assertion lifecycle, capability-gated host smoke, and mandatory vertical-slice-or-exemption policy for product-facing work.
 
 ### 4. Add bounded repair and real verification — Partially implemented
 
@@ -54,14 +56,14 @@ Tulid should classify failures as implementation, contract, environment, or base
 
 Capture a pre-worker file manifest, derive the authoritative diff, enforce add/edit/remove rules, allowed paths and symbols, generated-file policy, file/line budgets, and all selected checks. Record the base commit, diff hash, check results, Panalyzer delta, and repair history. If the repository advanced, replay into a clean workspace and rerun acceptance before promotion.
 
-**Today:** the trusted baseline manifest and frozen transition checks now exist, and repository drift between scheduling and execution is blocked. Existing transition validations still run from the frozen transition. The verifier does not yet compare the post-worker tree to the baseline or enforce the generated contract’s paths, budgets, focused checks, or proposal surface.
+**Done now:** Tulid derives add/edit/remove/rename changes from the frozen baseline manifest, enforces generated-contract add/edit/forbidden surfaces plus optional file and changed-line budgets, runs frozen argv checks without a shell, and persists a machine-readable verification report with deterministic failure classification. Legacy jobs retain their existing verifier behavior.
 
 ## Delivery order from here
 
 1. **Freeze the contract — Done:** repository facts, baseline manifest, resolved checks, integrity hashes, immutable job metadata, and workspace snapshots.
-2. **Compile compact prompts — Next:** ordered singleton sections, explicit excerpts, size budgets, and frozen instruction/context hashes.
-3. **Enforce acceptance:** trusted post-worker diff, scope/budget checks, focused and vertical-slice profiles.
-4. **Converge safely:** failure classification, bounded repair, evidence-based self-review, stale-base replay.
+2. **Compile compact prompts — Implemented and verified:** ordered singleton sections, explicit frozen heading excerpts, size budgets, and persisted packet manifests.
+3. **Enforce acceptance — In progress:** trusted post-worker diff, scope/budget checks, frozen focused checks, and reusable command profiles are complete; profile fixtures and vertical-slice policy remain.
+4. **Converge safely — In progress:** implementation failures now resume as bounded, evidence-only repairs in the original workspace; stale-base replay remains.
 5. **Close the loop:** Panalyzer deltas, conflict-aware scheduling, prompt lint/explain/history, and controlled Qwen replay metrics.
 
 ## Latest-commit proof

@@ -54,6 +54,7 @@ class WorkspacePreparer:
         task: Task,
         transition: TransitionDefinition,
         completion_endpoint: str | None = None,
+        preserve_workspace: bool = False,
     ) -> WorkspacePrepareResult:
         workspace = Path(job.workspace_path)
         output_dir = workspace / "output"
@@ -63,7 +64,7 @@ class WorkspacePreparer:
         try:
             workspace.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
-            if self.repo_root is not None:
+            if self.repo_root is not None and not preserve_workspace:
                 if not self.repo_root.is_dir():
                     return WorkspacePrepareResult(error=DomainError(
                         code="workspace.repo_missing",
@@ -71,7 +72,7 @@ class WorkspacePreparer:
                         location=str(self.repo_root),
                     ))
                 _copy_repo(self.repo_root, workspace)
-            if frozen.contract is not None:
+            if frozen.contract is not None and not preserve_workspace:
                 copied = capture_repository_snapshot(workspace)
                 if not copied.accepted or copied.snapshot is None:
                     return WorkspacePrepareResult(error=(

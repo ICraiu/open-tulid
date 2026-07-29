@@ -34,6 +34,8 @@ class ChangeSurface:
     add: tuple[str, ...] = ()
     edit: tuple[str, ...] = ()
     forbidden: tuple[str, ...] = ()
+    max_files: int | None = None
+    max_changed_lines: int | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,12 @@ class ContractInterface:
 
 
 @dataclass(frozen=True)
+class ContextExcerpt:
+    artifact: str
+    heading: str
+
+
+@dataclass(frozen=True)
 class ImplementationContractDraft:
     schema: str
     source_task_id: str
@@ -69,9 +77,11 @@ class ImplementationContractDraft:
     requirements: tuple[str, ...]
     focused_checks: tuple[ContractCheck, ...]
     invariants: tuple[str, ...]
+    acceptance_profiles: tuple[str, ...] = ()
     interfaces: tuple[ContractInterface, ...] = ()
     failure_behavior: tuple[str, ...] = ()
     non_goals: tuple[str, ...] = ()
+    context_excerpts: tuple[ContextExcerpt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -218,6 +228,7 @@ def parse_implementation_contract(
         "failure_behavior",
         "non_goals",
         "checks",
+        "context_excerpts",
     }
     _reject_unknown_fields(raw, allowed_top_level, errors, location)
 
@@ -282,7 +293,8 @@ def parse_implementation_contract(
     interfaces = _parse_interfaces(raw.get("interfaces"), errors, location)
     failure_behavior = _optional_string_tuple(raw.get("failure_behavior"), "failure_behavior", errors, location)
     non_goals = _optional_string_tuple(raw.get("non_goals"), "non_goals", errors, location)
-    focused_checks, invariants = _parse_checks(raw.get("checks"), errors, location)
+    focused_checks, invariants, acceptance_profiles = _parse_checks(raw.get("checks"), errors, location)
+    context_excerpts = _parse_context_excerpts(raw.get("context_excerpts"), errors, location)
 
     for duplicate in _duplicates(requirements):
         errors.append(_error(
@@ -291,10 +303,10 @@ def parse_implementation_contract(
             f"{location}.requirements",
         ))
 
-    if not focused_checks and not invariants:
+    if not focused_checks and not invariants and not acceptance_profiles:
         errors.append(_error(
             "contract.checks_missing",
-            "Implementation contract requires at least one focused check or project invariant.",
+            "Implementation contract requires at least one focused check, invariant, or acceptance profile.",
             f"{location}.checks",
         ))
     if profile == "integration" and not invariants:
@@ -346,10 +358,33 @@ def parse_implementation_contract(
         requirements=requirements,
         focused_checks=focused_checks,
         invariants=invariants,
+        acceptance_profiles=acceptance_profiles,
         interfaces=interfaces,
         failure_behavior=failure_behavior,
         non_goals=non_goals,
+        context_excerpts=context_excerpts,
     ))
+
+
+def _parse_context_excerpts(raw: object, errors: list[DomainError], location: str) -> tuple[ContextExcerpt, ...]:
+    if raw is None:
+        return ()
+    items = _sequence(raw)
+    if items is None:
+        errors.append(_error("contract.context_excerpts_invalid", "context_excerpts must be a list.", f"{location}.context_excerpts"))
+        return ()
+    result: list[ContextExcerpt] = []
+    for index, item in enumerate(items):
+        place = f"{location}.context_excerpts[{index}]"
+        if not isinstance(item, Mapping):
+            errors.append(_error("contract.context_excerpt_invalid", "Context excerpt must be a mapping.", place))
+            continue
+        _reject_unknown_fields(item, {"artifact", "heading"}, errors, place)
+        result.append(ContextExcerpt(
+            artifact=_required_string(item, "artifact", errors, place),
+            heading=_required_string(item, "heading", errors, place),
+        ))
+    return tuple(result)
 
 
 def _parse_change_surface(
@@ -367,13 +402,15 @@ def _parse_change_surface(
         return ChangeSurface()
     _reject_unknown_fields(
         raw,
-        {"add", "edit", "forbidden"},
+        {"add", "edit", "forbidden", "max_files", "max_changed_lines"},
         errors,
         field_location,
     )
     additions = _optional_string_tuple(raw.get("add"), "add", errors, field_location)
     edits = _optional_string_tuple(raw.get("edit"), "edit", errors, field_location)
     forbidden = _optional_string_tuple(raw.get("forbidden"), "forbidden", errors, field_location)
+    max_files = _optional_positive_int(raw.get("max_files"), "max_files", errors, field_location)
+    max_changed_lines = _optional_positive_int(raw.get("max_changed_lines"), "max_changed_lines", errors, field_location)
     if not additions and not edits:
         errors.append(_error(
             "contract.change_surface_empty",
@@ -402,14 +439,23 @@ def _parse_change_surface(
             f"Path appears more than once in the change surface: {duplicate}",
             field_location,
         ))
-    return ChangeSurface(add=additions, edit=edits, forbidden=forbidden)
+    return ChangeSurface(add=additions, edit=edits, forbidden=forbidden, max_files=max_files, max_changed_lines=max_changed_lines)
+
+
+def _optional_positive_int(raw: object, field: str, errors: list[DomainError], location: str) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        errors.append(_error("contract.budget_invalid", f"{field} must be a positive integer.", f"{location}.{field}"))
+        return None
+    return raw
 
 
 def _parse_checks(
     raw: object,
     errors: list[DomainError],
     location: str,
-) -> tuple[tuple[ContractCheck, ...], tuple[str, ...]]:
+) -> tuple[tuple[ContractCheck, ...], tuple[str, ...], tuple[str, ...]]:
     field_location = f"{location}.checks"
     if not isinstance(raw, Mapping):
         errors.append(_error(
@@ -417,10 +463,10 @@ def _parse_checks(
             "Implementation contract requires a checks mapping.",
             field_location,
         ))
-        return (), ()
+        return (), (), ()
     _reject_unknown_fields(
         raw,
-        {"focused", "invariants"},
+        {"focused", "invariants", "profiles"},
         errors,
         field_location,
     )
@@ -521,7 +567,21 @@ def _parse_checks(
             f"Project invariant appears more than once: {duplicate}",
             f"{field_location}.invariants",
         ))
-    return tuple(focused), invariants
+    profiles = _optional_string_tuple(raw.get("profiles"), "profiles", errors, field_location)
+    for index, profile in enumerate(profiles):
+        if not CHECK_ID_RE.fullmatch(profile):
+            errors.append(_error(
+                "contract.acceptance_profile_id_invalid",
+                f"Acceptance profile id is invalid: {profile!r}.",
+                f"{field_location}.profiles[{index}]",
+            ))
+    for duplicate in _duplicates(profiles):
+        errors.append(_error(
+            "contract.acceptance_profile_duplicate",
+            f"Acceptance profile appears more than once: {duplicate}",
+            f"{field_location}.profiles",
+        ))
+    return tuple(focused), invariants, profiles
 
 
 def _parse_expectation(

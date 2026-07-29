@@ -261,6 +261,28 @@ Fields:
 - `transaction` optionally lists side-effecting operations to run.
 - `derives` optionally creates new child tasks from submitted task-file artifacts while the parent still moves to its own `to` state.
 
+### Acceptance profiles
+
+Projects can declare reusable trusted commands in `acceptance.yaml` beside
+`workflow.yaml`. An implementation contract selects them with
+`checks.profiles`; Tulid validates and freezes their argv, expectation, timeout,
+and working directory into the execution contract before the worker starts.
+
+```yaml
+schema: tulid.acceptance/v1
+profiles:
+  unit:
+    kind: unit
+    argv: [python, -m, pytest, -q]
+  api_smoke:
+    kind: vertical_slice
+    argv: [python, scripts/check_api.py]
+    timeout_seconds: 90
+```
+
+Supported kinds are `unit`, `build`, `static`, `component`, `vertical_slice`,
+and `host_smoke`. Commands are argv arrays, never shell programs.
+
 ### Deriving child tasks
 
 Use `derives` when a transition decomposes one parent into many new tasks of the same shape:

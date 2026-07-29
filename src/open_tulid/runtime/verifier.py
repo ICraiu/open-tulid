@@ -11,6 +11,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from open_tulid.domain import DomainError, TransitionDefinition
 from open_tulid.runtime.execution_contracts import ExecutionContract
+from open_tulid.runtime.repository_facts import BaselineManifest, capture_repository_snapshot
 
 
 @dataclass(frozen=True)
@@ -34,12 +35,55 @@ class CompletionSubmission:
 class VerificationResult:
     accepted: bool
     errors: tuple[DomainError, ...] = ()
+    report: "VerificationReport | None" = None
 
     @property
     def message(self) -> str:
         if self.accepted:
             return "Completion accepted."
         return "; ".join(error.message for error in self.errors)
+
+
+@dataclass(frozen=True)
+class VerificationCheckResult:
+    id: str
+    status: str
+    argv: tuple[str, ...]
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id, "status": self.status, "argv": list(self.argv),
+            "exit_code": self.exit_code, "stdout": self.stdout, "stderr": self.stderr,
+        }
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    schema: str
+    classification: str | None
+    baseline_sha256: str
+    post_manifest_sha256: str | None
+    added: tuple[str, ...] = ()
+    edited: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    renamed: tuple[tuple[str, str], ...] = ()
+    changed_lines: int = 0
+    checks: tuple[VerificationCheckResult, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": self.schema, "classification": self.classification,
+            "baseline_sha256": self.baseline_sha256,
+            "post_manifest_sha256": self.post_manifest_sha256,
+            "changes": {"added": list(self.added), "edited": list(self.edited),
+                        "removed": list(self.removed),
+                        "renamed": [{"from": old, "to": new} for old, new in self.renamed],
+                        "changed_lines": self.changed_lines},
+            "checks": [check.to_dict() for check in self.checks],
+        }
 
 
 class DeterministicVerifier:
@@ -64,6 +108,7 @@ class DeterministicVerifier:
         execution_contract: ExecutionContract | None = None,
     ) -> VerificationResult:
         errors: list[DomainError] = []
+        report: VerificationReport | None = None
         if (
             execution_contract is not None
             and execution_contract.transition != transition
@@ -73,6 +118,12 @@ class DeterministicVerifier:
                 "Verifier transition does not match the frozen execution contract.",
                 transition.id,
             ))
+        if execution_contract is not None:
+            report, enforcement_errors = self._enforce_execution_contract(
+                workspace=workspace,
+                contract=execution_contract,
+            )
+            errors.extend(enforcement_errors)
         output_root = output_dir or workspace / "output"
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         duplicate_artifact_types = _duplicates(artifact.type for artifact in submitted_artifacts)
@@ -216,7 +267,60 @@ class DeterministicVerifier:
                     ",".join(sorted(actual_changed_files)),
                 ))
 
-        return VerificationResult(accepted=not errors, errors=tuple(errors))
+        if report is not None and errors:
+            report = VerificationReport(
+                schema=report.schema,
+                classification=_failure_classification(errors),
+                baseline_sha256=report.baseline_sha256,
+                post_manifest_sha256=report.post_manifest_sha256,
+                added=report.added,
+                edited=report.edited,
+                removed=report.removed,
+                renamed=report.renamed,
+                changed_lines=report.changed_lines,
+                checks=report.checks,
+            )
+        return VerificationResult(accepted=not errors, errors=tuple(errors), report=report)
+
+    def _enforce_execution_contract(
+        self,
+        *,
+        workspace: Path,
+        contract: ExecutionContract,
+    ) -> tuple[VerificationReport, tuple[DomainError, ...]]:
+        errors: list[DomainError] = []
+        post = capture_repository_snapshot(workspace)
+        if not post.accepted or post.snapshot is None:
+            errors.extend(_error("verification.baseline_unavailable", error.message, error.location) for error in post.errors)
+            return VerificationReport("tulid.verification/v1", "baseline_failure", contract.baseline_manifest.sha256, None), tuple(errors)
+        added, edited, removed, renamed = _manifest_changes(contract.baseline_manifest, post.snapshot.baseline)
+        surface = contract.generated_contract.change_surface
+        for path in added:
+            if not _path_allowed(path, surface.add):
+                errors.append(_error("verification.path_add_forbidden", f"Added file is outside the allowed add surface: {path}", path))
+        for path in edited:
+            if not _path_allowed(path, surface.edit):
+                errors.append(_error("verification.path_edit_forbidden", f"Edited file is outside the allowed edit surface: {path}", path))
+        for path in removed:
+            errors.append(_error("verification.deletion_forbidden", f"Contract does not permit deleting files: {path}", path))
+        for old, new in renamed:
+            errors.append(_error("verification.rename_forbidden", f"Contract does not permit renaming files: {old} -> {new}", new))
+        for path in (*added, *edited, *removed):
+            if _path_allowed(path, surface.forbidden):
+                errors.append(_error("verification.path_forbidden", f"Contract forbids changing: {path}", path))
+        changed_lines = _changed_line_count(workspace, contract.baseline_manifest, (*added, *edited, *removed))
+        changed_file_count = len(added) + len(edited) + len(removed) + (2 * len(renamed))
+        if surface.max_files is not None and changed_file_count > surface.max_files:
+            errors.append(_error("verification.max_files_exceeded", f"Contract permits at most {surface.max_files} changed files; found {changed_file_count}."))
+        if surface.max_changed_lines is not None and changed_lines > surface.max_changed_lines:
+            errors.append(_error("verification.changed_line_budget_exceeded", f"Contract permits at most {surface.max_changed_lines} changed lines; conservative count is {changed_lines}."))
+        checks, check_errors = _run_contract_checks(workspace, contract)
+        errors.extend(check_errors)
+        return VerificationReport(
+            "tulid.verification/v1", None, contract.baseline_manifest.sha256,
+            post.snapshot.baseline.sha256, added, edited, removed, renamed,
+            changed_lines, checks,
+        ), tuple(errors)
 
     def _run_trusted_validations(
         self,
@@ -270,6 +374,103 @@ class DeterministicVerifier:
                         call.type,
                     ))
         return tuple(errors)
+
+
+def _manifest_changes(
+    baseline: BaselineManifest,
+    post: BaselineManifest,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]:
+    before = {entry.path: entry for entry in baseline.entries}
+    after = {entry.path: entry for entry in post.entries}
+    added = set(after) - set(before)
+    removed = set(before) - set(after)
+    edited = tuple(sorted(path for path in set(before) & set(after) if before[path].sha256 != after[path].sha256))
+    renamed: list[tuple[str, str]] = []
+    for old in sorted(removed):
+        matches = sorted(new for new in added if before[old].sha256 == after[new].sha256)
+        if len(matches) == 1:
+            new = matches[0]
+            renamed.append((old, new))
+            added.remove(new)
+            removed.remove(old)
+    return tuple(sorted(added)), edited, tuple(sorted(removed)), tuple(renamed)
+
+
+def _path_allowed(path: str, patterns: Sequence[str]) -> bool:
+    from fnmatch import fnmatchcase
+    return any(fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def _changed_line_count(workspace: Path, baseline: BaselineManifest, paths: Sequence[str]) -> int:
+    total = 0
+    for path in paths:
+        new_path = workspace / path
+        new = _read_text(new_path) if new_path.is_file() else ""
+        if new is None:
+            total += 1
+            continue
+        # The frozen manifest deliberately contains only hashes and sizes, never
+        # source content. Count the complete current file as a conservative upper
+        # bound for each added or edited file; removals count as one unit.
+        total += max(1, len(new.splitlines()))
+    return total
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _run_contract_checks(
+    workspace: Path,
+    contract: ExecutionContract,
+) -> tuple[tuple[VerificationCheckResult, ...], tuple[DomainError, ...]]:
+    results: list[VerificationCheckResult] = []
+    errors: list[DomainError] = []
+    for check in contract.resolved_checks:
+        if check.runner != "command":
+            continue
+        cwd = _contained_path(workspace, check.working_directory)
+        if cwd is None or not cwd.is_dir():
+            results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr="working directory unavailable"))
+            errors.append(_error("verification.check_environment", f"Check {check.id!r} has no usable working directory.", check.id))
+            continue
+        try:
+            completed = subprocess.run(check.argv, cwd=cwd, capture_output=True, text=True, timeout=check.timeout_seconds, check=False)
+        except subprocess.TimeoutExpired as exc:
+            results.append(VerificationCheckResult(check.id, "timeout", check.argv, stdout=_as_text(exc.stdout), stderr=_as_text(exc.stderr)))
+            errors.append(_error("verification.check_timeout", f"Frozen check timed out: {check.id}", check.id))
+            continue
+        except OSError as exc:
+            results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr=str(exc)))
+            errors.append(_error("verification.check_environment", f"Frozen check could not run: {check.id}: {exc}", check.id))
+            continue
+        passed = (completed.returncode == check.expect.exit_code
+                  and all(value in completed.stdout for value in check.expect.stdout_contains)
+                  and all(value in completed.stderr for value in check.expect.stderr_contains))
+        results.append(VerificationCheckResult(check.id, "passed" if passed else "failed", check.argv, completed.returncode, completed.stdout, completed.stderr))
+        if not passed:
+            errors.append(_error("verification.check_failed", f"Frozen check failed expectations: {check.id}", check.id))
+    return tuple(results), tuple(errors)
+
+
+def _as_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    return value.decode(errors="replace") if isinstance(value, bytes) else value
+
+
+def _failure_classification(errors: Sequence[DomainError]) -> str:
+    codes = {error.code for error in errors}
+    if any(code.startswith("verification.baseline") for code in codes):
+        return "baseline_failure"
+    if any(code in {"verification.check_environment", "verification.check_timeout"} for code in codes):
+        return "environment_failure"
+    if any(code.startswith("execution_contract") or code.startswith("verification.path") or code.startswith("verification.deletion") or code.startswith("verification.rename") or code.startswith("verification.max_files") or code.startswith("verification.changed_line_budget") for code in codes):
+        return "contract_failure"
+    return "implementation_failure"
 
 
 def submission_from_mapping(payload: Mapping[str, object]) -> CompletionSubmission:

@@ -559,6 +559,35 @@ def test_scheduler_can_stop_after_configured_failed_attempts(tmp_path: Path):
     assert result.skipped[0].code == "job.retry_limit_reached"
 
 
+def test_scheduler_resumes_repair_ready_job_in_its_existing_workspace(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    workspace = tmp_path / "existing-workspace"
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000FIX",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        status="completion_rejected",
+        metadata={"repair_ready": True, "repair_packet": "# Open Tulid Repair\n"},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.job_id == "01J00000000000000000000FIX"
+    assert result.job.workspace_path == str(workspace)
+
+
 def test_scheduler_ignores_retry_limit_failures_before_runtime_session(tmp_path: Path):
     store = FileExecutionJobStore(tmp_path / "jobs")
     session_started_at = datetime.now(timezone.utc)

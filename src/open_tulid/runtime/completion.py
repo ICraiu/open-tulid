@@ -27,6 +27,7 @@ from .verifier import (
     VerificationResult,
     normalize_artifacts,
 )
+from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
 
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -66,6 +67,7 @@ class CompletionService:
         verifier: DeterministicVerifier | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
+        max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -83,6 +85,7 @@ class CompletionService:
             validation_implementations=validation_implementations,
             validation_context_factory=validation_context_factory,
         )
+        self.max_repair_attempts = max_repair_attempts
 
     def submit(
         self,
@@ -247,6 +250,7 @@ class CompletionService:
             duration_seconds=duration_seconds,
             error_codes=tuple(error.code for error in verification.errors),
             error_count=len(verification.errors),
+            verification_report=(verification.report.to_dict() if verification.report is not None else None),
         )
         if not verification.accepted:
             return self._reject_completion(
@@ -497,11 +501,30 @@ class CompletionService:
                 job.job_id,
             ),))
         metadata = current_job.metadata if current_job is not None else job.metadata
+        report = verification.report
+        repair = plan_repair(
+            report=report,
+            errors=errors,
+            repair_attempts=int(metadata.get("repair_attempts", 0)),
+            max_repair_attempts=self.max_repair_attempts,
+        )
+        repair_history = list(metadata.get("repair_history", ()))
+        repair_history.append({
+            "submission_id": submission_id,
+            "classification": report.classification if report is not None else None,
+            "verification_report": report.to_dict() if report is not None else None,
+            "error_codes": [error.code for error in errors],
+            "repair_ready": repair.eligible,
+        })
         self.job_store.update_status(
             job.job_id,
             ExecutionJobStatus.COMPLETION_REJECTED,
             metadata={
                 "last_verification": message,
+                "repair_ready": repair.eligible,
+                "repair_packet": repair.packet,
+                "repair_blocked_reason": repair.reason,
+                "repair_history": tuple(repair_history),
                 "completion_submissions": _record_submission(
                     metadata,
                     submission_id,
@@ -533,6 +556,7 @@ class CompletionService:
         error_codes: tuple[str, ...],
         error_count: int,
         detail: str | None = None,
+        verification_report: Mapping[str, object] | None = None,
     ) -> None:
         data = {
             "accepted": accepted,
@@ -542,6 +566,8 @@ class CompletionService:
         }
         if detail is not None:
             data["detail"] = detail
+        if verification_report is not None:
+            data["verification_report"] = dict(verification_report)
         self.event_store.append(build_event(
             project_id=job.project_id,
             actor=EventActor(type="system", id="completion-verifier"),
@@ -564,6 +590,7 @@ class CompletionService:
                 "completion_validation_duration_seconds": duration_seconds,
                 "completion_validation_error_codes": tuple(error_codes),
                 "completion_validation_error_count": error_count,
+                **({"verification_report": dict(verification_report)} if verification_report is not None else {}),
             },
         )
 

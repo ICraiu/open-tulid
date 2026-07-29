@@ -31,6 +31,7 @@ from open_tulid.runtime.execution_contracts import (
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
+from open_tulid.runtime.prompts import CompiledPrompt, compile_execution_prompt
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
 from open_tulid.runtime.task_contracts import (
     implementation_contract_required,
@@ -68,6 +69,7 @@ class PromptRenderResult:
     text: str = ""
     instruction_packet: PromptPacket | None = None
     execution_contract_sha256: str | None = None
+    compiled_prompt: CompiledPrompt | None = None
     errors: tuple[DomainError, ...] = ()
 
     @property
@@ -87,6 +89,13 @@ def render_execution_prompt(
     execution_contract: ExecutionContract | None = None,
 ) -> PromptRenderResult:
     """Render the exact model prompt for an execution job without running it."""
+    if execution_contract is not None:
+        compiled = compile_execution_prompt(execution_contract)
+        return PromptRenderResult(
+            text=compiled.text,
+            execution_contract_sha256=execution_contract.sha256,
+            compiled_prompt=compiled,
+        )
     worker = workflow.workers.get(worker_id)
     task_type = workflow.task_types.get(transition.task_type)
     prompt_text = _build_runtime_prompt(
@@ -257,11 +266,16 @@ class JobExecutor:
 
         try:
             endpoint = self._start_completion_endpoint(job.job_id)
+            repair_mode = (
+                job_status == ExecutionJobStatus.COMPLETION_REJECTED.value
+                and bool(job.metadata.get("repair_ready"))
+            )
             prepared = WorkspacePreparer(repo_root=self.project_config.repo_root).prepare(
                 job=job,
                 task=execution_task,
                 transition=transition,
                 completion_endpoint=endpoint.url,
+                preserve_workspace=repair_mode,
             )
             if not prepared.accepted or prepared.workspace is None:
                 endpoint.stop()
@@ -270,22 +284,30 @@ class JobExecutor:
                     prepared.error or _error("workspace.prepare_failed", "Workspace failed."),
                 )
 
-            rendered_prompt = render_execution_prompt(
-                workflow=self.workflow,
-                adapter=self.adapter,
-                task=execution_task,
-                transition=transition,
-                worker_id=job.worker_id,
-                job_id=job.job_id,
-                completion_endpoint=endpoint.url,
-                execution_contract=frozen.contract,
-            )
-            if not rendered_prompt.accepted:
-                endpoint.stop()
-                return self._fail_before_run(job, rendered_prompt.errors[0])
-            prompt_text = rendered_prompt.text
-            prompt_packet = rendered_prompt.instruction_packet
+            rendered_prompt = None
+            prompt_text = _repair_prompt_packet(job) if repair_mode else _frozen_prompt_packet(job, frozen.contract)
+            prompt_packet = None
+            if prompt_text is None:
+                rendered_prompt = render_execution_prompt(
+                    workflow=self.workflow,
+                    adapter=self.adapter,
+                    task=execution_task,
+                    transition=transition,
+                    worker_id=job.worker_id,
+                    job_id=job.job_id,
+                    completion_endpoint=endpoint.url,
+                    execution_contract=frozen.contract,
+                )
+                if not rendered_prompt.accepted:
+                    endpoint.stop()
+                    return self._fail_before_run(job, rendered_prompt.errors[0])
+                prompt_text = rendered_prompt.text
+                prompt_packet = rendered_prompt.instruction_packet
             prompt_sha256 = _write_prompt_packet(prepared.workspace, prompt_text)
+            if rendered_prompt is not None and rendered_prompt.compiled_prompt is not None:
+                _write_prompt_manifest(prepared.workspace, rendered_prompt.compiled_prompt)
+            elif isinstance(job.metadata.get("prompt_manifest"), Mapping):
+                _write_prompt_manifest_payload(prepared.workspace, job.metadata["prompt_manifest"])
 
             self.job_store.update_status(
                 job.job_id,
@@ -295,8 +317,16 @@ class JobExecutor:
                     "completion_endpoint": endpoint.url,
                     "completion_endpoint_host": endpoint.host,
                     "completion_endpoint_port": endpoint.port,
-                    "prompt_packet_sha256": prompt_sha256,
+                    "prompt_packet_sha256": (
+                        job.metadata.get("prompt_packet_sha256")
+                        if repair_mode else prompt_sha256
+                    ),
                     "instruction_packet_sha256": prompt_packet.sha256 if prompt_packet is not None else None,
+                    "prompt_manifest": (
+                        rendered_prompt.compiled_prompt.manifest.to_dict()
+                        if rendered_prompt is not None and rendered_prompt.compiled_prompt is not None else job.metadata.get("prompt_manifest")
+                    ),
+                    **({"repair_ready": False, "repair_attempts": int(job.metadata.get("repair_attempts", 0)) + 1} if repair_mode else {}),
                 },
                 increment_attempts=True,
             )
@@ -393,6 +423,8 @@ class JobExecutor:
                 ExecutionJobStatus.CANCELLED.value,
             }:
                 return ExecutorRunResult(True, run=result)
+            if status_after_run == ExecutionJobStatus.COMPLETION_REJECTED.value:
+                return ExecutorRunResult(True, run=result)
             if not result.succeeded:
                 self.job_store.update_status(
                     job.job_id,
@@ -483,6 +515,7 @@ class JobExecutor:
             repo_root=self.project_config.repo_root,
             validation_implementations=self.validation_implementations,
             validation_context_factory=self.validation_context_factory,
+            max_repair_attempts=self.runtime.max_repair_attempts,
         )
         server = serve_completion_endpoint(
             CompletionEndpointConfig(
@@ -806,6 +839,50 @@ def _write_prompt_packet(workspace: Path, text: str) -> str:
     context_dir.mkdir(parents=True, exist_ok=True)
     (context_dir / "prompt-packet.md").write_text(text + "\n", encoding="utf-8")
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_prompt_manifest(workspace: Path, compiled: CompiledPrompt) -> None:
+    context_dir = workspace / ".open-tulid"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    (context_dir / "prompt-manifest.json").write_text(
+        json.dumps(compiled.manifest.to_dict(), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_prompt_manifest_payload(workspace: Path, manifest: Mapping[str, object]) -> None:
+    context_dir = workspace / ".open-tulid"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    (context_dir / "prompt-manifest.json").write_text(
+        json.dumps(dict(manifest), sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _frozen_prompt_packet(job, contract: ExecutionContract | None) -> str | None:
+    if contract is None:
+        return None
+    packet = job.metadata.get("prompt_packet")
+    expected = job.metadata.get("prompt_packet_sha256")
+    if not isinstance(packet, str) or not isinstance(expected, str):
+        return None
+    if hashlib.sha256(packet.encode("utf-8")).hexdigest() != expected:
+        raise ValueError("frozen prompt packet failed its integrity check")
+    manifest = job.metadata.get("prompt_manifest")
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("execution_contract_sha256") != contract.sha256
+        or manifest.get("packet_sha256") != expected
+    ):
+        raise ValueError("frozen prompt manifest does not match the execution contract")
+    return packet
+
+
+def _repair_prompt_packet(job) -> str:
+    packet = job.metadata.get("repair_packet")
+    if not isinstance(packet, str) or not packet.strip():
+        raise ValueError("repair-ready job has no repair packet")
+    return packet
 
 
 def _validation_ids(validations: tuple[ValidationCallDefinition, ...]) -> tuple[str, ...]:

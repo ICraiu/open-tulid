@@ -145,22 +145,16 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         implementation_prompt = (implementation_workspace / ".open-tulid" / "prompt-packet.md").read_text(
             encoding="utf-8",
         )
-        assert "## Role" in implementation_prompt
-        assert "## Primary Objective" in implementation_prompt
-        assert "## Context Priority" in implementation_prompt
-        assert "## Read-Only And Writable Paths" in implementation_prompt
-        assert "The current task is authoritative for the user-requested outcome." in implementation_prompt
-        assert "A generated execution contract, when present, is binding" in implementation_prompt
-        assert (
-            "This implementation transition does not require artifacts, so leave `output/` alone"
-            in implementation_prompt
-        )
-        assert "## Parent Context 1" in implementation_prompt
-        assert "Generated Execution Contract: artifacts/" in implementation_prompt
-        assert "/ImplementationContract/implementation-contract-" in implementation_prompt
-        assert "schema: tulid.implementation/v1" in implementation_prompt
-        assert "## Parent Task" not in implementation_prompt
+        assert "## Mission" in implementation_prompt
+        assert "## Repository Facts" in implementation_prompt
+        assert "## Execution Contract" in implementation_prompt
+        assert "## Selected Context Excerpts" in implementation_prompt
+        assert "## Required Validation" in implementation_prompt
+        assert "## Execution Procedure" in implementation_prompt
+        assert "## Completion Submission" in implementation_prompt
+        assert "## Parent Context" not in implementation_prompt
         assert "## Derived tasks" not in implementation_prompt
+        assert "implementation-contract-" not in implementation_prompt
         assert not any((implementation_workspace / "output").glob("*"))
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")

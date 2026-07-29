@@ -30,6 +30,7 @@ from .repository_facts import (
     capture_repository_snapshot,
     repository_facts_to_dict,
 )
+from .acceptance_profiles import load_acceptance_profiles
 from .task_contracts import (
     CheckExpectation,
     ContractCheck,
@@ -44,6 +45,7 @@ from .task_contracts import (
 
 EXECUTION_CONTRACT_SCHEMA = "tulid.execution/v1"
 EXECUTION_CONTRACT_COMPILER_VERSION = 1
+PROMPT_COMPILER_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,14 @@ class ResolvedCheck:
 
 
 @dataclass(frozen=True)
+class FrozenContextExcerpt:
+    artifact: str
+    heading: str
+    text: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class ExecutionContract:
     source_task: Task
     transition: TransitionDefinition
@@ -71,6 +81,7 @@ class ExecutionContract:
     repository_facts: RepositoryFacts
     baseline_manifest: BaselineManifest
     resolved_checks: tuple[ResolvedCheck, ...]
+    context_excerpts: tuple[FrozenContextExcerpt, ...]
     sha256: str
 
 
@@ -121,10 +132,13 @@ def compile_task_execution_contract(
     repository = capture_repository_snapshot(repo_root)
     if not repository.accepted or repository.snapshot is None:
         return ExecutionContractResult(errors=repository.errors)
-    checks, check_errors = _resolve_checks(parsed.contract, transition)
+    checks, check_errors = _resolve_checks(project_root, parsed.contract, transition)
     if check_errors:
         return ExecutionContractResult(errors=check_errors)
 
+    excerpts, excerpt_errors = _freeze_context_excerpts(project_root, task, parsed.contract.context_excerpts)
+    if excerpt_errors:
+        return ExecutionContractResult(errors=excerpt_errors)
     provisional = ExecutionContract(
         source_task=task,
         transition=transition,
@@ -134,6 +148,7 @@ def compile_task_execution_contract(
         repository_facts=repository.snapshot.facts,
         baseline_manifest=repository.snapshot.baseline,
         resolved_checks=checks,
+        context_excerpts=excerpts,
         sha256="",
     )
     contract_hash = canonical_sha256(_execution_contract_body(provisional))
@@ -182,6 +197,7 @@ def load_job_execution_contract(
         embedded_hash != expected_hash
         or actual_hash != expected_hash
         or payload.get("schema") != EXECUTION_CONTRACT_SCHEMA
+        or payload.get("prompt_compiler_version") != PROMPT_COMPILER_VERSION
     ):
         return ExecutionContractResult(errors=(_error(
             "execution_contract.hash_mismatch",
@@ -197,6 +213,7 @@ def load_job_execution_contract(
         facts = _repository_facts_from_dict(repository.get("facts"))
         baseline = _baseline_manifest_from_dict(repository.get("baseline_manifest"))
         resolved_checks = _resolved_checks_from_list(payload.get("resolved_checks"))
+        context_excerpts = _context_excerpts_from_list(payload.get("context_excerpts", ()))
         artifact_path = _required_string(
             _mapping(payload.get("generated_contract"), "generated_contract"),
             "artifact_path",
@@ -231,6 +248,7 @@ def load_job_execution_contract(
         repository_facts=facts,
         baseline_manifest=baseline,
         resolved_checks=resolved_checks,
+        context_excerpts=context_excerpts,
         sha256=expected_hash,
     ))
 
@@ -240,6 +258,7 @@ def _execution_contract_body(contract: ExecutionContract) -> dict[str, object]:
     return {
         "schema": EXECUTION_CONTRACT_SCHEMA,
         "compiler_version": EXECUTION_CONTRACT_COMPILER_VERSION,
+        "prompt_compiler_version": PROMPT_COMPILER_VERSION,
         "source": {
             "task": _task_to_dict(contract.source_task),
             "source_intent_sha256": task_source_intent_sha256(contract.source_task),
@@ -259,10 +278,15 @@ def _execution_contract_body(contract: ExecutionContract) -> dict[str, object]:
             _resolved_check_to_dict(check)
             for check in contract.resolved_checks
         ],
+        "context_excerpts": [
+            {"artifact": excerpt.artifact, "heading": excerpt.heading, "text": excerpt.text, "sha256": excerpt.sha256}
+            for excerpt in contract.context_excerpts
+        ],
     }
 
 
 def _resolve_checks(
+    project_root: Path,
     contract: ImplementationContractDraft,
     transition: TransitionDefinition,
 ) -> tuple[tuple[ResolvedCheck, ...], tuple[DomainError, ...]]:
@@ -270,6 +294,35 @@ def _resolve_checks(
     errors: list[DomainError] = []
     for check in contract.focused_checks:
         checks[check.id] = _focused_check(check)
+
+    profiles = load_acceptance_profiles(project_root)
+    if not profiles.accepted or profiles.profiles is None:
+        return (), profiles.errors
+    for profile_id in contract.acceptance_profiles:
+        profile = profiles.profiles.get(profile_id)
+        if profile is None:
+            errors.append(_error(
+                "execution_contract.acceptance_profile_unknown",
+                f"Contract selects unknown acceptance profile: {profile_id}",
+                profile_id,
+            ))
+            continue
+        if profile_id in checks:
+            errors.append(_error(
+                "execution_contract.check_conflict",
+                f"Acceptance profile id conflicts with a focused check: {profile_id}",
+                profile_id,
+            ))
+            continue
+        checks[profile_id] = ResolvedCheck(
+            id=profile.id,
+            source="acceptance_profile",
+            runner="command",
+            argv=profile.argv,
+            working_directory=profile.working_directory,
+            timeout_seconds=profile.timeout_seconds,
+            expect=profile.expect,
+        )
 
     transition_calls: dict[str, ValidationCallDefinition] = {}
     for call in transition.requires.validations:
@@ -328,6 +381,62 @@ def _focused_check(check: ContractCheck) -> ResolvedCheck:
         timeout_seconds=check.timeout_seconds,
         expect=check.expect,
     )
+
+
+def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple[FrozenContextExcerpt, ...], tuple[DomainError, ...]]:
+    frozen: list[FrozenContextExcerpt] = []
+    errors: list[DomainError] = []
+    for selection in selections:
+        root = project_root.resolve()
+        candidates = []
+        for link in task.artifact_links:
+            relative = Path(link)
+            if selection.artifact not in relative.parts or relative.is_absolute() or ".." in relative.parts:
+                continue
+            candidate = (root / relative).resolve()
+            if candidate != root and root not in candidate.parents:
+                continue
+            candidates.append(candidate)
+        if len(candidates) != 1 or not candidates[0].is_file():
+            errors.append(_error("execution_contract.context_artifact_missing", f"Context artifact {selection.artifact!r} must resolve to one linked file.", selection.artifact))
+            continue
+        try:
+            source = candidates[0].read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(_error("execution_contract.context_read_failed", f"Cannot read context artifact: {exc}", str(candidates[0])))
+            continue
+        excerpt = _markdown_heading_excerpt(source, selection.heading)
+        if excerpt is None:
+            errors.append(_error("execution_contract.context_heading_missing", f"Heading {selection.heading!r} was not found in {selection.artifact!r}.", selection.heading))
+            continue
+        frozen.append(FrozenContextExcerpt(selection.artifact, selection.heading, excerpt, hashlib.sha256(excerpt.encode("utf-8")).hexdigest()))
+    return tuple(frozen), tuple(errors)
+
+
+def _markdown_heading_excerpt(source: str, heading: str) -> str | None:
+    lines = source.splitlines()
+    target = heading.strip().lstrip("#").strip().casefold()
+    start = None
+    level = 0
+    for index, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith("#"):
+            continue
+        hashes, _, title = stripped.partition(" ")
+        if title.strip().casefold() == target:
+            start, level = index, len(hashes)
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].lstrip()
+        if stripped.startswith("#"):
+            hashes, _, _title = stripped.partition(" ")
+            if len(hashes) <= level:
+                end = index
+                break
+    return "\n".join(lines[start:end]).strip()
 
 
 def _transition_check(
@@ -430,6 +539,8 @@ def _implementation_contract_to_dict(
             "add": list(contract.change_surface.add),
             "edit": list(contract.change_surface.edit),
             "forbidden": list(contract.change_surface.forbidden),
+            "max_files": contract.change_surface.max_files,
+            "max_changed_lines": contract.change_surface.max_changed_lines,
         },
         "interfaces": [
             {
@@ -442,6 +553,10 @@ def _implementation_contract_to_dict(
         "requirements": list(contract.requirements),
         "failure_behavior": list(contract.failure_behavior),
         "non_goals": list(contract.non_goals),
+        "context_excerpts": [
+            {"artifact": excerpt.artifact, "heading": excerpt.heading}
+            for excerpt in contract.context_excerpts
+        ],
         "checks": {
             "focused": [
                 {
@@ -457,6 +572,7 @@ def _implementation_contract_to_dict(
                 for check in contract.focused_checks
             ],
             "invariants": list(contract.invariants),
+            "profiles": list(contract.acceptance_profiles),
         },
     }
 
@@ -701,6 +817,25 @@ def _resolved_checks_from_list(raw: object) -> tuple[ResolvedCheck, ...]:
             ),
         ))
     return tuple(checks)
+
+
+def _context_excerpts_from_list(raw: object) -> tuple[FrozenContextExcerpt, ...]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("context_excerpts must be a list")
+    excerpts: list[FrozenContextExcerpt] = []
+    for item in raw:
+        payload = _mapping(item, "context_excerpts[]")
+        text = _required_string(payload, "text")
+        sha256 = _required_string(payload, "sha256")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha256:
+            raise ValueError("context excerpt hash mismatch")
+        excerpts.append(FrozenContextExcerpt(
+            artifact=_required_string(payload, "artifact"),
+            heading=_required_string(payload, "heading"),
+            text=text,
+            sha256=sha256,
+        ))
+    return tuple(excerpts)
 
 
 def _mapping(raw: object, name: str) -> Mapping[str, object]:

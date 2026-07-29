@@ -21,6 +21,7 @@ from .execution_contracts import (
     compile_task_execution_contract,
     execution_contract_to_dict,
 )
+from .prompts import compile_execution_prompt
 from .task_contracts import (
     implementation_contract_required,
 )
@@ -219,6 +220,7 @@ class TaskManager:
                 transition.id,
             ),))
         frozen_contract = None
+        compiled_prompt = None
         if implementation_contract_required(task, self.workflow):
             if self.project_root is None:
                 return CommandResult(accepted=False, errors=(_error(
@@ -235,6 +237,7 @@ class TaskManager:
             if not compiled.accepted or compiled.contract is None:
                 return CommandResult(accepted=False, errors=compiled.errors)
             frozen_contract = compiled.contract
+            compiled_prompt = compile_execution_prompt(frozen_contract)
         job_id = command.job_id or new_ulid()
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
@@ -252,6 +255,9 @@ class TaskManager:
                     {
                         "execution_contract": execution_contract_to_dict(frozen_contract),
                         "execution_contract_sha256": frozen_contract.sha256,
+                        "prompt_packet": compiled_prompt.text,
+                        "prompt_packet_sha256": compiled_prompt.manifest.packet_sha256,
+                        "prompt_manifest": compiled_prompt.manifest.to_dict(),
                     }
                     if frozen_contract is not None
                     else {}

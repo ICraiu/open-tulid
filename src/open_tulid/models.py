@@ -23,6 +23,7 @@ class RuntimeConfig:
     default_timeout_seconds: int = 7200
     failed_job_backoff_seconds: int = 60
     max_failed_attempts_per_transition: int = 0
+    max_repair_attempts: int = 2
     worker_images: dict[str, str] = field(default_factory=dict)
     worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
     worker_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)
