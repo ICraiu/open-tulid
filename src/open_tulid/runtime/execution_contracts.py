@@ -30,11 +30,16 @@ from .repository_facts import (
     capture_repository_snapshot,
     repository_facts_to_dict,
 )
-from .acceptance_profiles import load_acceptance_profiles
+from .prompt_versions import (
+    PROMPT_COMPILER_VERSION,
+    SUPPORTED_PROMPT_COMPILER_VERSIONS,
+)
+from .acceptance_profiles import AcceptanceProfile, load_acceptance_profiles
 from .task_contracts import (
     CheckExpectation,
     ContractCheck,
     ImplementationContractDraft,
+    PRODUCT_FACING_CONTRACT_PROFILES,
     SHELL_CONTROL_TOKENS,
     find_implementation_contract_path,
     parse_implementation_contract,
@@ -45,7 +50,8 @@ from .task_contracts import (
 
 EXECUTION_CONTRACT_SCHEMA = "tulid.execution/v1"
 EXECUTION_CONTRACT_COMPILER_VERSION = 1
-PROMPT_COMPILER_VERSION = 1
+CONTEXT_EXCERPT_CHARACTER_LIMIT = 1_200
+CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT = 2_000
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ class ResolvedCheck:
 class FrozenContextExcerpt:
     artifact: str
     heading: str
+    reason: str
     text: str
     sha256: str
 
@@ -193,11 +200,14 @@ def load_job_execution_contract(
         ),))
     embedded_hash = payload.pop("sha256", None)
     actual_hash = canonical_sha256(payload)
+    prompt_compiler_version = payload.get("prompt_compiler_version")
     if (
         embedded_hash != expected_hash
         or actual_hash != expected_hash
         or payload.get("schema") != EXECUTION_CONTRACT_SCHEMA
-        or payload.get("prompt_compiler_version") != PROMPT_COMPILER_VERSION
+        or payload.get("compiler_version") != EXECUTION_CONTRACT_COMPILER_VERSION
+        or isinstance(prompt_compiler_version, bool)
+        or prompt_compiler_version not in SUPPORTED_PROMPT_COMPILER_VERSIONS
     ):
         return ExecutionContractResult(errors=(_error(
             "execution_contract.hash_mismatch",
@@ -206,6 +216,7 @@ def load_job_execution_contract(
         ),))
 
     try:
+        assert isinstance(prompt_compiler_version, int)
         source_task = _task_from_dict(_mapping(payload.get("source"), "source").get("task"))
         transition = _transition_from_dict(payload.get("transition"))
         generated = _implementation_contract_from_dict(payload.get("generated_contract"))
@@ -213,7 +224,10 @@ def load_job_execution_contract(
         facts = _repository_facts_from_dict(repository.get("facts"))
         baseline = _baseline_manifest_from_dict(repository.get("baseline_manifest"))
         resolved_checks = _resolved_checks_from_list(payload.get("resolved_checks"))
-        context_excerpts = _context_excerpts_from_list(payload.get("context_excerpts", ()))
+        context_excerpts = _context_excerpts_from_list(
+            payload.get("context_excerpts", ()),
+            legacy_missing_reason=prompt_compiler_version == 1,
+        )
         artifact_path = _required_string(
             _mapping(payload.get("generated_contract"), "generated_contract"),
             "artifact_path",
@@ -279,7 +293,13 @@ def _execution_contract_body(contract: ExecutionContract) -> dict[str, object]:
             for check in contract.resolved_checks
         ],
         "context_excerpts": [
-            {"artifact": excerpt.artifact, "heading": excerpt.heading, "text": excerpt.text, "sha256": excerpt.sha256}
+            {
+                "artifact": excerpt.artifact,
+                "heading": excerpt.heading,
+                "reason": excerpt.reason,
+                "text": excerpt.text,
+                "sha256": excerpt.sha256,
+            }
             for excerpt in contract.context_excerpts
         ],
     }
@@ -323,6 +343,13 @@ def _resolve_checks(
             timeout_seconds=profile.timeout_seconds,
             expect=profile.expect,
         )
+
+    _validate_vertical_slice_policy(
+        contract,
+        profiles.profiles,
+        profiles.require_vertical_slice,
+        errors,
+    )
 
     transition_calls: dict[str, ValidationCallDefinition] = {}
     for call in transition.requires.validations:
@@ -372,6 +399,45 @@ def _resolve_checks(
     )
 
 
+def _validate_vertical_slice_policy(
+    contract: ImplementationContractDraft,
+    profiles: Mapping[str, AcceptanceProfile],
+    require_vertical_slice: bool,
+    errors: list[DomainError],
+) -> None:
+    """Enforce vertical-slice evidence for product-facing implementation work."""
+    selected = [
+        profiles[profile_id]
+        for profile_id in contract.acceptance_profiles
+        if profile_id in profiles
+    ]
+    has_vertical_slice = any(profile.kind == "vertical_slice" for profile in selected)
+    if contract.profile not in PRODUCT_FACING_CONTRACT_PROFILES:
+        if contract.vertical_slice_exemption is not None:
+            errors.append(_error(
+                "execution_contract.vertical_slice_exemption_unneeded",
+                "Only product-facing contracts may declare a vertical-slice exemption.",
+                "checks.vertical_slice_exemption",
+            ))
+        return
+    if has_vertical_slice and contract.vertical_slice_exemption is not None:
+        errors.append(_error(
+            "execution_contract.vertical_slice_exemption_conflict",
+            "Select a vertical-slice profile or record an exemption, not both.",
+            "checks.vertical_slice_exemption",
+        ))
+    elif (
+        require_vertical_slice
+        and not has_vertical_slice
+        and contract.vertical_slice_exemption is None
+    ):
+        errors.append(_error(
+            "execution_contract.vertical_slice_required",
+            "Product-facing contracts require a selected vertical-slice acceptance profile or an explicit exemption.",
+            "checks.profiles",
+        ))
+
+
 def _focused_check(check: ContractCheck) -> ResolvedCheck:
     return ResolvedCheck(
         id=check.id,
@@ -386,6 +452,7 @@ def _focused_check(check: ContractCheck) -> ResolvedCheck:
 def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple[FrozenContextExcerpt, ...], tuple[DomainError, ...]]:
     frozen: list[FrozenContextExcerpt] = []
     errors: list[DomainError] = []
+    total_characters = 0
     for selection in selections:
         root = project_root.resolve()
         candidates = []
@@ -405,38 +472,72 @@ def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tupl
         except OSError as exc:
             errors.append(_error("execution_contract.context_read_failed", f"Cannot read context artifact: {exc}", str(candidates[0])))
             continue
-        excerpt = _markdown_heading_excerpt(source, selection.heading)
-        if excerpt is None:
+        excerpts = _markdown_heading_excerpts(source, selection.heading)
+        if not excerpts:
             errors.append(_error("execution_contract.context_heading_missing", f"Heading {selection.heading!r} was not found in {selection.artifact!r}.", selection.heading))
             continue
-        frozen.append(FrozenContextExcerpt(selection.artifact, selection.heading, excerpt, hashlib.sha256(excerpt.encode("utf-8")).hexdigest()))
+        if len(excerpts) > 1:
+            errors.append(_error(
+                "execution_contract.context_heading_duplicate",
+                f"Heading {selection.heading!r} appears more than once in {selection.artifact!r}.",
+                selection.heading,
+            ))
+            continue
+        excerpt = excerpts[0]
+        if len(excerpt) > CONTEXT_EXCERPT_CHARACTER_LIMIT:
+            errors.append(_error(
+                "execution_contract.context_excerpt_too_large",
+                (
+                    f"Context excerpt {selection.heading!r} exceeds the "
+                    f"{CONTEXT_EXCERPT_CHARACTER_LIMIT}-character per-excerpt budget."
+                ),
+                selection.heading,
+            ))
+            continue
+        total_characters += len(excerpt)
+        if total_characters > CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT:
+            errors.append(_error(
+                "execution_contract.context_excerpts_too_large",
+                (
+                    "Selected context excerpts exceed the "
+                    f"{CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT}-character total budget."
+                ),
+                "context_excerpts",
+            ))
+            continue
+        frozen.append(FrozenContextExcerpt(
+            selection.artifact,
+            selection.heading,
+            selection.reason,
+            excerpt,
+            hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+        ))
     return tuple(frozen), tuple(errors)
 
 
-def _markdown_heading_excerpt(source: str, heading: str) -> str | None:
+def _markdown_heading_excerpts(source: str, heading: str) -> tuple[str, ...]:
     lines = source.splitlines()
     target = heading.strip().lstrip("#").strip().casefold()
-    start = None
-    level = 0
+    starts: list[tuple[int, int]] = []
     for index, line in enumerate(lines):
         stripped = line.lstrip()
         if not stripped.startswith("#"):
             continue
         hashes, _, title = stripped.partition(" ")
         if title.strip().casefold() == target:
-            start, level = index, len(hashes)
-            break
-    if start is None:
-        return None
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].lstrip()
-        if stripped.startswith("#"):
-            hashes, _, _title = stripped.partition(" ")
-            if len(hashes) <= level:
-                end = index
-                break
-    return "\n".join(lines[start:end]).strip()
+            starts.append((index, len(hashes)))
+    excerpts: list[str] = []
+    for start, level in starts:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            stripped = lines[index].lstrip()
+            if stripped.startswith("#"):
+                hashes, _, _title = stripped.partition(" ")
+                if len(hashes) <= level:
+                    end = index
+                    break
+        excerpts.append("\n".join(lines[start:end]).strip())
+    return tuple(excerpts)
 
 
 def _transition_check(
@@ -554,7 +655,11 @@ def _implementation_contract_to_dict(
         "failure_behavior": list(contract.failure_behavior),
         "non_goals": list(contract.non_goals),
         "context_excerpts": [
-            {"artifact": excerpt.artifact, "heading": excerpt.heading}
+            {
+                "artifact": excerpt.artifact,
+                "heading": excerpt.heading,
+                "reason": excerpt.reason,
+            }
             for excerpt in contract.context_excerpts
         ],
         "checks": {
@@ -573,6 +678,7 @@ def _implementation_contract_to_dict(
             ],
             "invariants": list(contract.invariants),
             "profiles": list(contract.acceptance_profiles),
+            "vertical_slice_exemption": contract.vertical_slice_exemption,
         },
     }
 
@@ -667,6 +773,8 @@ def _transition_to_dict(transition: TransitionDefinition) -> dict[str, object]:
                 "task_type": transition.derives.task_type,
                 "state": transition.derives.state,
                 "artifact_type": transition.derives.artifact_type,
+                "required": transition.derives.required,
+                "parent_to_if_derived": transition.derives.parent_to_if_derived,
             }
             if transition.derives is not None
             else None
@@ -716,10 +824,22 @@ def _transition_from_dict(raw: object) -> TransitionDefinition:
     derives = None
     if derives_payload is not None:
         derives_map = _mapping(derives_payload, "transition.derives")
+        derives_required = derives_map.get("required", True)
+        if not isinstance(derives_required, bool):
+            raise ValueError("transition.derives.required must be a boolean")
+        parent_to_if_derived = derives_map.get("parent_to_if_derived")
+        if parent_to_if_derived is not None and (
+            not isinstance(parent_to_if_derived, str) or not parent_to_if_derived
+        ):
+            raise ValueError(
+                "transition.derives.parent_to_if_derived must be a non-empty string or null"
+            )
         derives = DerivesDefinition(
             task_type=_required_string(derives_map, "task_type"),
             state=_required_string(derives_map, "state"),
             artifact_type=_required_string(derives_map, "artifact_type"),
+            required=derives_required,
+            parent_to_if_derived=parent_to_if_derived,
         )
 
     worker = payload.get("worker")
@@ -819,7 +939,11 @@ def _resolved_checks_from_list(raw: object) -> tuple[ResolvedCheck, ...]:
     return tuple(checks)
 
 
-def _context_excerpts_from_list(raw: object) -> tuple[FrozenContextExcerpt, ...]:
+def _context_excerpts_from_list(
+    raw: object,
+    *,
+    legacy_missing_reason: bool = False,
+) -> tuple[FrozenContextExcerpt, ...]:
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise ValueError("context_excerpts must be a list")
     excerpts: list[FrozenContextExcerpt] = []
@@ -829,9 +953,15 @@ def _context_excerpts_from_list(raw: object) -> tuple[FrozenContextExcerpt, ...]
         sha256 = _required_string(payload, "sha256")
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != sha256:
             raise ValueError("context excerpt hash mismatch")
+        reason = payload.get("reason")
+        if reason is None and legacy_missing_reason:
+            reason = "Required to implement the generated contract."
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be a non-empty string")
         excerpts.append(FrozenContextExcerpt(
             artifact=_required_string(payload, "artifact"),
             heading=_required_string(payload, "heading"),
+            reason=reason,
             text=text,
             sha256=sha256,
         ))

@@ -1,2 +1,4 @@
 schema: tulid.acceptance/v1
+policy:
+  require_vertical_slice: true
 profiles: {}

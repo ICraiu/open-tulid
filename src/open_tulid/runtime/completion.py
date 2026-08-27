@@ -303,6 +303,13 @@ class CompletionService:
                 errors=derivation_errors,
                 message=_format_errors(derivation_errors),
             )
+        effective_to_state = transition.to_state
+        if (
+            derived_tasks
+            and transition.derives is not None
+            and transition.derives.parent_to_if_derived is not None
+        ):
+            effective_to_state = transition.derives.parent_to_if_derived
         events = (
             build_event(
                 project_id=job.project_id,
@@ -313,7 +320,7 @@ class CompletionService:
                 job_id=job.job_id,
                 transition_id=job.transition_id,
                 submission_id=submission_id,
-                data={"from_state": transition.from_state, "to_state": transition.to_state},
+                data={"from_state": transition.from_state, "to_state": effective_to_state},
             ),
             build_event(
                 project_id=job.project_id,
@@ -326,7 +333,7 @@ class CompletionService:
                 submission_id=submission_id,
                 data={
                     "from_state": transition.from_state,
-                    "to_state": transition.to_state,
+                    "to_state": effective_to_state,
                     "reason": "completion_accepted",
                 },
             ),
@@ -423,13 +430,13 @@ class CompletionService:
                     "child_links": tuple(item["link"] for item in derived_tasks),
                 },) if derived_tasks else ()
             ),
-            {"type": "move_task", "task_id": job.task_id, "to_state": transition.to_state},
+            {"type": "move_task", "task_id": job.task_id, "to_state": effective_to_state},
         )
         transaction = self._apply_acceptance(
             project_id=job.project_id,
             task_id=job.task_id,
             transition_id=job.transition_id,
-            expected_to_state=transition.to_state,
+            expected_to_state=effective_to_state,
             effects=effects,
             events=events,
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -54,6 +55,10 @@ from open_tulid.runtime import (
     check_backend_readiness,
     cleanup_job_workspaces,
     compile_task_execution_contract,
+    compiled_prompt_from_metadata,
+    find_review_evidence,
+    is_review_transition,
+    lint_compiled_prompt,
     recover_job_creation_transactions,
     recover_completion_transactions,
     render_execution_prompt,
@@ -1222,8 +1227,8 @@ def render_prompt(
         "--transition",
         "-t",
         help=(
-            "Transition to preview, including a historical transition for a completed task. "
-            "Defaults to the transition the scheduler would select."
+            "Transition to preview using current inputs, including a transition no longer "
+            "active for a completed task. Defaults to the scheduler selection."
         ),
     ),
     job_id: str = typer.Option(
@@ -1233,6 +1238,22 @@ def render_prompt(
     ),
 ) -> None:
     """Render the exact prompt packet for a task without scheduling or running it."""
+    rendered = _render_prompt_preview(
+        project=project,
+        task_id=task_id,
+        transition_id=transition_id,
+        job_id=job_id,
+    )
+    typer.echo(rendered.text)
+
+
+def _render_prompt_preview(
+    *,
+    project: str,
+    task_id: str,
+    transition_id: str | None,
+    job_id: str,
+):
     config, workflow = _load_cli_context(project)
     if workflow is None:
         console.print(Panel(f"workflow.yaml is required in project {project!r}.", style="red"))
@@ -1304,6 +1325,30 @@ def render_prompt(
         execution_contract = compiled.contract
         task = execution_contract.source_task
         transition = execution_contract.transition
+    render_kwargs = {}
+    if (
+        execution_contract is not None
+        and is_review_transition(transition)
+    ):
+        app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
+        listed = FileExecutionJobStore(app_state / "jobs" / project).list()
+        if not listed.accepted:
+            _print_domain_errors((listed.error,) if listed.error is not None else ())
+            raise typer.Exit(1)
+        evidence = find_review_evidence(
+            listed.jobs,
+            project_id=project,
+            task_id=task.id,
+            review_transition=transition,
+        )
+        if evidence is None:
+            _print_domain_errors((DomainError(
+                "prompt.review_evidence_missing",
+                "No accepted implementation verification report is available for self-review.",
+                task.id,
+            ),))
+            raise typer.Exit(1)
+        render_kwargs["review_evidence"] = evidence
     rendered = render_execution_prompt(
         workflow=workflow,
         adapter=adapter,
@@ -1313,11 +1358,108 @@ def render_prompt(
         job_id=job_id,
         completion_endpoint=f"http://preview.invalid/jobs/{job_id}/complete",
         execution_contract=execution_contract,
+        **render_kwargs,
     )
     if not rendered.accepted:
         _print_domain_errors(rendered.errors)
         raise typer.Exit(1)
-    typer.echo(rendered.text)
+    return rendered
+
+
+@prompts_app.command("explain")
+def explain_prompt(
+    project: str = typer.Argument(..., help="Configured project name."),
+    task_id: str = typer.Argument(..., help="Task id to inspect."),
+    transition_id: str | None = typer.Option(None, "--transition", "-t"),
+) -> None:
+    """Explain section provenance, budgets, hashes, and selection decisions."""
+    rendered = _render_prompt_preview(
+        project=project,
+        task_id=task_id,
+        transition_id=transition_id,
+        job_id="PROMPT_PREVIEW",
+    )
+    if rendered.compiled_prompt is None:
+        typer.echo("mode: live legacy prompt\nstructured manifest: unavailable")
+        return
+    _echo_prompt_explanation(rendered.compiled_prompt, mode="live preview")
+
+
+@prompts_app.command("lint")
+def lint_prompt(
+    project: str = typer.Argument(..., help="Configured project name."),
+    task_id: str = typer.Argument(..., help="Task id to inspect."),
+    transition_id: str | None = typer.Option(None, "--transition", "-t"),
+) -> None:
+    """Validate a prompt's structure, integrity, duplication, and budgets."""
+    rendered = _render_prompt_preview(
+        project=project,
+        task_id=task_id,
+        transition_id=transition_id,
+        job_id="PROMPT_PREVIEW",
+    )
+    if rendered.compiled_prompt is None:
+        typer.echo("No structured prompt manifest is available for this legacy transition.")
+        raise typer.Exit(1)
+    issues = lint_compiled_prompt(
+        rendered.compiled_prompt,
+        contract=rendered.execution_contract,
+    )
+    if issues:
+        _print_domain_errors(issues)
+        raise typer.Exit(1)
+    typer.echo(
+        f"OK: {len(rendered.compiled_prompt.sections)} singleton sections, "
+        f"{rendered.compiled_prompt.manifest.characters}/"
+        f"{rendered.compiled_prompt.manifest.character_budget} characters"
+    )
+
+
+@prompts_app.command("show-job")
+def show_job_prompt(
+    project: str = typer.Argument(..., help="Configured project name."),
+    job_id: str = typer.Argument(..., help="Historical execution job id."),
+    explain: bool = typer.Option(False, "--explain", help="Show manifest provenance instead of packet text."),
+) -> None:
+    """Show the immutable packet stored for a historical execution job."""
+    config = _load_cli_config()
+    app_state = config.config_dir or (Path.home() / CONFIG_DIRNAME)
+    loaded = FileExecutionJobStore(app_state / "jobs" / project).get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        _print_domain_errors((loaded.error,) if loaded.error is not None else ())
+        raise typer.Exit(1)
+    try:
+        compiled = compiled_prompt_from_metadata(loaded.job.metadata)
+    except ValueError as exc:
+        _print_domain_errors((DomainError(
+            "prompt.history_corrupt",
+            str(exc),
+            job_id,
+        ),))
+        raise typer.Exit(1)
+    if explain:
+        _echo_prompt_explanation(compiled, mode=f"historical job {job_id}")
+    else:
+        typer.echo(compiled.text)
+
+
+def _echo_prompt_explanation(compiled, *, mode: str) -> None:
+    manifest = compiled.manifest
+    typer.echo(f"mode: {mode}")
+    typer.echo(f"packet_type: {manifest.packet_type}")
+    typer.echo(f"compiler_version: {manifest.compiler_version}")
+    typer.echo(f"characters: {manifest.characters}/{manifest.character_budget}")
+    typer.echo(f"packet_sha256: {manifest.packet_sha256}")
+    for index, section in enumerate(compiled.sections, start=1):
+        budget = section.budget if section.budget is not None else "binding"
+        section_sha = hashlib.sha256(section.text.encode("utf-8")).hexdigest()
+        typer.echo(
+            f"{index}. {section.id} [{section.source_kind}:{section.source_ref}] "
+            f"characters={len(section.text)} budget={budget} "
+            f"truncated={str(section.truncated).lower()}"
+        )
+        typer.echo(f"   sha256: {section_sha}")
+        typer.echo(f"   reason: {section.selection_reason}")
 
 
 def _prompt_transition_error(

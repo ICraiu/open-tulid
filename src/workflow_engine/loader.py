@@ -723,7 +723,7 @@ def _build_transition(
                         f"unknown key {key!r} in derives",
                         key_span(derives_raw, key, f"{d_path}.{key}"),
                     ))
-            missing = langdef.DERIVES_KEYS - set(derives_raw)
+            missing = langdef.DERIVES_REQUIRED_KEYS - set(derives_raw)
             for key in missing:
                 diagnostics.append(_diag_from_span(
                     "workflow.shape.missing_required_field",
@@ -731,7 +731,7 @@ def _build_transition(
                     key_span(derives_raw, key, f"{d_path}.{key}"),
                 ))
             if not missing:
-                values = {key: derives_raw[key] for key in langdef.DERIVES_KEYS}
+                values = {key: derives_raw[key] for key in langdef.DERIVES_REQUIRED_KEYS}
                 for key, value in values.items():
                     if not isinstance(value, str):
                         diagnostics.append(_diag_from_span(
@@ -739,11 +739,35 @@ def _build_transition(
                             f"derives.{key} must be a string",
                             key_span(derives_raw, key, f"{d_path}.{key}"),
                         ))
-                if not diagnostics:
+                required = derives_raw.get("required", True)
+                if not isinstance(required, bool):
+                    diagnostics.append(_diag_from_span(
+                        "workflow.shape.wrong_type",
+                        "derives.required must be a boolean",
+                        key_span(derives_raw, "required", f"{d_path}.required"),
+                    ))
+                parent_to_if_derived = derives_raw.get("parent_to_if_derived")
+                if parent_to_if_derived is not None and not isinstance(parent_to_if_derived, str):
+                    diagnostics.append(_diag_from_span(
+                        "workflow.shape.wrong_type",
+                        "derives.parent_to_if_derived must be a string",
+                        key_span(
+                            derives_raw,
+                            "parent_to_if_derived",
+                            f"{d_path}.parent_to_if_derived",
+                        ),
+                    ))
+                if (
+                    all(isinstance(value, str) for value in values.values())
+                    and isinstance(required, bool)
+                    and (parent_to_if_derived is None or isinstance(parent_to_if_derived, str))
+                ):
                     derives = DerivesSpec(
                         task_type=values["task_type"],
                         state=values["state"],
                         artifact_type=values["artifact_type"],
+                        required=required,
+                        parent_to_if_derived=parent_to_if_derived,
                         span=key_span(raw, "derives", d_path),
                     )
 

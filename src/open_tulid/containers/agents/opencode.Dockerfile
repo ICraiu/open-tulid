@@ -7,6 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 ENV OPENCODE_DISABLE_AUTOUPDATE=true
 
+ARG OPENCODE_VERSION=1.18.18
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -16,7 +18,7 @@ RUN apt-get update \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g opencode-ai \
+RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" \
     && opencode --version
 
 WORKDIR /workspace/project

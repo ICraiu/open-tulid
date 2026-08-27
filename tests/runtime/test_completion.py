@@ -742,6 +742,128 @@ def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
     assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()].count("TaskDerived") == 2
 
 
+def test_optional_derivation_without_child_uses_normal_destination(tmp_path: Path):
+    store = _job_store(tmp_path)
+    base = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=base.schema_version,
+        states=base.states,
+        task_types=MappingProxyType({
+            **dict(base.task_types),
+            "question": TaskTypeDefinition(id="question", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({"follow_up": ArtifactTypeDefinition(id="follow_up")}),
+        validation_types=base.validation_types,
+        operation_types=base.operation_types,
+        workers=base.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+                derives=DerivesDefinition(
+                    task_type="question",
+                    state="Todo",
+                    artifact_type="follow_up",
+                    required=False,
+                    parent_to_if_derived="Todo",
+                ),
+            ),
+        }),
+    )
+    adapter = FakeAdapter(_task())
+    service = CompletionService(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(summary="everything is clear"),
+    )
+
+    assert result.accepted is True
+    assert adapter.moved_to == "CodeReview"
+
+
+def test_optional_derivation_with_child_uses_alternate_destination(tmp_path: Path):
+    store = _job_store(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "follow-up.md").write_text(
+        "---\nlocal_id: follow-up\n---\n# Follow-up questions\n\nAnswer these.\n",
+        encoding="utf-8",
+    )
+
+    class FollowUpAdapter(FakeAdapter):
+        def __init__(self, task: Task):
+            super().__init__(task)
+            self.created: list[Task] = []
+
+        def create_task(self, task: Task) -> WriteResult:
+            self.created.append(task)
+            return WriteResult(path=task.path)
+
+    base = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=base.schema_version,
+        states=base.states,
+        task_types=MappingProxyType({
+            **dict(base.task_types),
+            "question": TaskTypeDefinition(id="question", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({"follow_up": ArtifactTypeDefinition(id="follow_up")}),
+        validation_types=base.validation_types,
+        operation_types=base.operation_types,
+        workers=base.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+                derives=DerivesDefinition(
+                    task_type="question",
+                    state="Todo",
+                    artifact_type="follow_up",
+                    required=False,
+                    parent_to_if_derived="Todo",
+                ),
+            ),
+        }),
+    )
+    adapter = FollowUpAdapter(_task())
+    service = CompletionService(
+        workflow=workflow,
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="more answers are needed",
+            artifacts=(ArtifactSubmission(type="follow_up", path="follow-up.md"),),
+        ),
+    )
+
+    assert result.accepted is True
+    assert adapter.moved_to == "Todo"
+    assert len(adapter.created) == 1
+    assert adapter.created[0].parent_id == TASK_ID
+
+
 def test_completion_derives_child_tasks_after_existing_numeric_ids(tmp_path: Path):
     store = _job_store(tmp_path)
     output = tmp_path / "workspace" / "output"

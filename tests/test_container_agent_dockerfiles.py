@@ -46,7 +46,8 @@ def test_codex_agent_dockerfile_packages_codex_cli():
 
     assert "FROM node:24-bookworm-slim" in content
     assert "curl" in content
-    assert "npm install -g @openai/codex" in content
+    assert "ARG CODEX_VERSION=" in content
+    assert 'npm install -g "@openai/codex@${CODEX_VERSION}"' in content
     assert 'ENTRYPOINT ["codex"]' in content
     assert "WORKDIR /workspace/project" in content
 
@@ -56,7 +57,8 @@ def test_opencode_agent_dockerfile_packages_opencode_cli():
 
     assert "FROM node:24-bookworm-slim" in content
     assert "curl" in content
-    assert "npm install -g opencode-ai" in content
+    assert "ARG OPENCODE_VERSION=" in content
+    assert 'npm install -g "opencode-ai@${OPENCODE_VERSION}"' in content
     assert 'ENTRYPOINT ["opencode"]' in content
     assert "WORKDIR /workspace/project" in content
 

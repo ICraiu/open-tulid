@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -897,6 +898,65 @@ def test_prompts_render_uses_scheduler_transition_and_prints_raw_packet(tmp_path
     assert seen["worker_id"] == "qwen_27b"
     assert seen["job_id"] == "PROMPT_PREVIEW"
     assert seen["completion_endpoint"] == "http://preview.invalid/jobs/PROMPT_PREVIEW/complete"
+
+
+def test_prompts_show_job_reads_immutable_packet_and_explains_manifest(tmp_path: Path):
+    _write_config(tmp_path)
+    text = "## Completion Submission\n\ncurl -sS -X POST"
+    packet_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    section_text = "curl -sS -X POST"
+    section_sha = hashlib.sha256(section_text.encode("utf-8")).hexdigest()
+    store = FileExecutionJobStore(
+        tmp_path / CONFIG_DIRNAME / "jobs" / "Agent"
+    )
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="1",
+        transition_id="ImplementTask",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "workspace"),
+        status="accepted",
+        metadata={
+            "prompt_packet": text,
+            "prompt_packet_sha256": packet_sha,
+            "prompt_manifest": {
+                "compiler_version": 2,
+                "packet_type": "implementation",
+                "execution_contract_sha256": "a" * 64,
+                "packet_sha256": packet_sha,
+                "characters": len(text),
+                "character_budget": 6000,
+                "sections": [{
+                    "id": "completion_submission",
+                    "heading": "Completion Submission",
+                    "source_kind": "runtime",
+                    "source_ref": "completion_api",
+                    "selection_reason": "The sole completion mechanism.",
+                    "sha256": section_sha,
+                    "characters": len(section_text),
+                    "budget": 900,
+                    "truncated": False,
+                }],
+            },
+        },
+    )).accepted is True
+
+    with _with_cwd(tmp_path):
+        shown = runner.invoke(app, [
+            "prompts", "show-job", "Agent", "01J00000000000000000000JOB",
+        ])
+        explained = runner.invoke(app, [
+            "prompts", "show-job", "Agent", "01J00000000000000000000JOB",
+            "--explain",
+        ])
+
+    assert shown.exit_code == 0
+    assert shown.output == text + "\n"
+    assert explained.exit_code == 0
+    assert "mode: historical job 01J00000000000000000000JOB" in explained.output
+    assert "packet_type: implementation" in explained.output
+    assert "runtime:completion_api" in explained.output
 
 
 def test_prompts_render_allows_explicit_historical_transition_for_done_task(tmp_path: Path, monkeypatch):

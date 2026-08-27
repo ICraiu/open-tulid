@@ -8,9 +8,15 @@ storage:
       - state: Idea
         board: Work
         column: Idea
-      - state: HumanReview
+      - state: ReadyForQuestions
         board: Work
-        column: Human review
+        column: Ready for questions
+      - state: Questions
+        board: Work
+        column: Questions
+      - state: AnswersReady
+        board: Work
+        column: Answers ready
       - state: ReadyForSpec
         board: Work
         column: Ready for spec
@@ -34,7 +40,11 @@ statements:
   - kind: state
     id: Idea
   - kind: state
-    id: HumanReview
+    id: ReadyForQuestions
+  - kind: state
+    id: Questions
+  - kind: state
+    id: AnswersReady
   - kind: state
     id: ReadyForSpec
   - kind: state
@@ -52,10 +62,21 @@ statements:
     id: ProductIdea
     instructions: [default]
     requirements:
-      HumanReview:
+      ReadyForQuestions:
         artifacts: [ProductSpec, TechnicalDirection]
+      Done:
+        artifacts: [ProductSpec, TechnicalDirection]
+
+  - kind: task_type
+    id: QuestionRound
+    instructions: [default]
+    requirements:
+      ReadyForSpec:
+        artifacts: [ClarityAssessment]
       ReadyForBreakdown:
-        artifacts: [ImplementationSpec]
+        artifacts: [ClarityAssessment, ImplementationSpec]
+      Done:
+        artifacts: [ClarityAssessment]
 
   - kind: task_type
     id: ImplementationTask
@@ -83,16 +104,17 @@ statements:
         type: string
         required: true
 
-  # Validation capabilities are generic, but commands are project-specific.
-  # Add compatible validation calls to implementation transitions after the
-  # target repository's language, manifests, and test entrypoints are known.
-
   - kind: artifact_type
     id: ProductSpec
     template: product-spec.md
   - kind: artifact_type
     id: TechnicalDirection
     template: technical-direction.md
+  - kind: artifact_type
+    id: QuestionRoundFile
+  - kind: artifact_type
+    id: ClarityAssessment
+    template: clarity-assessment.md
   - kind: artifact_type
     id: ImplementationSpec
     template: implementation-spec.md
@@ -107,6 +129,14 @@ statements:
     type: codex
     instructions: [default, direction-authoring, product-template, technical-direction-template]
   - kind: worker
+    id: codex_questions
+    type: codex
+    instructions: [default, questions-authoring]
+  - kind: worker
+    id: codex_clarity
+    type: codex
+    instructions: [default, answers-review]
+  - kind: worker
     id: codex_spec
     type: codex
     instructions: [default, implementation-spec, implementation-spec-template, diagram-requirements]
@@ -119,29 +149,63 @@ statements:
     type: codex
     instructions: [default, execution-contract-authoring]
   - kind: worker
-    id: qwen_27b
+    id: peon-llm
     type: local_llm
-    instructions: [default, qwen-implementation]
+    instructions: [default, peon-implementation]
 
   - kind: transition
     id: DraftDirection
     task_type: ProductIdea
     from: Idea
-    to: HumanReview
+    to: ReadyForQuestions
     worker: codex_direction
     default_for_scheduler: true
     requires:
       artifacts: [ProductSpec, TechnicalDirection]
 
   - kind: transition
-    id: ApproveDirection
+    id: GenerateQuestions
     task_type: ProductIdea
-    from: HumanReview
+    from: ReadyForQuestions
+    to: Done
+    worker: codex_questions
+    default_for_scheduler: true
+    derives:
+      task_type: QuestionRound
+      state: Questions
+      artifact_type: QuestionRoundFile
+
+  - kind: transition
+    id: SubmitAnswers
+    task_type: QuestionRound
+    from: Questions
+    to: AnswersReady
+
+  - kind: transition
+    id: ReopenAnswers
+    task_type: QuestionRound
+    from: AnswersReady
+    to: Questions
+
+  - kind: transition
+    id: ReviewAnswers
+    task_type: QuestionRound
+    from: AnswersReady
     to: ReadyForSpec
+    worker: codex_clarity
+    default_for_scheduler: true
+    requires:
+      artifacts: [ClarityAssessment]
+    derives:
+      task_type: QuestionRound
+      state: Questions
+      artifact_type: QuestionRoundFile
+      required: false
+      parent_to_if_derived: Done
 
   - kind: transition
     id: WriteImplementationSpec
-    task_type: ProductIdea
+    task_type: QuestionRound
     from: ReadyForSpec
     to: ReadyForBreakdown
     worker: codex_spec
@@ -151,7 +215,7 @@ statements:
 
   - kind: transition
     id: BreakDownImplementationSpec
-    task_type: ProductIdea
+    task_type: QuestionRound
     from: ReadyForBreakdown
     to: Done
     worker: codex_breakdown
@@ -180,7 +244,7 @@ statements:
     task_type: ImplementationTask
     from: ReadyToImplement
     to: SelfReview
-    worker: qwen_27b
+    worker: peon-llm
     default_for_scheduler: true
     requires:
       changed_files:
@@ -203,6 +267,6 @@ statements:
     task_type: ImplementationTask
     from: SelfReview
     to: Done
-    worker: qwen_27b
+    worker: peon-llm
     default_for_scheduler: true
     instructions: [self-review]

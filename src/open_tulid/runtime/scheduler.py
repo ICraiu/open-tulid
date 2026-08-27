@@ -300,6 +300,7 @@ class Scheduler:
                 workflow=self.workflow,
                 adapter=self.adapter,
                 job_store=None if self._transactional_creation_enabled else self.job_store,
+                history_job_store=self.job_store,
                 project_root=self.project_root,
                 repo_root=self.repo_root,
             )

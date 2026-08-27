@@ -8,4 +8,6 @@ Prefer explicit contracts, state transitions, failure cases, ownership boundarie
 
 Carry every relevant technical-direction decision forward. Resolve the repository paths, public symbols, signatures, failure behavior, dependency seams, and deterministic validation commands needed by task breakdown and execution-contract authoring. Do not leave an implementation task to choose architecture or product behavior.
 
-Before submission, state explicitly whether any implementation-blocking decision remains. If one remains, identify the single owner or human decision needed instead of hiding it in broad “open questions.”
+The clarification loop has already declared the project crystal clear. Use the current answers, every earlier question-and-answer round, and the linked specifications as binding input. Do not reopen answered product decisions or silently replace them with your preferences.
+
+Before submission, verify explicitly that no implementation-blocking decision remains. If you discover a genuine contradiction that makes a correct specification impossible, fail the job with the exact conflict instead of writing an ambiguous specification or passing an open decision to an implementation task.

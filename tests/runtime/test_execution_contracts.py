@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
+
+import pytest
 
 from open_tulid.domain import (
     ExecutionJob,
@@ -12,13 +15,22 @@ from open_tulid.domain import (
     ValidationCallDefinition,
 )
 from open_tulid.runtime.execution_contracts import (
+    FrozenContextExcerpt,
     compile_task_execution_contract,
     execution_contract_to_dict,
     load_job_execution_contract,
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
-from open_tulid.runtime.prompts import TOTAL_BUDGET, compile_execution_prompt
+from open_tulid.runtime.prompts import (
+    TOTAL_BUDGET,
+    ReviewEvidence,
+    compile_execution_prompt,
+    compiled_prompt_from_metadata,
+    is_review_transition,
+    lint_compiled_prompt,
+)
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
+from open_tulid.runtime.repository_facts import canonical_sha256
 from open_tulid.runtime.workspaces import WorkspacePreparer
 from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
 
@@ -204,6 +216,42 @@ def test_job_contract_round_trips_and_detects_tampering(tmp_path):
     assert tampered.errors[0].code == "execution_contract.hash_mismatch"
 
 
+def test_job_contract_loader_accepts_supported_prompt_compiler_v1(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.contract is not None
+    payload = execution_contract_to_dict(compiled.contract)
+    payload.pop("sha256")
+    payload["prompt_compiler_version"] = 1
+    expected_hash = canonical_sha256(payload)
+    payload["sha256"] = expected_hash
+    job = ExecutionJob(
+        job_id="job-v1",
+        project_id="Agent",
+        task_id=task.id,
+        transition_id="ImplementTask",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "workspace"),
+        metadata={
+            "execution_contract": payload,
+            "execution_contract_sha256": expected_hash,
+        },
+    )
+
+    loaded = load_job_execution_contract(job, required=True)
+
+    assert loaded.accepted is True
+    assert loaded.contract is not None
+    assert loaded.contract.sha256 == expected_hash
+
+
 def test_job_store_rejects_frozen_contract_replacement(tmp_path):
     store = FileExecutionJobStore(tmp_path / "jobs")
     created = store.create(ExecutionJob(
@@ -302,9 +350,8 @@ def test_compiled_prompt_is_deterministic_compact_and_has_single_completion_exam
     assert first.text == second.text
     assert first.manifest.packet_sha256 == second.manifest.packet_sha256
     assert [section.heading for section in first.sections] == [
-        "Mission", "Repository Facts", "Execution Contract", "Panalyzer Context",
-        "Selected Context Excerpts", "Required Validation", "Execution Procedure",
-        "Completion Submission",
+        "Mission", "Repository Facts", "Execution Contract", "Selected Context Excerpts",
+        "Required Validation", "Execution Procedure", "Completion Submission",
     ]
     assert len(first.text) <= TOTAL_BUDGET
     assert first.text.count("curl -sS -X POST") == 1
@@ -312,6 +359,261 @@ def test_compiled_prompt_is_deterministic_compact_and_has_single_completion_exam
     assert str(project_root) not in first.text
     assert compiled.contract.sha256 not in first.text
     assert first.manifest.execution_contract_sha256 == compiled.contract.sha256
+    assert first.manifest.packet_type == "implementation"
+    assert lint_compiled_prompt(first, contract=compiled.contract) == ()
+
+
+def test_historical_prompt_round_trips_and_rejects_section_tampering(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    prompt = compile_execution_prompt(compiled_contract.contract)
+    metadata = {
+        "prompt_packet": prompt.text,
+        "prompt_packet_sha256": prompt.manifest.packet_sha256,
+        "prompt_manifest": prompt.manifest.to_dict(),
+    }
+
+    loaded = compiled_prompt_from_metadata(metadata)
+
+    assert loaded.text == prompt.text
+    assert loaded.sections == prompt.sections
+
+    tampered_manifest = prompt.manifest.to_dict()
+    tampered_manifest["sections"][0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="section failed"):
+        compiled_prompt_from_metadata({
+            **metadata,
+            "prompt_manifest": tampered_manifest,
+        })
+
+    malformed_manifest = prompt.manifest.to_dict()
+    malformed_manifest["compiler_version"] = {}
+    with pytest.raises(ValueError, match="compiler_version"):
+        compiled_prompt_from_metadata({
+            **metadata,
+            "prompt_manifest": malformed_manifest,
+        })
+
+
+def test_historical_prompt_round_trip_treats_nested_markdown_headings_as_content(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    excerpt_text = "# Selected API\n\nKeep this contract.\n\n## Nested Detail\n\nDo not split here."
+    excerpt = FrozenContextExcerpt(
+        artifact="design.md",
+        heading="Selected API",
+        reason="Defines the selected interface.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+    )
+    contract = replace(
+        compiled_contract.contract,
+        context_excerpts=(excerpt,),
+    )
+    prompt = compile_execution_prompt(contract)
+
+    loaded = compiled_prompt_from_metadata({
+        "prompt_packet": prompt.text,
+        "prompt_packet_sha256": prompt.manifest.packet_sha256,
+        "prompt_manifest": prompt.manifest.to_dict(),
+    })
+
+    selected = next(
+        section for section in loaded.sections
+        if section.id == "selected_context_excerpts"
+    )
+    assert "## Nested Detail" in selected.text
+    assert selected.truncated is False
+    assert loaded.text == prompt.text
+
+
+def test_prompt_does_not_truncate_binding_objective_or_selected_context(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    objective = "Deliver exact behavior " + ("carefully " * 280)
+    excerpt_text = (
+        "# Required Detail\n\n" + ("binding reference text " * 50)
+    ).rstrip()
+    excerpt = FrozenContextExcerpt(
+        artifact="design.md",
+        heading="Required Detail",
+        reason="Defines required behavior.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+    )
+    contract = replace(
+        compiled_contract.contract,
+        generated_contract=replace(
+            compiled_contract.contract.generated_contract,
+            objective=objective,
+        ),
+        context_excerpts=(excerpt,),
+    )
+
+    prompt = compile_execution_prompt(contract)
+
+    contract_section = next(
+        section for section in prompt.sections if section.id == "execution_contract"
+    )
+    context_section = next(
+        section for section in prompt.sections
+        if section.id == "selected_context_excerpts"
+    )
+    assert f"Objective: {objective}" in contract_section.text
+    assert contract_section.truncated is False
+    assert excerpt_text in context_section.text
+    assert context_section.truncated is False
+
+
+def test_prompt_allows_user_content_that_looks_like_an_unrelated_sha256(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    user_hash = "d" * 64
+    contract = replace(
+        compiled_contract.contract,
+        source_task=replace(
+            compiled_contract.contract.source_task,
+            body=(
+                f"Preserve the documented content id {user_hash} and the "
+                "literal example {{checksum}}."
+            ),
+        ),
+    )
+
+    prompt = compile_execution_prompt(contract)
+
+    assert user_hash in prompt.text
+    assert "{{checksum}}" in prompt.text
+    assert lint_compiled_prompt(prompt, contract=contract) == ()
+
+
+def test_review_transition_detection_uses_tokens_not_substrings():
+    assert is_review_transition(replace(_transition(), id="SelfReview")) is True
+    assert is_review_transition(replace(_transition(), id="PreviewChanges")) is False
+
+
+def test_self_review_prompt_is_distinct_and_uses_prior_authoritative_evidence(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    review_transition = replace(
+        _transition(),
+        id="SelfReview",
+        from_state="SelfReview",
+        to_state="Done",
+        requires=replace(
+            _transition().requires,
+            changed_files_required=False,
+        ),
+    )
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=review_transition,
+    )
+    assert compiled_contract.contract is not None
+    evidence = ReviewEvidence(
+        source_job_id="implementation-job",
+        verification_report={
+            "changes": {
+                "added": [],
+                "edited": ["app.py"],
+                "removed": [],
+                "renamed": [],
+                "changed_lines": 2,
+            },
+            "checks": [{"id": "tests_pass", "status": "passed", "exit_code": 0}],
+        },
+    )
+
+    prompt = compile_execution_prompt(
+        compiled_contract.contract,
+        review_evidence=evidence,
+    )
+
+    assert prompt.manifest.packet_type == "self_review"
+    assert "## Prior Implementation Evidence" in prompt.text
+    assert "Source implementation job: implementation-job" in prompt.text
+    assert '"edited":["app.py"]' in prompt.text
+    assert "Find a concrete in-scope defect" in prompt.text
+    assert "make the smallest coherent implementation" not in prompt.text.casefold()
+    assert prompt.text.count("curl -sS -X POST") == 1
+
+
+def test_context_excerpt_rejects_duplicate_heading_and_oversized_content(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    spec_relative = Path("artifacts/task-1/ImplementationSpec/spec.md")
+    spec = project_root / spec_relative
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# Needed\nfirst\n# Needed\nsecond\n", encoding="utf-8")
+    contract_path = project_root / task.artifact_links[0]
+    contract_path.write_text(
+        contract_path.read_text(encoding="utf-8")
+        + "\ncontext_excerpts:\n"
+        + "  - artifact: ImplementationSpec\n"
+        + "    heading: Needed\n"
+        + "    reason: Exact interface behavior.\n",
+        encoding="utf-8",
+    )
+    task = replace(task, artifact_links=(*task.artifact_links, spec_relative.as_posix()))
+
+    repo = _repo(tmp_path)
+    duplicate = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+
+    assert [error.code for error in duplicate.errors] == [
+        "execution_contract.context_heading_duplicate"
+    ]
+
+    spec.write_text("# Needed\n" + ("x" * 1201) + "\n", encoding="utf-8")
+    oversized = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert [error.code for error in oversized.errors] == [
+        "execution_contract.context_excerpt_too_large"
+    ]
 
 
 def test_verifier_enforces_manifest_surface_and_runs_frozen_checks(tmp_path):

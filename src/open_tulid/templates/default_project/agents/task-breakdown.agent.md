@@ -4,7 +4,7 @@ Break the injected implementation specification into a dependency-aware set of c
 
 Use the task body, injected linked context, and repository files present in the workspace as source material. Preserve the architecture defined in the implementation specification, maximize safe parallelism, and keep true prerequisites explicit.
 
-Choose the number, size, and Markdown structure of tasks based on the actual work; there is no fixed daily structure, task count, line count, or mandatory section list. Each task must still form one coherent local-model execution unit and carry the exact behavior, repository paths, interfaces, failure behavior, and acceptance checks relevant to it. Do not make the child choose architecture already owned by the direction or specification.
+Choose the number, size, and Markdown structure of tasks based on the actual work; there is no fixed daily structure, task count, line count, or mandatory section list. Each task must still form one coherent local-model execution unit and carry the exact behavior, repository paths, interfaces, failure behavior, and acceptance checks relevant to it. Do not make the child choose architecture already owned by the direction or specification. Do not emit a task whose purpose is to obtain a missing product decision: the clarification loop must have settled every such decision before breakdown.
 
 Emit one `ImplementationTaskFile` artifact per task under `output/`. The only storage-required shape is:
 

@@ -46,7 +46,17 @@ from .instructions import (
     PromptPacket,
     PromptPacketResult,
 )
-from .prompts import CompiledPrompt, PromptManifest, PromptSection, compile_execution_prompt
+from .prompts import (
+    CompiledPrompt,
+    PromptManifest,
+    PromptSection,
+    ReviewEvidence,
+    compile_execution_prompt,
+    compiled_prompt_from_metadata,
+    find_review_evidence,
+    is_review_transition,
+    lint_compiled_prompt,
+)
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairPlan, build_repair_packet, plan_repair
 from .scheduler import (
     ScheduleResult,
@@ -84,6 +94,7 @@ from .executor import (
     render_execution_prompt,
 )
 from .verifier import (
+    VERIFICATION_REPORT_SCHEMA,
     ArtifactSubmission,
     CompletionSubmission,
     DeterministicVerifier,
@@ -156,7 +167,12 @@ __all__ = [
     "CompiledPrompt",
     "PromptManifest",
     "PromptSection",
+    "ReviewEvidence",
     "compile_execution_prompt",
+    "compiled_prompt_from_metadata",
+    "find_review_evidence",
+    "is_review_transition",
+    "lint_compiled_prompt",
     "DEFAULT_MAX_REPAIR_ATTEMPTS",
     "RepairPlan",
     "build_repair_packet",
@@ -191,6 +207,7 @@ __all__ = [
     "JobExecutor",
     "PromptRenderResult",
     "render_execution_prompt",
+    "VERIFICATION_REPORT_SCHEMA",
     "ArtifactSubmission",
     "CompletionSubmission",
     "DeterministicVerifier",

@@ -1,6 +1,16 @@
+---
+
+kanban-plugin: board
+
+---
+
 ## Idea
 
-## Human review
+## Ready for questions
+
+## Questions
+
+## Answers ready
 
 ## Ready for spec
 
@@ -13,3 +23,10 @@
 ## Self review
 
 ## Done
+
+
+%% kanban:settings
+```
+{"kanban-plugin":"board"}
+```
+%%

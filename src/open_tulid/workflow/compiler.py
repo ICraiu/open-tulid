@@ -244,6 +244,18 @@ def _validate_cross_references_with_ast(
                     message=f"{ctx} derives from unknown artifact_type {trans_stmt.derives.artifact_type!r}",
                     path=path, line=line, column=column,
                 ))
+            if (
+                trans_stmt.derives.parent_to_if_derived is not None
+                and trans_stmt.derives.parent_to_if_derived not in states
+            ):
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.unknown_state_ref",
+                    message=(
+                        f"{ctx} derives into unknown parent_to_if_derived state "
+                        f"{trans_stmt.derives.parent_to_if_derived!r}"
+                    ),
+                    path=path, line=line, column=column,
+                ))
 
         if trans_stmt.transaction is not None:
             for step in trans_stmt.transaction.steps:
@@ -460,6 +472,8 @@ def compile_workflow(
                     task_type=stmt.derives.task_type,
                     state=stmt.derives.state,
                     artifact_type=stmt.derives.artifact_type,
+                    required=stmt.derives.required,
+                    parent_to_if_derived=stmt.derives.parent_to_if_derived,
                 ) if stmt.derives is not None else None,
                 default_for_scheduler=stmt.default_for_scheduler,
                 instructions=stmt.instructions,

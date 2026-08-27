@@ -13,6 +13,8 @@ from open_tulid.domain import DomainError, TransitionDefinition
 from open_tulid.runtime.execution_contracts import ExecutionContract
 from open_tulid.runtime.repository_facts import BaselineManifest, capture_repository_snapshot
 
+VERIFICATION_REPORT_SCHEMA = "tulid.verification/v1"
+
 
 @dataclass(frozen=True)
 class ArtifactSubmission:
@@ -163,7 +165,7 @@ class DeterministicVerifier:
         allowed_artifact_types = set(transition.requires.artifacts)
         if multi_artifact_type is not None:
             allowed_artifact_types.add(multi_artifact_type)
-            if multi_artifact_type not in artifact_types:
+            if transition.derives.required and multi_artifact_type not in artifact_types:
                 errors.append(_error(
                     "completion.derived_task_missing",
                     f"Deriving transition requires at least one {multi_artifact_type} artifact.",
@@ -292,7 +294,12 @@ class DeterministicVerifier:
         post = capture_repository_snapshot(workspace)
         if not post.accepted or post.snapshot is None:
             errors.extend(_error("verification.baseline_unavailable", error.message, error.location) for error in post.errors)
-            return VerificationReport("tulid.verification/v1", "baseline_failure", contract.baseline_manifest.sha256, None), tuple(errors)
+            return VerificationReport(
+                VERIFICATION_REPORT_SCHEMA,
+                "baseline_failure",
+                contract.baseline_manifest.sha256,
+                None,
+            ), tuple(errors)
         added, edited, removed, renamed = _manifest_changes(contract.baseline_manifest, post.snapshot.baseline)
         surface = contract.generated_contract.change_surface
         for path in added:
@@ -317,7 +324,7 @@ class DeterministicVerifier:
         checks, check_errors = _run_contract_checks(workspace, contract)
         errors.extend(check_errors)
         return VerificationReport(
-            "tulid.verification/v1", None, contract.baseline_manifest.sha256,
+            VERIFICATION_REPORT_SCHEMA, None, contract.baseline_manifest.sha256,
             post.snapshot.baseline.sha256, added, edited, removed, renamed,
             changed_lines, checks,
         ), tuple(errors)

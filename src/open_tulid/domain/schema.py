@@ -328,7 +328,13 @@ class TransactionDefinition:
 @dataclass(frozen=True)
 class DerivesDefinition:
     """Rule describing tasks derived from a transition's output.
-    It tells the system what task type, starting state, and artifact type the output creates."""
+
+    Optional derivations can route the parent to a different state when at least
+    one child is created. This supports deterministic review loops without
+    letting model-authored text move task state directly.
+    """
     task_type: str
     state: str
     artifact_type: str
+    required: bool = True
+    parent_to_if_derived: str | None = None

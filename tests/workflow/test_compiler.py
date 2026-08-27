@@ -145,6 +145,78 @@ statements:
     assert result.definition.transitions["Implement"].requires.changed_files_required is True
 
 
+def test_compiles_optional_derivation_with_alternate_parent_destination():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: AnswersReady
+  - kind: state
+    id: ReadyForSpec
+  - kind: state
+    id: Questions
+  - kind: state
+    id: Done
+  - kind: task_type
+    id: QuestionRound
+  - kind: artifact_type
+    id: QuestionRoundFile
+  - kind: transition
+    id: ReviewAnswers
+    task_type: QuestionRound
+    from: AnswersReady
+    to: ReadyForSpec
+    derives:
+      task_type: QuestionRound
+      state: Questions
+      artifact_type: QuestionRoundFile
+      required: false
+      parent_to_if_derived: Done
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    derives = result.definition.transitions["ReviewAnswers"].derives
+    assert derives is not None
+    assert derives.required is False
+    assert derives.parent_to_if_derived == "Done"
+
+
+def test_rejects_unknown_alternate_parent_destination():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: AnswersReady
+  - kind: state
+    id: ReadyForSpec
+  - kind: state
+    id: Questions
+  - kind: task_type
+    id: QuestionRound
+  - kind: artifact_type
+    id: QuestionRoundFile
+  - kind: transition
+    id: ReviewAnswers
+    task_type: QuestionRound
+    from: AnswersReady
+    to: ReadyForSpec
+    derives:
+      task_type: QuestionRound
+      state: Questions
+      artifact_type: QuestionRoundFile
+      required: false
+      parent_to_if_derived: Missing
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is False
+    assert any("parent_to_if_derived" in diagnostic.message for diagnostic in result.diagnostics)
+
+
 def test_compiles_task_type_instruction_refs():
     doc = _build_document("""
 schema_version: 1

@@ -1,8 +1,8 @@
 # Qwen Improvement Plan: Status and Roadmap
 
-**Updated:** 2026-07-27  
-**Baseline:** commit `ba05496` — “implemented 1/3 of the local llm contract”  
-**Current position:** contract preparation, immutable job contracts, compact frozen prompt compilation, trusted post-worker enforcement, and reusable frozen acceptance profiles are implemented.
+**Updated:** 2026-07-29
+**Baseline:** commit `d4ed9e4` — “improved qwen prompt structure”
+**Current position:** contract preparation, immutable job contracts, compact frozen implementation and self-review prompt compilation, trusted post-worker enforcement, bounded repair, reusable frozen acceptance profiles, and prompt observability are implemented.
 
 ## Destination
 
@@ -35,7 +35,7 @@ Each task needs one observable objective, exact interfaces and behaviors, allowe
 
 The next slice now compiles a content-addressed `tulid.execution/v1` contract at job creation. It freezes the source task, transition requirements, generated contract, resolved checks, repository commit/dirty state, detected manifests and entrypoints, and a hash manifest of every baseline file. The same frozen task and transition are used by execution, prompt preview, and verification. Corrupt metadata or repository drift before execution is rejected; exact snapshots are written under `.open-tulid/`.
 
-**Remaining:** add Panalyzer identities, proposal coverage, path/symbol budgets, deterministic context excerpts, and instruction/context hashes.
+**Remaining:** add the Panalyzer runtime boundary, proposal coverage, and structural path/symbol enforcement. Deterministic context excerpts, prompt policy identities, section hashes, prompt manifests, path budgets, and change budgets are implemented.
 
 ### 3. Add reusable runnable acceptance profiles — Foundation implemented
 
@@ -43,14 +43,13 @@ Projects should declare named `unit`, `build`, `static`, `component`, `vertical_
 
 **Done now:** projects may declare `acceptance.yaml` profiles of type unit, build, static, component, vertical_slice, or host_smoke. Generated contracts select them by ID; Tulid validates, freezes, independently runs, and reports their argv checks.
 
-**Remaining:** fixture/readiness/action/assertion lifecycle, capability-gated host smoke, and mandatory vertical-slice-or-exemption policy for product-facing work.
+**Remaining:** fixture/readiness/action/assertion lifecycle and capability-gated host smoke. The default template now requires every product-facing contract to select a `vertical_slice` profile or record a concrete exemption.
 
-### 4. Add bounded repair and real verification — Partially implemented
+### 4. Add bounded repair and real verification — Implemented
 
 Tulid should classify failures as implementation, contract, environment, or baseline failures. Only implementation failures return to Qwen, in the same workspace, with a compact diagnostic packet and at most two targeted repairs. Verification must allow an empty diff when the work is already correct.
 
-**Done now:** no-change self-review is accepted.  
-**Remaining:** failure classification, repair packets, attempt limits, and a distinct no-edit verification transition using prior diff and test evidence.
+**Done now:** deterministic failure classification, evidence-only repair packets, attempt limits, same-workspace repair, and no-change self-review are implemented. Self-review now receives a distinct frozen packet containing the accepted implementation job's authoritative change summary, trusted check results, and repair history; it is not scheduled without that evidence.
 
 ### 5. Enforce boundaries and promote only proven work — Foundation started
 
@@ -62,12 +61,12 @@ Capture a pre-worker file manifest, derive the authoritative diff, enforce add/e
 
 1. **Freeze the contract — Done:** repository facts, baseline manifest, resolved checks, integrity hashes, immutable job metadata, and workspace snapshots.
 2. **Compile compact prompts — Implemented and verified:** ordered singleton sections, explicit frozen heading excerpts, size budgets, and persisted packet manifests.
-3. **Enforce acceptance — In progress:** trusted post-worker diff, scope/budget checks, frozen focused checks, and reusable command profiles are complete; profile fixtures and vertical-slice policy remain.
-4. **Converge safely — In progress:** implementation failures now resume as bounded, evidence-only repairs in the original workspace; stale-base replay remains.
-5. **Close the loop:** Panalyzer deltas, conflict-aware scheduling, prompt lint/explain/history, and controlled Qwen replay metrics.
+3. **Enforce acceptance — In progress:** trusted post-worker diff, scope/budget checks, frozen focused checks, reusable command profiles, and vertical-slice policy are complete; profile lifecycle orchestration remains.
+4. **Converge safely — In progress:** implementation failures resume as bounded, evidence-only repairs and self-review audits the prior accepted implementation; stale-base replay remains.
+5. **Close the loop:** prompt lint/explain/immutable history are complete. Panalyzer deltas, conflict-aware scheduling, and controlled Qwen replay metrics remain.
 
-## Latest-commit proof
+## Current working-tree proof
 
-The contract lifecycle, immutable compilation, repository facts, baseline drift detection, corruption checks, prompt preview, artifact handling, and no-change self-review have unit/runtime/E2E coverage. **All 583 repository tests pass.**
+The contract lifecycle, immutable implementation and review prompt compilation, repository facts, baseline drift detection, packet/section corruption checks, prompt preview/inspection/history, artifact handling, vertical-slice policy, and no-change self-review have unit/runtime/E2E coverage. **All 608 repository tests pass.**
 
-**Bottom line:** Tulid now creates and freezes the exact work order before Qwen starts. The next milestone is a compact prompt compiled from that frozen object; the following milestone makes Tulid independently prove the implementation stayed inside it.
+**Bottom line:** Tulid now gives Qwen a compact frozen implementation work order, independently proves its result, and gives self-review only the prior authoritative evidence needed for a targeted correction or valid no-op. The remaining roadmap is runtime architecture enforcement and empirical rollout, not prompt assembly.

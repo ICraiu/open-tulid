@@ -159,7 +159,7 @@ Do not describe the current verifier as full contract enforcement.
 - Qwen’s completion report is evidence, not proof. Tulid’s independent acceptance result is authoritative.
 - A no-change result may validly transition to `SelfReview`.
 - Contract-backed and legacy jobs can coexist during migration.
-- Product-facing changes will eventually require a vertical-slice check or an explicit exemption.
+- Projects that enable the product-facing policy require a vertical-slice check or an explicit exemption.
 - There is no planned high-level LLM code-review gate between Qwen and deterministic acceptance.
 
 ## Verification already performed
@@ -170,33 +170,32 @@ The execution-contract slice was exercised with:
 PYTHONDONTWRITEBYTECODE=1 uv run pytest -q -p no:cacheprovider
 ```
 
-Recorded results:
+Latest working-tree results:
 
-- Focused execution-contract/runtime selection: 50 passed.
-- Broader runtime selection: 131 passed.
-- Full repository suite: 583 passed in 29.65 seconds.
-- After the final small readiness/exclusion adjustments, the affected focused selection was rerun: 50 passed.
-- `git diff --check` passed.
-
-The final focused run covers the tiny changes made after the full-suite run; a fresh session should still run the full suite before committing the entire slice.
+- Prompt/contract/scheduler/executor/CLI focused selection: 106 passed.
+- Contract/scheduler/completion-verifier selection: 68 passed.
+- Full repository suite: 608 passed in 29.21 seconds.
+- `python -m compileall -q src` and `git diff --check` passed.
 
 The sandbox may make the default uv cache read-only. If that happens, rerun the same test command with the required execution approval. The repository `.venv/bin/python` does not currently provide pytest directly.
 
-## Structured prompt compiler: implemented and verified
+## Structured prompt compiler and observability: implemented and verified
 
-`src/open_tulid/runtime/prompts.py` now compiles a deterministic contract-backed packet with the required eight ordered singleton sections and a 6,000-character total limit. It carries a manifest with section hashes, sizes, truncation decisions, packet hash, and execution-contract hash. Model text excludes audit hashes and absolute paths.
+`src/open_tulid/runtime/prompts.py` now compiles deterministic, contract-backed implementation and self-review packets with a 6,000-character total limit. It carries a manifest with packet type, section provenance, selection reasons, hashes, sizes, budgets, truncation decisions, packet hash, and execution-contract hash. Binding scope, interface, validation, and completion sections fail closed instead of being truncated. Model text excludes audit hashes and absolute paths.
 
-The implementation contract accepts explicit `context_excerpts` (`artifact` plus Markdown `heading`). Contract compilation resolves one linked artifact, extracts the heading through its next equal-or-higher heading, hashes and freezes the result in `tulid.execution/v1`. It does not recursively inject parents or source documents.
+The implementation contract accepts explicit `context_excerpts` (`artifact`, Markdown `heading`, and selection `reason`). Contract compilation resolves one linked artifact, rejects missing or duplicate headings, extracts through the next equal-or-higher heading, enforces per-excerpt and total budgets, and hashes and freezes the result in `tulid.execution/v1`. It does not recursively inject parents or source documents.
 
 At job creation, Tulid persists the packet, packet hash, and manifest as immutable metadata. Runtime validates and uses that stored packet; CLI preview compiles from the same frozen execution contract. Legacy and planning prompts retain the prior path.
 
-Focused prompt/runtime coverage and the full repository suite pass. Before committing, add targeted coverage for exact preview-versus-runtime hash equality, live-file mutation, explicit-excerpt bounds, and malformed persisted-packet rejection.
+Exact preview-versus-runtime packet equality, mutation isolation, explicit-excerpt bounds, persisted packet/section corruption, and deterministic compilation have focused coverage. `tulid prompts explain`, `lint`, and `show-job` expose live provenance and immutable historical packets without reconstructing old jobs from current inputs.
+
+Self-review is now a distinct packet type. Job creation locates the accepted implementation job that produced the review state and freezes its authoritative change summary, trusted check results, and repair history. Missing evidence blocks scheduling. The Docker-backed no-change review workflow covers this path.
 
 ## Acceptance-profile foundation
 
 The profile foundation is implemented: `acceptance.yaml` declares project-owned `unit`, `build`, `static`, `component`, `vertical_slice`, and `host_smoke` argv profiles. Task contracts select them in `checks.profiles`; Tulid validates and freezes them as resolved checks, runs them without a shell, and includes them in the verification report.
 
-Remaining profile work is fixture/readiness/action/assertion orchestration, host-capability gating, and the product-facing vertical-slice-or-exemption policy.
+Remaining profile work is fixture/readiness/action/assertion orchestration and host-capability gating. The default project enables a product-facing vertical-slice-or-exemption policy, which is validated and frozen into the execution contract.
 
 ## Bounded convergence and repair: implemented
 
@@ -206,49 +205,36 @@ Implementation failures now create a bounded `tulid.repair/v1` packet containing
 
 The next run should execute focused repair/completion/scheduler/executor tests, then the complete suite and `git diff --check` before committing the combined slice.
 
-## Known design gaps after the prompt slice
+## Known design gaps after the completed prompt work
 
-Complete these in order:
-
-1. **Trusted post-worker enforcement**
-   - Capture the post-worker manifest.
-   - Calculate add/edit/remove/rename changes from the frozen baseline.
-   - Enforce allowed and forbidden surfaces, deletion/generated-file rules, max files, and max changed lines.
-   - Run frozen focused and invariant checks without a shell.
-   - Persist a structured verification report and failure classification.
-2. **Acceptance profiles**
-   - Add general profiles for unit, build, static, component, vertical slice, and host smoke.
-   - Require task-selected profiles.
-   - Require vertical-slice coverage or a recorded exemption for product-facing changes.
-3. **Bounded convergence and repair**
-   - Classify implementation, contract, environment, and baseline failures.
-   - Give Qwen only the authoritative diff/report/evidence needed for repair.
-   - Reuse the same workspace and original scope.
-   - Cap repair attempts and preserve every attempt/result.
-4. **Panalyzer runtime boundary**
+1. **Panalyzer runtime boundary**
    - Require exact-base scans.
    - Validate proposal schema and hashes.
    - Validate task coverage and overlap.
    - Re-scan after accepted tasks and compare the expected architecture delta.
-5. **Observability and replay**
-   - Add explain/lint/show-job views.
-   - Surface prompt manifests and acceptance history.
-   - Add golden prompt packets and a replay corpus before broad rollout.
+2. **Acceptance-profile orchestration**
+   - Add fixture, readiness, action, and assertion lifecycle support.
+   - Add capability-gated host-smoke execution.
+3. **Stale-base promotion**
+   - Replay accepted work into a clean current-base workspace.
+   - Rerun frozen acceptance before promotion.
+4. **Empirical replay**
+   - Run a fixed corpus against the configured Qwen build and record first-pass/final acceptance, scope violations, prompt size, wall time, and repair attempts.
+   - Tune budgets from controlled outcomes. Prompt explain/lint/show-job and immutable manifests are already available.
 
 Additional known schema gaps to address as their owning slices are implemented:
 
-- The execution contract does not yet freeze full instruction/context identities and selected-excerpt records.
 - Project-owned invariant declarations, allow-listed environment values, and working-directory rules need a complete schema and validation model.
-- Self-review supports no-change work, but does not yet receive a compact authoritative prior diff and verification packet.
+- Controlled Qwen replay metrics require a configured model/runtime and remain an operational rollout gate.
 
 ## Safe continuation checklist
 
 1. Read the four documents listed under “Source plans.”
-2. Inspect `git status --short`, `git diff --stat`, and the two new runtime modules.
+2. Inspect `git status --short`, `git diff --stat`, and the prompt/contract runtime modules.
 3. Preserve every existing working-tree change.
-4. Run the focused execution-contract tests to establish a local baseline.
-5. Implement only the structured prompt slice above.
-6. Keep planning/legacy behavior working while switching contract-backed implementation/review jobs.
+4. Run the focused execution-contract and prompt tests to establish a local baseline.
+5. Select one remaining architecture slice above.
+6. Keep contract-backed and legacy planning behavior compatible.
 7. Run focused tests, the full suite, and `git diff --check`.
 8. Update `PLAN-STATUS.md` and this handoff when the slice is complete.
 

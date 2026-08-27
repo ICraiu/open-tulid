@@ -29,6 +29,12 @@ from open_tulid.runtime import (
     TransactionJournalStore,
     recover_job_creation_transactions,
 )
+from open_tulid.runtime.execution_contracts import (
+    compile_task_execution_contract,
+    execution_contract_to_dict,
+    load_job_execution_contract,
+)
+from open_tulid.runtime.prompts import compile_execution_prompt
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
 
 
@@ -416,6 +422,115 @@ def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: P
     assert result.events[0].data["execution_contract_sha256"] == (
         result.job.metadata["execution_contract_sha256"]
     )
+    frozen = load_job_execution_contract(result.job, required=True)
+    assert frozen.contract is not None
+    preview = compile_execution_prompt(frozen.contract)
+    assert preview.text == result.job.metadata["prompt_packet"]
+    assert preview.manifest.packet_sha256 == result.job.metadata["prompt_packet_sha256"]
+
+    contract_path = project_root / task.artifact_links[0]
+    contract_path.write_text(
+        contract_path.read_text(encoding="utf-8").replace(
+            "Add a health endpoint.",
+            "Mutated live objective.",
+        ),
+        encoding="utf-8",
+    )
+    historical = compile_execution_prompt(
+        load_job_execution_contract(result.job, required=True).contract
+    )
+    assert historical.text == result.job.metadata["prompt_packet"]
+    assert "Mutated live objective" not in historical.text
+
+
+def test_scheduler_compiles_self_review_from_prior_verification_evidence(tmp_path: Path):
+    project_root = tmp_path / "project"
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="SelfReview",
+        task_type="task",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    task = _write_contract(
+        project_root,
+        task,
+        source_hash=task_source_intent_sha256(task),
+    )
+    workflow = _contract_workflow()
+    review = TransitionDefinition(
+        id="review",
+        task_type="task",
+        from_state="SelfReview",
+        to_state="Done",
+        worker="qwen",
+        requires=RequirementDefinition(changed_files_required=False),
+        transaction=None,
+        default_for_scheduler=True,
+    )
+    workflow = replace(
+        workflow,
+        states=MappingProxyType({
+            **workflow.states,
+            "Done": StateDefinition(id="Done"),
+        }),
+        transitions=MappingProxyType({
+            **workflow.transitions,
+            "review": review,
+        }),
+    )
+    prior_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=None,
+        task=task,
+        transition=workflow.transitions["implement"],
+    )
+    assert prior_contract.contract is not None
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J0000000000000000000IMPL",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "implementation-workspace"),
+        status="accepted",
+        metadata={
+            "execution_contract": execution_contract_to_dict(prior_contract.contract),
+            "execution_contract_sha256": prior_contract.contract.sha256,
+            "verification_report": {
+                "schema": "tulid.verification/v1",
+                "baseline_sha256": prior_contract.contract.baseline_manifest.sha256,
+                "changes": {
+                    "added": [],
+                    "edited": ["app.py"],
+                    "removed": [],
+                    "renamed": [],
+                    "changed_lines": 2,
+                },
+                "checks": [{"id": "health", "status": "passed", "exit_code": 0}],
+            },
+        },
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=project_root,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.transition_id == "review"
+    assert result.job.metadata["review_source_job_id"] == "01J0000000000000000000IMPL"
+    assert result.job.metadata["prompt_manifest"]["packet_type"] == "self_review"
+    assert "## Prior Implementation Evidence" in result.job.metadata["prompt_packet"]
+    assert '"edited":["app.py"]' in result.job.metadata["prompt_packet"]
 
 
 def test_scheduler_invalidates_stale_contract_before_qwen_is_scheduled(tmp_path: Path):

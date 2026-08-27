@@ -6,6 +6,8 @@ LABEL org.opencontainers.image.description="Agent image containing the OpenAI Co
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 
+ARG CODEX_VERSION=0.147.0
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -15,7 +17,7 @@ RUN apt-get update \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @openai/codex \
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" \
     && codex --version
 
 WORKDIR /workspace/project

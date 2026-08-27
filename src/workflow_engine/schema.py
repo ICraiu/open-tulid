@@ -99,6 +99,8 @@ def _build_statement_properties(kind: str, allowed: frozenset) -> dict:
                 "task_type": {"type": "string"},
                 "state": {"type": "string"},
                 "artifact_type": {"type": "string"},
+                "required": {"type": "boolean"},
+                "parent_to_if_derived": {"type": "string"},
             },
         }
 

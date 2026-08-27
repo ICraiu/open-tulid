@@ -31,7 +31,12 @@ from open_tulid.runtime.execution_contracts import (
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
-from open_tulid.runtime.prompts import CompiledPrompt, compile_execution_prompt
+from open_tulid.runtime.prompts import (
+    CompiledPrompt,
+    ReviewEvidence,
+    compile_execution_prompt,
+    compiled_prompt_from_metadata,
+)
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
 from open_tulid.runtime.task_contracts import (
     implementation_contract_required,
@@ -68,6 +73,7 @@ class ExecutorRunResult:
 class PromptRenderResult:
     text: str = ""
     instruction_packet: PromptPacket | None = None
+    execution_contract: ExecutionContract | None = None
     execution_contract_sha256: str | None = None
     compiled_prompt: CompiledPrompt | None = None
     errors: tuple[DomainError, ...] = ()
@@ -87,12 +93,24 @@ def render_execution_prompt(
     job_id: str,
     completion_endpoint: str,
     execution_contract: ExecutionContract | None = None,
+    review_evidence: ReviewEvidence | None = None,
 ) -> PromptRenderResult:
     """Render the exact model prompt for an execution job without running it."""
     if execution_contract is not None:
-        compiled = compile_execution_prompt(execution_contract)
+        try:
+            compiled = compile_execution_prompt(
+                execution_contract,
+                review_evidence=review_evidence,
+            )
+        except ValueError as exc:
+            return PromptRenderResult(errors=(_error(
+                "prompt.compile_failed",
+                str(exc),
+                task.id,
+            ),))
         return PromptRenderResult(
             text=compiled.text,
+            execution_contract=execution_contract,
             execution_contract_sha256=execution_contract.sha256,
             compiled_prompt=compiled,
         )
@@ -109,20 +127,12 @@ def render_execution_prompt(
         derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
     )
     prompt_packet = None
+    parent_tasks: tuple[Task, ...] = ()
+    context_packet = None
     project_root = _adapter_project_root(adapter)
     if project_root is not None:
         parent_tasks = _load_parent_tasks(adapter, task)
         task_for_context = _task_for_prompt_context(task, transition)
-        prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
-        context_result = LinkedContextResolver(project_root).build_context_packet(
-            task_for_context,
-            parent_tasks=parent_tasks,
-        )
-        if not context_result.accepted:
-            return PromptRenderResult(errors=context_result.errors)
-        context_packet = context_result.packet
-        if context_packet is not None and context_packet.text:
-            prompt_text = f"{prompt_text}\n\n{context_packet.text}"
         prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
             worker=worker,
             task_type=task_type,
@@ -136,6 +146,13 @@ def render_execution_prompt(
         prompt_packet = prompt_result.packet
         if prompt_packet is not None:
             prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
+        context_result = LinkedContextResolver(project_root).build_context_packet(
+            task_for_context,
+            parent_tasks=parent_tasks,
+        )
+        if not context_result.accepted:
+            return PromptRenderResult(errors=context_result.errors)
+        context_packet = context_result.packet
     prompt_text = _append_completion_submission(
         prompt_text,
         required_artifacts=transition.requires.artifacts,
@@ -143,7 +160,19 @@ def render_execution_prompt(
         required_validation_details=_validation_details(transition.requires.validations),
         changed_files_required=transition.requires.changed_files_required,
         derived_artifact_type=transition.derives.artifact_type if transition.derives is not None else None,
+        derived_artifact_required=transition.derives.required if transition.derives is not None else True,
+        parent_to_if_derived=(
+            transition.derives.parent_to_if_derived
+            if transition.derives is not None
+            else None
+        ),
     )
+    # Operative worker and completion instructions must precede potentially
+    # very large parent and linked-reference context so the model sees the
+    # entire execution contract before it begins acting on background material.
+    prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
+    if context_packet is not None and context_packet.text:
+        prompt_text = f"{prompt_text}\n\n{context_packet.text}"
     return PromptRenderResult(
         text=prompt_text,
         instruction_packet=prompt_packet,
@@ -285,7 +314,19 @@ class JobExecutor:
                 )
 
             rendered_prompt = None
-            prompt_text = _repair_prompt_packet(job) if repair_mode else _frozen_prompt_packet(job, frozen.contract)
+            try:
+                prompt_text = (
+                    _repair_prompt_packet(job)
+                    if repair_mode
+                    else _frozen_prompt_packet(job, frozen.contract)
+                )
+            except ValueError as exc:
+                endpoint.stop()
+                return self._fail_before_run(job, _error(
+                    "prompt.frozen_invalid",
+                    str(exc),
+                    job.job_id,
+                ))
             prompt_packet = None
             if prompt_text is None:
                 rendered_prompt = render_execution_prompt(
@@ -862,20 +903,15 @@ def _write_prompt_manifest_payload(workspace: Path, manifest: Mapping[str, objec
 def _frozen_prompt_packet(job, contract: ExecutionContract | None) -> str | None:
     if contract is None:
         return None
-    packet = job.metadata.get("prompt_packet")
-    expected = job.metadata.get("prompt_packet_sha256")
-    if not isinstance(packet, str) or not isinstance(expected, str):
-        return None
-    if hashlib.sha256(packet.encode("utf-8")).hexdigest() != expected:
-        raise ValueError("frozen prompt packet failed its integrity check")
-    manifest = job.metadata.get("prompt_manifest")
     if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("execution_contract_sha256") != contract.sha256
-        or manifest.get("packet_sha256") != expected
+        not isinstance(job.metadata.get("prompt_packet"), str)
+        or not isinstance(job.metadata.get("prompt_packet_sha256"), str)
     ):
+        raise ValueError("frozen execution job has no immutable prompt packet")
+    compiled = compiled_prompt_from_metadata(job.metadata)
+    if compiled.manifest.execution_contract_sha256 != contract.sha256:
         raise ValueError("frozen prompt manifest does not match the execution contract")
-    return packet
+    return compiled.text
 
 
 def _repair_prompt_packet(job) -> str:
@@ -950,8 +986,16 @@ def _append_completion_submission(
     required_validation_details: tuple[str, ...],
     changed_files_required: bool,
     derived_artifact_type: str | None,
+    derived_artifact_required: bool = True,
+    parent_to_if_derived: str | None = None,
 ) -> str:
-    artifacts = ", ".join(required_artifacts) if required_artifacts else "none"
+    artifact_labels = list(required_artifacts)
+    if derived_artifact_type is not None:
+        derivation_label = f"{derived_artifact_type} (derived"
+        if not derived_artifact_required:
+            derivation_label += ", optional"
+        artifact_labels.append(f"{derivation_label})")
+    artifacts = ", ".join(artifact_labels) if artifact_labels else "none"
     validations = ", ".join(required_validations) if required_validations else "none"
     completion = _render_prompt_completion_section(
         required_artifacts=required_artifacts,
@@ -959,6 +1003,8 @@ def _append_completion_submission(
         required_validation_details=required_validation_details,
         changed_files_required=changed_files_required,
         derived_artifact_type=derived_artifact_type,
+        derived_artifact_required=derived_artifact_required,
+        parent_to_if_derived=parent_to_if_derived,
         artifacts=artifacts,
         validations=validations,
     )
@@ -1083,6 +1129,8 @@ def _render_prompt_completion_section(
     required_validation_details: tuple[str, ...],
     changed_files_required: bool,
     derived_artifact_type: str | None,
+    derived_artifact_required: bool,
+    parent_to_if_derived: str | None,
     artifacts: str,
     validations: str,
 ) -> str:
@@ -1093,6 +1141,8 @@ def _render_prompt_completion_section(
     ]
     if required_artifacts:
         lines.append("Only create the artifact files explicitly required for this transition.")
+    elif derived_artifact_type:
+        lines.append("No fixed artifact is required; follow the derived-task artifact rules below.")
     else:
         lines.extend((
             "No artifacts are required for this transition. Submit an empty `artifacts` array.",
@@ -1100,9 +1150,24 @@ def _render_prompt_completion_section(
             "Do not regenerate product specs, technical directions, implementation specs, or task breakdown files for an implementation transition.",
         ))
     if derived_artifact_type:
+        if derived_artifact_required:
+            lines.extend((
+                f"This transition derives child tasks via `{derived_artifact_type}` artifacts.",
+                f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
+                "At least one derived-task artifact is required.",
+            ))
+        else:
+            lines.extend((
+                f"This transition may derive child tasks via `{derived_artifact_type}` artifacts.",
+                f"Submit a `{derived_artifact_type}` artifact only when a child task is needed.",
+                "If no child task is needed, do not create or submit this optional artifact.",
+            ))
+            if parent_to_if_derived:
+                lines.append(
+                    f"Submitting one or more `{derived_artifact_type}` artifacts routes the parent to "
+                    f"`{parent_to_if_derived}`; submitting none uses the transition's normal destination."
+                )
         lines.extend((
-            f"This transition derives child tasks via `{derived_artifact_type}` artifacts.",
-            f"Submit one artifact entry per generated `{derived_artifact_type}` file.",
             "If you generate multiple task files, every generated file must appear in the `artifacts` array.",
             "Only submitted derived-task artifacts will be promoted and turned into tasks.",
         ))
@@ -1126,7 +1191,11 @@ def _render_prompt_completion_section(
         "  --data-binary @- <<'JSON'",
         "{",
         "    \"summary\": \"what changed\",",
-        _completion_artifacts_line(required_artifacts),
+        _completion_artifacts_line(
+            required_artifacts,
+            derived_artifact_type=derived_artifact_type,
+            derived_artifact_required=derived_artifact_required,
+        ),
         "    \"changed_files\": [\"relative/workspace/path\"],",
         _completion_validation_evidence_line(required_validations),
         "}",
@@ -1159,11 +1228,22 @@ def _render_changed_files_required_lines(changed_files_required: bool) -> tuple[
     )
 
 
-def _completion_artifacts_line(required_artifacts: tuple[str, ...]) -> str:
-    if not required_artifacts:
+def _completion_artifacts_line(
+    required_artifacts: tuple[str, ...],
+    *,
+    derived_artifact_type: str | None,
+    derived_artifact_required: bool,
+) -> str:
+    artifact_types = list(required_artifacts)
+    if derived_artifact_type is not None and derived_artifact_required:
+        artifact_types.append(derived_artifact_type)
+    if not artifact_types:
         return '    "artifacts": [],'
-    artifact_example = f'{{"type": "{required_artifacts[0]}", "path": "relative/path/in/output"}}'
-    return f'    "artifacts": [{artifact_example}],'
+    artifact_examples = ", ".join(
+        f'{{"type": "{artifact_type}", "path": "relative/path/in/output"}}'
+        for artifact_type in artifact_types
+    )
+    return f'    "artifacts": [{artifact_examples}],'
 
 
 def _completion_validation_evidence_line(required_validations: tuple[str, ...]) -> str:
@@ -1284,13 +1364,19 @@ def _adapter_project_root(adapter: StorageAdapter) -> Path | None:
 
 
 def _load_parent_tasks(adapter: StorageAdapter, task: Task) -> tuple[Task, ...]:
+    parents: list[Task] = []
+    seen = {task.id}
     parent_id = task.parent_id
-    if not parent_id or parent_id == task.id:
-        return ()
-    loaded = adapter.read_task(parent_id)
-    if not loaded.accepted or loaded.task is None:
-        return ()
-    return (loaded.task,)
+    while parent_id and parent_id not in seen and len(parents) < 64:
+        seen.add(parent_id)
+        loaded = adapter.read_task(parent_id)
+        if not loaded.accepted or loaded.task is None:
+            break
+        parent = loaded.task
+        parents.append(parent)
+        parent_id = parent.parent_id
+    # Present the original idea first, followed by each question/answer round.
+    return tuple(reversed(parents))
 
 
 def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> str:

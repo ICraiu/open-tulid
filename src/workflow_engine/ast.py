@@ -66,6 +66,8 @@ class DerivesSpec:
     task_type: str
     state: str
     artifact_type: str
+    required: bool = True
+    parent_to_if_derived: str | None = None
     span: SourceSpan | None = None
 
 

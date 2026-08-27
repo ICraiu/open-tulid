@@ -31,6 +31,7 @@ class AcceptanceProfile:
 @dataclass(frozen=True)
 class AcceptanceProfileResult:
     profiles: Mapping[str, AcceptanceProfile] | None = None
+    require_vertical_slice: bool = False
     errors: tuple[DomainError, ...] = ()
 
     @property
@@ -46,10 +47,16 @@ def load_acceptance_profiles(project_root: Path) -> AcceptanceProfileResult:
         raw = YAML(typ="safe").load(StringIO(path.read_text(encoding="utf-8")))
     except Exception as exc:
         return AcceptanceProfileResult(errors=(_error("acceptance_profiles.invalid_yaml", f"Cannot parse acceptance profiles: {exc}", str(path)),))
-    if not isinstance(raw, Mapping) or set(raw) - {"schema", "profiles"}:
-        return AcceptanceProfileResult(errors=(_error("acceptance_profiles.invalid_shape", "acceptance.yaml must contain only schema and profiles mappings.", str(path)),))
+    if not isinstance(raw, Mapping) or set(raw) - {"schema", "profiles", "policy"}:
+        return AcceptanceProfileResult(errors=(_error("acceptance_profiles.invalid_shape", "acceptance.yaml must contain only schema, profiles, and optional policy mappings.", str(path)),))
     if raw.get("schema") != ACCEPTANCE_PROFILES_SCHEMA or not isinstance(raw.get("profiles"), Mapping):
         return AcceptanceProfileResult(errors=(_error("acceptance_profiles.invalid_shape", f"acceptance.yaml requires schema {ACCEPTANCE_PROFILES_SCHEMA!r} and a profiles mapping.", str(path)),))
+    policy = raw.get("policy", {})
+    if not isinstance(policy, Mapping) or set(policy) - {"require_vertical_slice"}:
+        return AcceptanceProfileResult(errors=(_error("acceptance_profiles.policy_invalid", "acceptance.yaml policy may contain only require_vertical_slice.", str(path)),))
+    require_vertical_slice = policy.get("require_vertical_slice", False)
+    if not isinstance(require_vertical_slice, bool):
+        return AcceptanceProfileResult(errors=(_error("acceptance_profiles.policy_invalid", "policy.require_vertical_slice must be a boolean.", f"{path}:policy.require_vertical_slice"),))
     profiles: dict[str, AcceptanceProfile] = {}
     errors: list[DomainError] = []
     for identifier, value in raw["profiles"].items():
@@ -79,7 +86,11 @@ def load_acceptance_profiles(project_root: Path) -> AcceptanceProfileResult:
             profile_id, kind, tuple(argv), timeout, working_directory,
             CheckExpectation(exit_code, tuple(stdout), tuple(stderr)),
         )
-    return AcceptanceProfileResult(profiles=profiles if not errors else None, errors=tuple(errors))
+    return AcceptanceProfileResult(
+        profiles=profiles if not errors else None,
+        require_vertical_slice=require_vertical_slice,
+        errors=tuple(errors),
+    )
 
 
 def _strings(value: object) -> bool:

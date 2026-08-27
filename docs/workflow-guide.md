@@ -259,7 +259,7 @@ Fields:
 - `instructions` add transition-specific agent guidance.
 - `requires` describes acceptance requirements for the transition.
 - `transaction` optionally lists side-effecting operations to run.
-- `derives` optionally creates new child tasks from submitted task-file artifacts while the parent still moves to its own `to` state.
+- `derives` creates child tasks from submitted task-file artifacts. By default at least one is required and the parent moves to `to`; optional derivations can route the parent elsewhere only when a child is submitted.
 
 ### Acceptance profiles
 
@@ -270,6 +270,8 @@ and working directory into the execution contract before the worker starts.
 
 ```yaml
 schema: tulid.acceptance/v1
+policy:
+  require_vertical_slice: true
 profiles:
   unit:
     kind: unit
@@ -282,6 +284,36 @@ profiles:
 
 Supported kinds are `unit`, `build`, `static`, `component`, `vertical_slice`,
 and `host_smoke`. Commands are argv arrays, never shell programs.
+
+Set `policy.require_vertical_slice: true` to require product-facing
+implementation contracts (`bootstrap`, `bug_fix`, `code_change`,
+`configuration`, `integration`, and `refactor`) to select at least one profile
+whose kind is `vertical_slice`. When a deterministic vertical slice is not
+applicable, the contract must instead record a concrete non-empty
+`checks.vertical_slice_exemption` reason. Tulid freezes either choice in the
+execution contract and rejects contracts that specify both. The default project
+template enables this policy; existing projects remain compatible until they
+opt in.
+
+### Inspecting model prompts
+
+Use the prompt commands to distinguish a live preview from the immutable packet
+used by an existing job:
+
+```bash
+tulid prompts render PROJECT TASK --transition ImplementTask
+tulid prompts explain PROJECT TASK --transition ImplementTask
+tulid prompts lint PROJECT TASK --transition ImplementTask
+tulid prompts show-job PROJECT JOB_ID
+tulid prompts show-job PROJECT JOB_ID --explain
+```
+
+`render`, `explain`, and `lint` compile current live inputs. `show-job` reads and
+integrity-checks the persisted packet and section manifest instead of rebuilding
+old model input with current files. Contract-backed self-review packets include
+the accepted implementation job's authoritative change summary, trusted check
+results, and repair history; Tulid will not schedule self-review without that
+evidence.
 
 ### Deriving child tasks
 
@@ -325,6 +357,31 @@ dependencies: [parser]
 ```
 
 Tulid, not the worker, assigns real task IDs and writes the final child task files. This keeps the model useful for decomposition while the trusted runtime owns identity, links, and state placement.
+
+### Optional derivations and clarification loops
+
+Set `required: false` when the absence of a derived artifact is meaningful. `parent_to_if_derived` selects an alternate parent destination only when at least one child is actually created:
+
+```yaml
+- kind: transition
+  id: ReviewAnswers
+  task_type: QuestionRound
+  from: AnswersReady
+  to: ReadyForSpec
+  worker: codex
+  requires:
+    artifacts: [ClarityAssessment]
+  derives:
+    task_type: QuestionRound
+    state: Questions
+    artifact_type: QuestionRoundFile
+    required: false
+    parent_to_if_derived: Done
+```
+
+Here, submitting no `QuestionRoundFile` moves the answered round to `ReadyForSpec`. Submitting one creates the next question card in `Questions` and moves the answered round to `Done`. The trusted completion service chooses the state from submitted artifact presence; model-authored prose cannot move it directly.
+
+For human editing, keep `Questions` free of worker-backed scheduler transitions. The user saves the card and moves it to `AnswersReady` as an explicit submission signal. Tulid therefore cannot scan a half-written answer, and no sentinel such as `DONE DONE DONE` is needed. Derived follow-up rounds receive the complete ancestor chain as context, including the original idea and all earlier answers.
 
 ## Requirement sets
 

@@ -177,18 +177,18 @@ Worker/resource example:
 ```yaml
 runtime:
   worker_types:
-    qwen_27b: opencode
+    peon-llm: opencode
   worker_resources:
-    qwen_27b: [local-qwen]
+    peon-llm: [peon-local]
 
 resources:
-  local-qwen:
+  peon-local:
     kind: model
     capacity: 1
-    proxy: qwen-proxy
+    proxy: peon-proxy
 
 model_proxy:
-  qwen-proxy:
+  peon-proxy:
     kind: openai
     base_url: http://127.0.0.1:8080/v1
     api_key_file: secrets/local-model.key
@@ -238,20 +238,39 @@ or starting a model:
 tulid prompts render <project> <task-id>
 tulid prompts render <project> <task-id> --transition <transition-id>
 tulid prompts render <project> <task-id> > prompt.md
+tulid prompts explain <project> <task-id> --transition <transition-id>
+tulid prompts lint <project> <task-id> --transition <transition-id>
+tulid prompts show-job <project> <job-id>
+tulid prompts show-job <project> <job-id> --explain
 ```
 
 Without `--transition`, Tulid uses the same task-state transition selection as
-the scheduler. For a completed task, pass `--transition` to inspect a historical
-implementation or review prompt; explicit prompt inspection does not require
-the task to still be in that transition's source state. The preview uses
+the scheduler. For a completed task, pass `--transition` to preview an earlier
+implementation or review transition from current inputs; explicit prompt
+inspection does not require the task to still be in that transition's source
+state. Use `prompts show-job` when you need the exact historical packet. The preview uses
 `PROMPT_PREVIEW` as its synthetic job id; use `--job-id` when a particular value
 is useful for comparison. The command prints the raw prompt to standard output,
-including task text, parent and linked context, resolved agent instructions,
-artifact and validation requirements, and the final completion reminder.
+including the applicable scope, selected context, validation requirements, and
+the final completion submission. Contract-backed implementation prompts use
+only frozen, explicitly selected excerpts; legacy planning prompts retain their
+parent, linked-context, and resolved-instruction assembly.
 If a completed task is no longer present in the tracker, an explicit transition
 allows Tulid to recover the task body from the newest matching job snapshot. It
 reports the selected snapshot on standard error and renders it using the current
 workflow and agent instructions.
+
+`prompts explain` shows each structured section's source, selection reason,
+character budget, truncation decision, and packet identity. `prompts lint`
+checks singleton ownership, completion/validation consistency, unresolved
+markers, known frozen audit-data leaks, integrity hashes, and budgets. `prompts show-job` reads the
+immutable packet stored with a real job; it never reconstructs historical model
+input from current task files or instructions.
+
+Contract-backed self-review is also a distinct packet. Tulid freezes the prior
+implementation job's authoritative changed-file summary, trusted check results,
+and repair history into the review prompt. If no accepted implementation
+evidence exists, review is not scheduled.
 
 Run the scheduler:
 

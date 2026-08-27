@@ -70,6 +70,14 @@ class TestProjectCreation:
         assert loaded_workflow.valid is True
         assert loaded_workflow.definition is not None
         assert "ProductIdea" in loaded_workflow.definition.task_types
+        assert "QuestionRound" in loaded_workflow.definition.task_types
+        assert "Questions" in loaded_workflow.definition.states
+        review_answers = loaded_workflow.definition.transitions["ReviewAnswers"]
+        assert review_answers.from_state == "AnswersReady"
+        assert review_answers.to_state == "ReadyForSpec"
+        assert review_answers.derives is not None
+        assert review_answers.derives.required is False
+        assert review_answers.derives.parent_to_if_derived == "Done"
         assert "ReadyToImplement" in loaded_workflow.definition.states
         prepare = loaded_workflow.definition.transitions["PrepareExecutionContract"]
         assert prepare.from_state == "Todo"
@@ -80,12 +88,19 @@ class TestProjectCreation:
             "implementation_contract_valid",
         ]
         assert loaded_workflow.definition.transitions["ImplementTask"].from_state == "ReadyToImplement"
+        assert loaded_workflow.definition.transitions["ImplementTask"].worker == "peon-llm"
         assert loaded_workflow.definition.transitions["ImplementTask"].requires.validations == ()
         assert loaded_workflow.definition.transitions["ImplementTask"].requires.changed_files_required is True
         assert loaded_workflow.definition.transitions["SelfReview"].requires.validations == ()
+        assert loaded_workflow.definition.transitions["SelfReview"].worker == "peon-llm"
         assert loaded_workflow.definition.transitions["SelfReview"].requires.changed_files_required is False
+        assert "qwen_27b" not in loaded_workflow.definition.workers
         assert (tmp_vault / "Engine" / "kanban" / "Work.md").is_file()
-        assert "## Idea" in (tmp_vault / "Engine" / "kanban" / "Work.md").read_text(encoding="utf-8")
+        board_text = (tmp_vault / "Engine" / "kanban" / "Work.md").read_text(encoding="utf-8")
+        assert "kanban-plugin: board" in board_text
+        assert "## Idea" in board_text
+        assert "## Questions" in board_text
+        assert "## Answers ready" in board_text
         assert "## Ready to implement" in (
             tmp_vault / "Engine" / "kanban" / "Work.md"
         ).read_text(encoding="utf-8")

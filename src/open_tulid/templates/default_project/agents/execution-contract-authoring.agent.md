@@ -34,11 +34,16 @@ interfaces:
   - name: package.module.symbol
     behavior: Exact input, output, state, or compatibility contract.
 requirements:
-  - A concrete behavior Qwen must implement.
+  - A concrete behavior the implementation model must implement.
 failure_behavior:
   - An exact error, exit, or fallback behavior when relevant.
 non_goals:
   - A tempting adjacent change that is outside this task.
+# Include context_excerpts only when one exact section is required:
+# context_excerpts:
+#   - artifact: ImplementationSpec
+#     heading: Exact section heading
+#     reason: Why this section is required to implement this contract.
 checks:
   focused:
     - id: focused_test
@@ -47,8 +52,11 @@ checks:
       expect:
         exit_code: 0
   invariants: []
+  profiles: []
+  # When acceptance.yaml requires vertical slices, select one or supply a concrete reason.
+  # vertical_slice_exemption: "A deterministic vertical slice is not applicable because ..."
 ```
 
 Allowed profiles are `bootstrap`, `bug_fix`, `code_change`, `configuration`, `documentation`, `integration`, `refactor`, and `test_only`.
 
-The universal required fields are `schema`, `source`, `profile`, `objective`, `change_surface`, `requirements`, and `checks`. Always quote both source values so numeric task IDs remain strings. The change surface must allow at least one workspace-relative add or edit path. A contract needs at least one focused check or invariant. Use argument arrays, never shell control operators. Documentation contracts must include a Markdown path; integration contracts must include at least one invariant.
+The universal required fields are `schema`, `source`, `profile`, `objective`, `change_surface`, `requirements`, and `checks`. Always quote both source values so numeric task IDs remain strings. The change surface must allow at least one workspace-relative add or edit path. A contract needs at least one focused check, invariant, or acceptance profile. Use argument arrays, never shell control operators. Documentation contracts must include a Markdown path; integration contracts must include at least one invariant. Omit `context_excerpts` unless exact reference text is required; every selection needs one uniquely occurring heading and a concrete reason. When `acceptance.yaml` enables `policy.require_vertical_slice`, product-facing profiles (`bootstrap`, `bug_fix`, `code_change`, `configuration`, `integration`, and `refactor`) must select a project-owned `vertical_slice` acceptance profile in `checks.profiles`, unless `checks.vertical_slice_exemption` records a concrete non-empty reason. Do not declare both.

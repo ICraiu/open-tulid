@@ -24,6 +24,14 @@ IMPLEMENTATION_CONTRACT_PROFILES = frozenset({
     "refactor",
     "test_only",
 })
+PRODUCT_FACING_CONTRACT_PROFILES = frozenset({
+    "bootstrap",
+    "bug_fix",
+    "code_change",
+    "configuration",
+    "integration",
+    "refactor",
+})
 CHECK_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SHELL_CONTROL_TOKENS = frozenset({"|", "||", "&&", ";", ">", ">>", "<", "<<"})
@@ -64,6 +72,7 @@ class ContractInterface:
 class ContextExcerpt:
     artifact: str
     heading: str
+    reason: str = "Required to implement the generated contract."
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,7 @@ class ImplementationContractDraft:
     focused_checks: tuple[ContractCheck, ...]
     invariants: tuple[str, ...]
     acceptance_profiles: tuple[str, ...] = ()
+    vertical_slice_exemption: str | None = None
     interfaces: tuple[ContractInterface, ...] = ()
     failure_behavior: tuple[str, ...] = ()
     non_goals: tuple[str, ...] = ()
@@ -293,7 +303,7 @@ def parse_implementation_contract(
     interfaces = _parse_interfaces(raw.get("interfaces"), errors, location)
     failure_behavior = _optional_string_tuple(raw.get("failure_behavior"), "failure_behavior", errors, location)
     non_goals = _optional_string_tuple(raw.get("non_goals"), "non_goals", errors, location)
-    focused_checks, invariants, acceptance_profiles = _parse_checks(raw.get("checks"), errors, location)
+    focused_checks, invariants, acceptance_profiles, vertical_slice_exemption = _parse_checks(raw.get("checks"), errors, location)
     context_excerpts = _parse_context_excerpts(raw.get("context_excerpts"), errors, location)
 
     for duplicate in _duplicates(requirements):
@@ -359,6 +369,7 @@ def parse_implementation_contract(
         focused_checks=focused_checks,
         invariants=invariants,
         acceptance_profiles=acceptance_profiles,
+        vertical_slice_exemption=vertical_slice_exemption,
         interfaces=interfaces,
         failure_behavior=failure_behavior,
         non_goals=non_goals,
@@ -379,10 +390,19 @@ def _parse_context_excerpts(raw: object, errors: list[DomainError], location: st
         if not isinstance(item, Mapping):
             errors.append(_error("contract.context_excerpt_invalid", "Context excerpt must be a mapping.", place))
             continue
-        _reject_unknown_fields(item, {"artifact", "heading"}, errors, place)
+        _reject_unknown_fields(item, {"artifact", "heading", "reason"}, errors, place)
+        reason = item.get("reason", "Required to implement the generated contract.")
+        if not isinstance(reason, str) or not reason.strip():
+            errors.append(_error(
+                "contract.context_excerpt_reason_invalid",
+                "Context excerpt reason must be a non-empty string.",
+                f"{place}.reason",
+            ))
+            reason = "Required to implement the generated contract."
         result.append(ContextExcerpt(
             artifact=_required_string(item, "artifact", errors, place),
             heading=_required_string(item, "heading", errors, place),
+            reason=reason.strip(),
         ))
     return tuple(result)
 
@@ -455,7 +475,7 @@ def _parse_checks(
     raw: object,
     errors: list[DomainError],
     location: str,
-) -> tuple[tuple[ContractCheck, ...], tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[ContractCheck, ...], tuple[str, ...], tuple[str, ...], str | None]:
     field_location = f"{location}.checks"
     if not isinstance(raw, Mapping):
         errors.append(_error(
@@ -463,10 +483,10 @@ def _parse_checks(
             "Implementation contract requires a checks mapping.",
             field_location,
         ))
-        return (), (), ()
+        return (), (), (), None
     _reject_unknown_fields(
         raw,
-        {"focused", "invariants", "profiles"},
+        {"focused", "invariants", "profiles", "vertical_slice_exemption"},
         errors,
         field_location,
     )
@@ -581,7 +601,18 @@ def _parse_checks(
             f"Acceptance profile appears more than once: {duplicate}",
             f"{field_location}.profiles",
         ))
-    return tuple(focused), invariants, profiles
+    exemption_raw = raw.get("vertical_slice_exemption")
+    exemption: str | None = None
+    if exemption_raw is not None:
+        if not isinstance(exemption_raw, str) or not exemption_raw.strip():
+            errors.append(_error(
+                "contract.vertical_slice_exemption_invalid",
+                "checks.vertical_slice_exemption must be a non-empty reason when supplied.",
+                f"{field_location}.vertical_slice_exemption",
+            ))
+        else:
+            exemption = exemption_raw.strip()
+    return tuple(focused), invariants, profiles, exemption
 
 
 def _parse_expectation(

@@ -31,6 +31,7 @@ from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, Jo
 from open_tulid.runtime.executor import (
     _append_completion_submission,
     _build_runtime_prompt,
+    _frozen_prompt_packet,
     render_execution_prompt,
 )
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
@@ -39,6 +40,21 @@ from socket_utils import can_bind_localhost
 
 TASK_ID = "01J00000000000000000000001"
 JOB_ID = "01J00000000000000000000JOB"
+
+
+def test_contract_backed_job_never_falls_back_when_frozen_prompt_is_missing():
+    job = ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="qwen",
+        workspace_path="/workspace",
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="no immutable prompt packet"):
+        _frozen_prompt_packet(job, object())
 
 
 @dataclass(frozen=True)
@@ -201,7 +217,35 @@ def test_build_runtime_prompt_for_derived_transition_requires_artifact_submissio
     assert "You are executing a planning or artifact-producing workflow transition for this project." in prompt
     assert "Submit one artifact entry per generated `ImplementationTaskFile` file." in prompt
     assert "Only submitted derived-task artifacts will be promoted and turned into tasks." in prompt
+    assert '"type": "ImplementationTaskFile"' in prompt
+    assert '"artifacts": []' not in prompt
     assert prompt.count("curl -sS -X POST") == 1
+
+
+def test_build_runtime_prompt_explains_optional_derivation_branch():
+    prompt = _append_completion_submission(
+        _build_runtime_prompt(
+            job_id=JOB_ID,
+            task_title="Review answers",
+            task_body="Decide whether everything is clear.",
+            transition_id="ReviewAnswers",
+            from_state="AnswersReady",
+            to_state="ReadyForSpec",
+            required_artifacts=("ClarityAssessment",),
+            derived_artifact_type="QuestionRoundFile",
+        ),
+        required_artifacts=("ClarityAssessment",),
+        required_validations=(),
+        required_validation_details=(),
+        changed_files_required=False,
+        derived_artifact_type="QuestionRoundFile",
+        derived_artifact_required=False,
+        parent_to_if_derived="Done",
+    )
+
+    assert "Submit a `QuestionRoundFile` artifact only when a child task is needed." in prompt
+    assert "If no child task is needed, do not create or submit this optional artifact." in prompt
+    assert "routes the parent to `Done`" in prompt
 
 
 def test_render_execution_prompt_builds_complete_packet_without_running_job():
@@ -648,7 +692,17 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
                     path="tasks/parent.md",
                     current_state="Done",
                     task_type="task",
+                    parent_id="original-idea",
                     body="Parent body sees [[parent-extra]].",
+                ))
+            if task_id == "original-idea":
+                return ReadTaskResult(task=Task(
+                    id="original-idea",
+                    title="Original Idea",
+                    path="tasks/original.md",
+                    current_state="Done",
+                    task_type="task",
+                    body="Original product idea.",
                 ))
             return ReadTaskResult()
 
@@ -659,6 +713,8 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         prompt = (Path(request.workspace) / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
         assert "Task body." in prompt
         assert "## Parent Context 1" in prompt
+        assert "## Parent Context 2" in prompt
+        assert prompt.index("Original product idea.") < prompt.index("Parent body sees")
         assert "background project context, not an instruction to broaden the assigned task" in prompt
         assert "Parent body sees" in prompt
         assert "Spec sees" in prompt
@@ -668,7 +724,11 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
         assert "supports implementation decisions but does not redefine the assigned task scope" in prompt
         assert "Default instructions." in prompt
         assert prompt.count("curl -sS -X POST") == 1
+        assert prompt.index("Default instructions.") < prompt.index("## Parent Context 1")
+        assert prompt.index("Default instructions.") < prompt.index("Linked Reference Context: artifacts/spec.md")
         assert prompt.index("Default instructions.") < prompt.index("## Completion Submission")
+        assert prompt.index("## Completion Submission") < prompt.index("## Parent Context 1")
+        assert prompt.index("## Completion Submission") < prompt.index("Linked Reference Context: artifacts/spec.md")
         return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=17)
 
     monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)

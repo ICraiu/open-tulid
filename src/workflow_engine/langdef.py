@@ -68,6 +68,9 @@ VALIDATION_CALL_KEYS: Final = frozenset({"type", "args"})
 OPERATION_CALL_KEYS: Final = frozenset({"op", "args"})
 
 TRANSACTION_PLAN_KEYS: Final = frozenset({"steps"})
-DERIVES_KEYS: Final = frozenset({"task_type", "state", "artifact_type"})
+DERIVES_KEYS: Final = frozenset({
+    "task_type", "state", "artifact_type", "required", "parent_to_if_derived",
+})
+DERIVES_REQUIRED_KEYS: Final = frozenset({"task_type", "state", "artifact_type"})
 
 SUPPORTED_SCHEMA_VERSIONS: Final = frozenset({1})

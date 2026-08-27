@@ -21,7 +21,11 @@ from .execution_contracts import (
     compile_task_execution_contract,
     execution_contract_to_dict,
 )
-from .prompts import compile_execution_prompt
+from .prompts import (
+    compile_execution_prompt,
+    find_review_evidence,
+    is_review_transition,
+)
 from .task_contracts import (
     implementation_contract_required,
 )
@@ -76,12 +80,14 @@ class TaskManager:
         workflow: WorkflowDefinition,
         adapter: StorageAdapter,
         job_store: object | None = None,
+        history_job_store: object | None = None,
         project_root: Path | None = None,
         repo_root: Path | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
         self.job_store = job_store
+        self.history_job_store = history_job_store or job_store
         self.project_root = project_root
         self.repo_root = repo_root
 
@@ -237,7 +243,44 @@ class TaskManager:
             if not compiled.accepted or compiled.contract is None:
                 return CommandResult(accepted=False, errors=compiled.errors)
             frozen_contract = compiled.contract
-            compiled_prompt = compile_execution_prompt(frozen_contract)
+            review_evidence = None
+            if is_review_transition(transition):
+                if self.history_job_store is None:
+                    return CommandResult(accepted=False, errors=(_error(
+                        "prompt.review_evidence_missing",
+                        "Self-review requires the immutable prior implementation result.",
+                        task.id,
+                    ),))
+                listed = self.history_job_store.list()
+                if not listed.accepted:
+                    return CommandResult(accepted=False, errors=(listed.error or _error(
+                        "job.read_failed",
+                        "Cannot inspect prior implementation jobs.",
+                        task.id,
+                    ),))
+                review_evidence = find_review_evidence(
+                    listed.jobs,
+                    project_id=command.project_id,
+                    task_id=task.id,
+                    review_transition=transition,
+                )
+                if review_evidence is None:
+                    return CommandResult(accepted=False, errors=(_error(
+                        "prompt.review_evidence_missing",
+                        "No accepted implementation verification report is available for self-review.",
+                        task.id,
+                    ),))
+            try:
+                compiled_prompt = compile_execution_prompt(
+                    frozen_contract,
+                    review_evidence=review_evidence,
+                )
+            except ValueError as exc:
+                return CommandResult(accepted=False, errors=(_error(
+                    "prompt.compile_failed",
+                    str(exc),
+                    task.id,
+                ),))
         job_id = command.job_id or new_ulid()
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
@@ -258,6 +301,10 @@ class TaskManager:
                         "prompt_packet": compiled_prompt.text,
                         "prompt_packet_sha256": compiled_prompt.manifest.packet_sha256,
                         "prompt_manifest": compiled_prompt.manifest.to_dict(),
+                        **(
+                            {"review_source_job_id": review_evidence.source_job_id}
+                            if review_evidence is not None else {}
+                        ),
                     }
                     if frozen_contract is not None
                     else {}
