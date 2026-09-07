@@ -1,13 +1,20 @@
+import json
 from pathlib import Path
 from io import BytesIO
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from email.message import Message
+from datetime import datetime, timedelta, timezone
 import urllib.request
 
 import pytest
 
+
+def _utc(y, m, d, h=0, mi=0, s=0):
+    return datetime(y, m, d, h, mi, s, tzinfo=timezone.utc)
+
 from open_tulid.runtime import (
+    SessionStatus,
     check_backend_readiness,
     FileModelProxySessionStore,
     ModelProxyService,
@@ -264,8 +271,8 @@ def test_file_model_proxy_session_store_never_overwrites_existing_token(tmp_path
 
     assert first.token == "duplicate"
     assert second.token == "fresh"
-    assert store.get("duplicate").job_id == "job-1"
-    assert store.get("fresh").job_id == "job-2"
+    assert store.get("duplicate").session.job_id == "job-1"
+    assert store.get("fresh").session.job_id == "job-2"
 
 
 def test_model_proxy_session_stores_expire_issued_sessions(tmp_path: Path):
@@ -273,11 +280,126 @@ def test_model_proxy_session_stores_expire_issued_sessions(tmp_path: Path):
     memory_session = memory.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
     assert memory_session.issued_at is not None
     assert memory_session.expires_at is not None
-    assert memory.get(memory_session.token) is None
+    assert memory.get(memory_session.token).status is SessionStatus.EXPIRED
 
     files = FileModelProxySessionStore(tmp_path / "sessions", ttl_seconds=-1)
     file_session = files.issue(job_id="job-2", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
     assert file_session.issued_at is not None
     assert file_session.expires_at is not None
-    assert files.get(file_session.token) is None
+    assert files.get(file_session.token).status is SessionStatus.EXPIRED
     assert not (tmp_path / "sessions" / f"{file_session.token}.json").exists()
+
+
+class FakeClock:
+    def __init__(self, now):
+        self._now = now
+
+    def __call__(self):
+        return self._now
+
+    def advance(self, seconds):
+        from datetime import timedelta
+        self._now = self._now + timedelta(seconds=seconds)
+
+
+def test_session_stores_price_sessions_to_explicit_expiry_with_injected_clock(tmp_path):
+    start = _utc(2026, 9, 7, 12, 0, 0)
+    clock = FakeClock(start)
+    memory = ModelProxySessionStore(clock=clock, ttl_seconds=3600)
+    files = FileModelProxySessionStore(tmp_path / "sessions", clock=clock, ttl_seconds=3600)
+
+    session = memory.issue(
+        job_id="job-1",
+        worker_id="codex",
+        proxy_id="openai",
+        resource_id="remote-llm",
+        attempt_id="job-1@2",
+        expires_at=(start + timedelta(hours=2)).isoformat(),
+    )
+    assert session.attempt_id == "job-1@2"
+    assert session.expires_at == (start + timedelta(hours=2)).isoformat()
+
+    clock.advance(59 * 60)
+    assert memory.get(session.token).status is SessionStatus.VALID
+    clock.advance(2 * 60)
+    assert memory.get(session.token).status is SessionStatus.VALID
+    clock.advance(58 * 60)
+    assert memory.get(session.token).status is SessionStatus.VALID
+    clock.advance(60)
+    assert memory.get(session.token).status is SessionStatus.EXPIRED
+
+    file_session = files.issue(
+        job_id="job-2",
+        worker_id="codex",
+        proxy_id="openai",
+        resource_id="remote-llm",
+        expires_at=(clock() - timedelta(seconds=1)).isoformat(),
+    )
+    assert files.get(file_session.token).status is SessionStatus.EXPIRED
+
+
+def test_session_store_returns_unknown_for_missing_token():
+    memory = ModelProxySessionStore()
+    assert memory.get("no-such-token").status is SessionStatus.UNKNOWN
+
+
+def test_revoke_attempt_does_not_revoke_newly_issued_credential(tmp_path):
+    start = _utc(2026, 9, 7, 12, 0, 0)
+    clock = FakeClock(start)
+    memory = ModelProxySessionStore(clock=clock)
+    files = FileModelProxySessionStore(tmp_path / "sessions", clock=clock)
+
+    old_memory = memory.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm", attempt_id="job-1@1")
+    new_memory = memory.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm", attempt_id="job-1@2")
+    memory.revoke_attempt("job-1@1")
+    assert memory.get(old_memory.token).status is SessionStatus.UNKNOWN
+    assert memory.get(new_memory.token).status is SessionStatus.VALID
+
+    old_file = files.issue(job_id="job-2", worker_id="codex", proxy_id="openai", resource_id="remote-llm", attempt_id="job-2@1")
+    new_file = files.issue(job_id="job-2", worker_id="codex", proxy_id="openai", resource_id="remote-llm", attempt_id="job-2@2")
+    files.revoke_attempt("job-2@1")
+    assert files.get(old_file.token).status is SessionStatus.UNKNOWN
+    assert files.get(new_file.token).status is SessionStatus.VALID
+    assert not (tmp_path / "sessions" / f"{old_file.token}.json").exists()
+    assert (tmp_path / "sessions" / f"{new_file.token}.json").exists()
+
+
+def test_model_proxy_logs_rejection_evidence_without_tokens(tmp_path):
+    sessions = ModelProxySessionStore(clock=FakeClock(_utc(2026, 9, 7, 12, 0, 0)))
+    session = sessions.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
+    service = ModelProxyService(
+        sessions=sessions,
+        adapters={"openai": EchoAdapter()},
+        transcript_root=tmp_path / "proxy-logs",
+    )
+    request = ProxyRequest(method="POST", path="/responses", body=b"prompt", headers={})
+
+    unknown = service.forward(proxy_id="openai", token="bad", request=request)
+    wrong_proxy = service.forward(proxy_id="qwen", token=session.token, request=request)
+
+    assert unknown.status == 401
+    assert wrong_proxy.status == 401
+    records = (tmp_path / "proxy-logs" / "rejections.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(records) == 2
+    first = json.loads(records[0])
+    assert first["reason"] == "session_unknown"
+    assert first["job_id"] is None
+    assert "token" not in first
+    second = json.loads(records[1])
+    assert second["reason"] == "wrong_proxy"
+    assert second["job_id"] == "job-1"
+    assert second["attempt_id"] is None
+    assert "token" not in second
+
+
+def test_model_proxy_rejects_expired_session_and_records_reason(tmp_path):
+    sessions = ModelProxySessionStore(ttl_seconds=-1)
+    session = sessions.issue(job_id="job-1", worker_id="codex", proxy_id="openai", resource_id="remote-llm")
+    service = ModelProxyService(sessions=sessions, adapters={"openai": EchoAdapter()}, transcript_root=tmp_path / "logs")
+    request = ProxyRequest(method="POST", path="/responses", body=b"prompt", headers={})
+
+    response = service.forward(proxy_id="openai", token=session.token, request=request)
+
+    assert response.status == 401
+    records = (tmp_path / "logs" / "rejections.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert json.loads(records[0])["reason"] == "session_expired"

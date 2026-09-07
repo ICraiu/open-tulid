@@ -8,14 +8,19 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Mapping, Protocol
 from urllib.error import HTTPError, URLError
 import fcntl
 
 from open_tulid.models import ModelProxyConfig
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,7 @@ class ModelProxySession:
     worker_id: str
     proxy_id: str
     resource_id: str
+    attempt_id: str | None = None
     issued_at: str | None = None
     expires_at: str | None = None
 
@@ -37,44 +43,99 @@ class ModelProxySession:
             return True
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
-        return (now or datetime.now(timezone.utc)) >= expiry
+        return (now or _utc_now()) >= expiry
+
+
+class SessionStatus(Enum):
+    VALID = "valid"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SessionLookup:
+    status: SessionStatus
+    session: ModelProxySession | None = None
 
 
 class ModelProxySessionStore:
-    def __init__(self, *, ttl_seconds: int = 3600) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = 3600,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._sessions: dict[str, ModelProxySession] = {}
         self.ttl_seconds = ttl_seconds
+        self._clock = clock or _utc_now
 
-    def issue(self, *, job_id: str, worker_id: str, proxy_id: str, resource_id: str) -> ModelProxySession:
+    def issue(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        proxy_id: str,
+        resource_id: str,
+        attempt_id: str | None = None,
+        expires_at: str | None = None,
+    ) -> ModelProxySession:
         session = _new_session(
             job_id=job_id,
             worker_id=worker_id,
             proxy_id=proxy_id,
             resource_id=resource_id,
+            attempt_id=attempt_id,
             ttl_seconds=self.ttl_seconds,
+            expires_at=expires_at,
+            now=self._clock(),
         )
         self._sessions[session.token] = session
         return session
 
-    def get(self, token: str) -> ModelProxySession | None:
+    def get(self, token: str) -> SessionLookup:
         session = self._sessions.get(token)
-        if session is not None and session.expired():
+        if session is None:
+            return SessionLookup(SessionStatus.UNKNOWN)
+        if session.expired(self._clock()):
             del self._sessions[token]
-            return None
-        return session
+            return SessionLookup(SessionStatus.EXPIRED, session)
+        return SessionLookup(SessionStatus.VALID, session)
 
     def revoke_job(self, job_id: str) -> None:
         for token, session in tuple(self._sessions.items()):
             if session.job_id == job_id:
                 del self._sessions[token]
 
+    def revoke_attempt(self, attempt_id: str | None) -> None:
+        if not attempt_id:
+            return
+        for token, session in tuple(self._sessions.items()):
+            if session.attempt_id == attempt_id:
+                del self._sessions[token]
+
 
 class FileModelProxySessionStore:
-    def __init__(self, root: Path, *, ttl_seconds: int = 3600) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        ttl_seconds: int = 3600,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.root = root
         self.ttl_seconds = ttl_seconds
+        self._clock = clock or _utc_now
 
-    def issue(self, *, job_id: str, worker_id: str, proxy_id: str, resource_id: str) -> ModelProxySession:
+    def issue(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        proxy_id: str,
+        resource_id: str,
+        attempt_id: str | None = None,
+        expires_at: str | None = None,
+    ) -> ModelProxySession:
         with self._locked():
             while True:
                 session = _new_session(
@@ -82,7 +143,10 @@ class FileModelProxySessionStore:
                     worker_id=worker_id,
                     proxy_id=proxy_id,
                     resource_id=resource_id,
+                    attempt_id=attempt_id,
                     ttl_seconds=self.ttl_seconds,
+                    expires_at=expires_at,
+                    now=self._clock(),
                 )
                 path = self.root / f"{session.token}.json"
                 if not path.exists():
@@ -101,17 +165,17 @@ class FileModelProxySessionStore:
                 tmp_path.unlink(missing_ok=True)
             return session
 
-    def get(self, token: str) -> ModelProxySession | None:
+    def get(self, token: str) -> SessionLookup:
         path = self.root / f"{token}.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             session = ModelProxySession(**payload)
-            if session.expired():
-                path.unlink(missing_ok=True)
-                return None
-            return session
         except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
-            return None
+            return SessionLookup(SessionStatus.UNKNOWN)
+        if session.expired(self._clock()):
+            path.unlink(missing_ok=True)
+            return SessionLookup(SessionStatus.EXPIRED, session)
+        return SessionLookup(SessionStatus.VALID, session)
 
     def revoke_job(self, job_id: str) -> None:
         with self._locked():
@@ -121,6 +185,18 @@ class FileModelProxySessionStore:
                 except (OSError, json.JSONDecodeError):
                     continue
                 if payload.get("job_id") == job_id:
+                    path.unlink(missing_ok=True)
+
+    def revoke_attempt(self, attempt_id: str | None) -> None:
+        if not attempt_id:
+            return
+        with self._locked():
+            for path in self.root.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if payload.get("attempt_id") == attempt_id:
                     path.unlink(missing_ok=True)
 
     @contextmanager
@@ -140,17 +216,22 @@ def _new_session(
     worker_id: str,
     proxy_id: str,
     resource_id: str,
+    attempt_id: str | None = None,
     ttl_seconds: int,
+    expires_at: str | None = None,
+    now: datetime | None = None,
 ) -> ModelProxySession:
-    now = datetime.now(timezone.utc)
+    issued_at = now or _utc_now()
+    expiry = expires_at or (issued_at + timedelta(seconds=ttl_seconds)).isoformat()
     return ModelProxySession(
         token=secrets.token_urlsafe(32),
         job_id=job_id,
         worker_id=worker_id,
         proxy_id=proxy_id,
         resource_id=resource_id,
-        issued_at=now.isoformat(),
-        expires_at=(now + timedelta(seconds=ttl_seconds)).isoformat(),
+        attempt_id=attempt_id,
+        issued_at=issued_at.isoformat(),
+        expires_at=expiry,
     )
 
 
@@ -281,16 +362,101 @@ class ModelProxyService:
         self.body_logging = body_logging
 
     def forward(self, *, proxy_id: str, token: str, request: ProxyRequest) -> ProxyResponse:
-        session = self.sessions.get(token)
-        if session is None or session.proxy_id != proxy_id:
-            return ProxyResponse(status=401, body=b"unauthorized", headers={})
+        lookup = self.sessions.get(token)
+        session = lookup.session
+        if lookup.status == SessionStatus.UNKNOWN:
+            return self._reject(
+                reason="session_unknown",
+                http_status=401,
+                session=session,
+                proxy_id=proxy_id,
+                request=request,
+            )
+        if lookup.status == SessionStatus.EXPIRED:
+            return self._reject(
+                reason="session_expired",
+                http_status=401,
+                session=session,
+                proxy_id=proxy_id,
+                request=request,
+            )
+        assert session is not None
+        if session.proxy_id != proxy_id:
+            return self._reject(
+                reason="wrong_proxy",
+                http_status=401,
+                session=session,
+                proxy_id=proxy_id,
+                request=request,
+            )
         if self.lease_store is not None and not self.lease_store.job_holds((session.resource_id,), session.job_id):
-            return ProxyResponse(status=403, body=b"resource lease not held", headers={})
+            return self._reject(
+                reason="lost_lease",
+                http_status=403,
+                body=b"resource lease not held",
+                session=session,
+                proxy_id=proxy_id,
+                request=request,
+            )
         adapter = self.adapters.get(proxy_id)
         if adapter is None:
-            return ProxyResponse(status=404, body=b"unknown proxy", headers={})
+            return self._reject(
+                reason="unknown_proxy",
+                http_status=404,
+                body=b"unknown proxy",
+                session=session,
+                proxy_id=proxy_id,
+                request=request,
+            )
         response = adapter.forward(request)
         return self._with_transcript(session, request, response)
+
+    def _reject(
+        self,
+        *,
+        reason: str,
+        http_status: int,
+        body: bytes = b"unauthorized",
+        session: ModelProxySession | None = None,
+        proxy_id: str | None = None,
+        request: ProxyRequest | None = None,
+    ) -> ProxyResponse:
+        self._log_rejection(
+            reason=reason,
+            http_status=http_status,
+            session=session,
+            proxy_id=proxy_id,
+            request=request,
+        )
+        return ProxyResponse(status=http_status, body=body, headers={})
+
+    def _log_rejection(
+        self,
+        *,
+        reason: str,
+        http_status: int,
+        session: ModelProxySession | None,
+        proxy_id: str | None,
+        request: ProxyRequest | None,
+    ) -> None:
+        if self.transcript_root is None:
+            return
+        record: dict[str, object] = {
+            "ts": _utc_now().isoformat(),
+            "reason": reason,
+            "http_status": http_status,
+            "proxy_id": proxy_id,
+            "job_id": session.job_id if session is not None else None,
+            "attempt_id": session.attempt_id if session is not None else None,
+            "worker_id": session.worker_id if session is not None else None,
+            "method": request.method if request is not None else None,
+            "path": request.path if request is not None else None,
+        }
+        path = self.transcript_root / "rejections.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True))
+            handle.write("\n")
 
     def _with_transcript(
         self,

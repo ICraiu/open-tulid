@@ -411,7 +411,12 @@ class JobExecutor:
             ))
 
             implementation_id = _execution_worker_id(worker, job.worker_id)
-            model_proxy_env = self._model_proxy_env(job.job_id, job.worker_id, required_resources)
+            model_proxy_env = self._model_proxy_env(
+                job.job_id,
+                job.worker_id,
+                required_resources,
+                attempt=attempt_record,
+            )
             standard_runtime = _project_standard_runtime(self.adapter)
             worker_args = _worker_args(
                 runtime=self.runtime,
@@ -550,7 +555,10 @@ class JobExecutor:
             if lease_acquired and self.lease_store is not None:
                 self.lease_store.release_job(job.job_id)
             if self.model_proxy_sessions is not None:
-                self.model_proxy_sessions.revoke_job(job.job_id)
+                if settled_attempt_id is not None:
+                    self.model_proxy_sessions.revoke_attempt(settled_attempt_id)
+                else:
+                    self.model_proxy_sessions.revoke_job(job.job_id)
 
     def _admit_attempt(self, job, task, *, workspace: Path) -> AttemptRecord:
         """Persist a versioned attempt admission before spawning the worker.
@@ -770,6 +778,8 @@ class JobExecutor:
         job_id: str,
         worker_id: str,
         required_resources: tuple[str, ...],
+        *,
+        attempt: AttemptRecord | None = None,
     ) -> dict[str, str]:
         if self.model_proxy_sessions is None or self.model_proxy_endpoint_base is None:
             return {}
@@ -786,6 +796,8 @@ class JobExecutor:
                 worker_id=worker_id,
                 proxy_id=resource.proxy,
                 resource_id=resource_id,
+                attempt_id=attempt.attempt_id if attempt is not None else None,
+                expires_at=attempt.deadline if attempt is not None else None,
             )
             endpoints.append({
                 "resource_id": resource_id,

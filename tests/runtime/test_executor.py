@@ -29,7 +29,7 @@ from open_tulid.domain import (
     WorkflowDefinition,
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
-from open_tulid.runtime import FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
+from open_tulid.runtime import SessionStatus, FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
 from open_tulid.runtime.executor import (
     _append_completion_submission,
     _build_runtime_prompt,
@@ -1667,7 +1667,7 @@ def test_executor_passes_scoped_model_proxy_session_to_worker(tmp_path: Path, mo
     assert seen["OPEN_TULID_MODEL_SESSION_TOKEN"]
     assert seen["OPENAI_BASE_URL"] == "http://host.docker.internal:8787/proxies/openai"
     assert seen["OPENAI_API_KEY"] == seen["OPEN_TULID_MODEL_SESSION_TOKEN"]
-    assert sessions.get(seen["OPEN_TULID_MODEL_SESSION_TOKEN"]) is None
+    assert sessions.get(seen["OPEN_TULID_MODEL_SESSION_TOKEN"]).status is SessionStatus.UNKNOWN
 
 
 def test_executor_writes_opencode_config_for_tulid_model_proxy(tmp_path: Path, monkeypatch):
