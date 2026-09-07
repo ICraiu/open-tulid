@@ -48,6 +48,20 @@ from open_tulid.runtime.observability import (
     WorkerLivenessProbe,
     WorkerObservability,
 )
+from open_tulid.runtime.attempts import (
+    AttemptRecord,
+    AttemptStatus,
+    attempt_deadline,
+    attempt_id_for,
+    attempt_record_to_dict,
+    attempt_records_from_metadata,
+    task_semantic_revision,
+)
+from open_tulid.runtime.baseline import (
+    RuntimeBaseline,
+    baseline_to_dict,
+    capture_runtime_baseline,
+)
 from open_tulid.runtime.workspaces import WorkspacePreparer
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -300,6 +314,7 @@ class JobExecutor:
                     ),))
             lease_acquired = True
 
+        settled_attempt_id: str | None = None
         try:
             endpoint = self._start_completion_endpoint(job.job_id)
             repair_mode = (
@@ -357,6 +372,12 @@ class JobExecutor:
             elif isinstance(job.metadata.get("prompt_manifest"), Mapping):
                 _write_prompt_manifest_payload(prepared.workspace, job.metadata["prompt_manifest"])
 
+            attempt_record = self._admit_attempt(
+                job,
+                execution_task,
+                workspace=prepared.workspace,
+            )
+            settled_attempt_id = attempt_record.attempt_id
             self.job_store.update_status(
                 job.job_id,
                 ExecutionJobStatus.RUNNING,
@@ -438,6 +459,7 @@ class JobExecutor:
                 started_at=started_at,
             )
             result = None
+            self._mark_attempt_running(job.job_id, attempt_record.attempt_id)
             try:
                 result = self._run_worker_monitored(
                     job=job,
@@ -523,10 +545,156 @@ class JobExecutor:
                 job.job_id,
             ),))
         finally:
+            if settled_attempt_id is not None:
+                self._settle_attempt(job.job_id, settled_attempt_id)
             if lease_acquired and self.lease_store is not None:
                 self.lease_store.release_job(job.job_id)
             if self.model_proxy_sessions is not None:
                 self.model_proxy_sessions.revoke_job(job.job_id)
+
+    def _admit_attempt(self, job, task, *, workspace: Path) -> AttemptRecord:
+        """Persist a versioned attempt admission before spawning the worker.
+
+        The record is written under the already-held lease/store coordination
+        and carries the semantic task revision, transition, attempt number,
+        predecessor, worker identity, start time, and explicit deadline. A
+        baseline for the isolated fixture run is captured and persisted to the
+        workspace so the run is reproducible and the installed runtime is never
+        assumed to be the checkout being edited.
+        """
+        now = _utc_now()
+        attempt_number = int(job.attempts) + 1
+        attempt_id = attempt_id_for(job.job_id, attempt_number)
+        predecessor = self._preceding_attempt_id(job, attempt_number)
+        record = AttemptRecord(
+            schema="tulid.attempt/v1",
+            attempt_id=attempt_id,
+            job_id=job.job_id,
+            attempt_number=attempt_number,
+            task_revision=task_semantic_revision(task),
+            transition_id=job.transition_id,
+            worker_id=job.worker_id,
+            predecessor=predecessor,
+            status=AttemptStatus.ADMITTED,
+            started_at=now.isoformat(),
+            deadline=attempt_deadline(
+                started_at=now,
+                attempt_duration_seconds=self.runtime.default_timeout_seconds,
+                settlement_allowance_seconds=max(0.0, self.completion_settle_timeout_seconds),
+            ),
+            metadata={"baseline": baseline_to_dict(self._capture_baseline(job, workspace))},
+        )
+        persisted = self.job_store.record_attempt(job.job_id, attempt_record_to_dict(record))
+        if persisted.accepted:
+            self._write_baseline_file(record, workspace)
+        else:
+            raise ValueError(
+                f"Cannot admit attempt for job {job.job_id!r}: "
+                f"{persisted.error.message if persisted.error else 'unknown failure'}"
+            )
+        return record
+
+    def _capture_baseline(self, job, workspace: Path) -> RuntimeBaseline:
+        project_root = getattr(self.project_config, "repo_root", None)
+        command_policy_hash = self._command_policy_hash()
+        baseline = capture_runtime_baseline(
+            source_root=project_root,
+            workflow=self.workflow,
+            worker_id=job.worker_id,
+            worker_images=getattr(self.runtime, "worker_images", {}),
+            worker_types=getattr(self.runtime, "worker_types", {}),
+            worker_args=getattr(self.runtime, "worker_args", {}),
+            default_timeout_seconds=self.runtime.default_timeout_seconds,
+            max_repair_attempts=getattr(self.runtime, "max_repair_attempts", 0),
+            command_policy_sha256=command_policy_hash,
+        )
+        return baseline
+
+    def _write_baseline_file(self, record: AttemptRecord, workspace: Path) -> None:
+        baseline_payload = record.metadata.get("baseline")
+        if not isinstance(baseline_payload, Mapping):
+            return
+        from .baseline import baseline_from_dict, write_runtime_baseline
+
+        try:
+            baseline = baseline_from_dict(baseline_payload)
+        except (ValueError, TypeError):
+            return
+        write_runtime_baseline(baseline, workspace)
+
+    def _command_policy_hash(self) -> str | None:
+        from .repository_facts import canonical_sha256
+        from .standard_contracts import load_standard_contract
+
+        project_root = getattr(self.project_config, "repo_root", None)
+        if project_root is None:
+            return None
+        contract_result = load_standard_contract(project_root)
+        contract = getattr(contract_result, "contract", None)
+        if contract is None:
+            return None
+        commands = sorted(
+            (command.name, tuple(command.argv))
+            for command in getattr(contract, "commands", ())
+        )
+        return canonical_sha256({"commands": commands})
+
+    def _preceding_attempt_id(self, job, attempt_number: int) -> str | None:
+        if attempt_number <= 1:
+            return None
+        try:
+            records = attempt_records_from_metadata(job.metadata)
+        except ValueError:
+            return None
+        previous = [record for record in records if record.attempt_number < attempt_number]
+        if not previous:
+            return None
+        latest = max(previous, key=lambda record: record.attempt_number)
+        return latest.attempt_id if latest.job_id == job.job_id else None
+
+    def _mark_attempt_running(self, job_id: str, attempt_id: str) -> None:
+        self._update_attempt(job_id, attempt_id, status=AttemptStatus.RUNNING.value)
+
+    def _settle_attempt(self, job_id: str, attempt_id: str) -> None:
+        loaded = self.job_store.get(job_id)
+        status = (
+            _job_status_str(loaded)
+            if loaded.accepted and loaded.job is not None
+            else ""
+        )
+        failure_reference = None
+        if status == ExecutionJobStatus.FAILED.value:
+            failure_reference = job_id
+        self._update_attempt(
+            job_id,
+            attempt_id,
+            status=AttemptStatus.ENDED.value,
+            ended_at=_utc_now().isoformat(),
+            failure_reference=failure_reference,
+        )
+
+    def _update_attempt(
+        self,
+        job_id: str,
+        attempt_id: str,
+        *,
+        status: str,
+        ended_at: str | None = None,
+        failure_reference: str | None = None,
+    ) -> None:
+        loaded = self.job_store.get(job_id)
+        if not loaded.accepted or loaded.job is None:
+            return
+        job = loaded.job
+        try:
+            records = attempt_records_from_metadata(job.metadata)
+        except ValueError:
+            return
+        target = next((record for record in records if record.attempt_id == attempt_id), None)
+        if target is None:
+            return
+        updated = _updated_attempt_record(target, status=status, ended_at=ended_at, failure_reference=failure_reference)
+        self.job_store.record_attempt(job_id, attempt_record_to_dict(updated))
 
     def _wait_for_completion_settlement(self, job_id: str) -> None:
         deadline = time.monotonic() + max(0.0, self.completion_settle_timeout_seconds)
@@ -1060,6 +1228,21 @@ def _redact_env_for_log(env: Mapping[str, str]) -> dict[str, str]:
         key: "<redacted>" if _should_redact_env_key(key) else value
         for key, value in sorted(env.items())
     }
+
+
+def _updated_attempt_record(
+    record: AttemptRecord,
+    *,
+    status: str,
+    ended_at: str | None = None,
+    failure_reference: str | None = None,
+) -> AttemptRecord:
+    return _replace_request(
+        record,
+        status=status,
+        ended_at=ended_at or record.ended_at,
+        failure_reference=failure_reference or record.failure_reference,
+    )
 
 
 def _utc_now() -> datetime:

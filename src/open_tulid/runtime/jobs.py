@@ -11,6 +11,11 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from open_tulid.domain import DomainError, ExecutionJob, ExecutionJobStatus
+from open_tulid.runtime.attempts import (
+    ATTEMPT_RECORD_METADATA_KEY,
+    attempt_record_from_dict,
+    attempt_record_to_dict,
+)
 from open_tulid.runtime.events import utc_now
 
 
@@ -203,6 +208,47 @@ class FileExecutionJobStore:
             and _status_value(job.status) in ACTIVE_JOB_STATUSES
         )
         return JobStoreResult(jobs=jobs)
+
+    def record_attempt(self, job_id: str, payload: Mapping[str, Any]) -> JobStoreResult:
+        """Admit or update one versioned attempt record for a job.
+
+        The record is upserted by ``attempt_id`` under the existing job record
+        so attempt admission is durable before a worker is spawned. A restart
+        cannot create a new budget identity because the attempt number and
+        status are persisted with the job.
+        """
+        loaded = self.get(job_id)
+        if not loaded.accepted or loaded.job is None:
+            return loaded
+        job = loaded.job
+        try:
+            incoming = attempt_record_from_dict(payload)
+        except (ValueError, TypeError) as exc:
+            return JobStoreResult(error=DomainError(
+                code="attempt.invalid",
+                message=f"Cannot record attempt: {exc}",
+                location=job_id,
+            ))
+        raw_records: list[dict[str, Any]] = list(
+            job.metadata.get(ATTEMPT_RECORD_METADATA_KEY) or ()
+        )
+        if not isinstance(raw_records, list):
+            raw_records = []
+        surviving = [
+            item
+            for item in raw_records
+            if not (
+                isinstance(item, Mapping)
+                and item.get("attempt_id") == incoming.attempt_id
+            )
+        ]
+        surviving.append(attempt_record_to_dict(incoming))
+        surviving.sort(key=lambda item: int(item.get("attempt_number", 0)))
+        return self.update_status(
+            job_id,
+            job.status,
+            metadata={ATTEMPT_RECORD_METADATA_KEY: surviving},
+        )
 
     def _path_for(self, job_id: str) -> Path:
         return self.root / job_id / "job.json"
