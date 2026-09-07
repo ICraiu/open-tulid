@@ -64,10 +64,22 @@ def make_completion_handler(config: CompletionEndpointConfig) -> type[BaseHTTPRe
                 return
 
             status = _status_for_errors(result.errors)
-            _write_json(self, status, {
+            response: dict[str, object] = {
                 "accepted": False,
                 "errors": [_domain_error_dict(error) for error in result.errors],
-            })
+            }
+            if result.verification is not None and result.verification.report is not None:
+                response["verification_report"] = result.verification.report.to_dict()
+            job_store = getattr(config.service, "job_store", None)
+            repaired = job_store.get(job_id) if job_store is not None else None
+            if repaired is not None and repaired.accepted and repaired.job is not None:
+                metadata = repaired.job.metadata
+                response["retry"] = {
+                    "ready": metadata.get("repair_ready") is True,
+                    "attempt": metadata.get("retry_attempt", 0),
+                    "reason": metadata.get("retry_reason"),
+                }
+            _write_json(self, status, response)
 
         def log_message(self, format: str, *args: object) -> None:
             return

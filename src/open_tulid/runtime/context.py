@@ -21,6 +21,8 @@ class ContextDocument:
     content: str
     sha256: str
     is_execution_contract: bool = False
+    is_canonical_question_round_answers: bool = False
+    is_current_question_round_answers: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,30 @@ class LinkedContextResolver:
         seen: set[Path] = set()
         seen_hashes: set[str] = set()
         total_bytes = 0
+        canonical_answer_links = _canonical_question_round_answer_links(task)
+        if len(canonical_answer_links) > 1:
+            return ContextPacketResult(errors=(DomainError(
+                "context.question_round_answer_conflict",
+                "QuestionRound has multiple linked QuestionRoundFile artifacts; retain exactly one current answer source before review.",
+                task.id,
+            ),))
+        canonical_answer_link = canonical_answer_links[0] if canonical_answer_links else None
+        ancestor_answer_links = _ancestor_question_round_answer_links(parent_tasks)
+        canonical_answer_refs = {
+            _clean_ref(link)
+            for link in (*ancestor_answer_links, *canonical_answer_links)
+        }
 
+        # Answer records are intentionally first and chronological.  A review of a
+        # derived QuestionRound must see the complete explicit-answer history, not
+        # only the file linked to its immediate parent/current card.
         queue: list[tuple[str, int, bool]] = []
+        queue.extend((link, 0, True) for link in ancestor_answer_links)
+        queue.extend((link, 0, True) for link in canonical_answer_links)
         queue.extend(
             (link, 0, True)
             for link in _active_artifact_links(task.artifact_links)
+            if not _is_question_round_file_link(link)
         )
         queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(task.body)))
         for parent_task in parent_tasks:
@@ -65,6 +86,7 @@ class LinkedContextResolver:
                 (link, 0, True)
                 for link in _active_artifact_links(parent_task.artifact_links)
                 if not _is_implementation_task_file_link(link)
+                and not _is_question_round_file_link(link)
             )
             queue.extend((link, 0, False) for link in _wiki_links(sanitize_task_body_for_runtime(parent_task.body)))
         while queue:
@@ -121,6 +143,8 @@ class LinkedContextResolver:
                 content=content,
                 sha256=content_hash,
                 is_execution_contract=_is_implementation_contract_link(ref),
+                is_canonical_question_round_answers=_clean_ref(ref) in canonical_answer_refs,
+                is_current_question_round_answers=_clean_ref(ref) == _clean_ref(canonical_answer_link or ""),
             ))
             queue.extend((link, depth + 1, False) for link in _wiki_links(content))
 
@@ -177,6 +201,34 @@ def _is_implementation_contract_link(ref: str) -> bool:
     )
 
 
+def _is_question_round_file_link(ref: str) -> bool:
+    return "QuestionRoundFile" in Path(_clean_ref(ref)).parts
+
+
+def _canonical_question_round_answer_links(task: Task) -> tuple[str, ...]:
+    """A QuestionRound's own QuestionRoundFile is its sole current answer record."""
+    if task.task_type != "QuestionRound":
+        return ()
+    return tuple(link for link in task.artifact_links if _is_question_round_file_link(link))
+
+
+def _ancestor_question_round_answer_links(parent_tasks: tuple[Task, ...]) -> tuple[str, ...]:
+    """Return one canonical answer record from each ancestor round, oldest first.
+
+    The current round retains its strict conflict check above.  Historical records
+    are already persisted canonical answers; duplicate paths/content are removed by
+    the normal resolver de-duplication pass.
+    """
+    links: list[str] = []
+    for parent in parent_tasks:
+        if parent.task_type != "QuestionRound":
+            continue
+        round_links = _canonical_question_round_answer_links(parent)
+        if round_links:
+            links.append(round_links[0])
+    return tuple(links)
+
+
 def _active_artifact_links(links: tuple[str, ...]) -> tuple[str, ...]:
     latest_contract_index = next(
         (
@@ -195,7 +247,27 @@ def _active_artifact_links(links: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _render_context_document(document: ContextDocument) -> str:
-    if document.is_execution_contract:
+    if document.is_canonical_question_round_answers:
+        label = "Canonical QuestionRound Answers" if document.is_current_question_round_answers else "Canonical QuestionRound Answer History"
+        heading = f"# {label}: {document.ref}"
+        policy = (
+            "This is the sole authoritative answer record for its QuestionRound. "
+            "The task body is the generated question template and is not an answer source. "
+            "Treat text following a supported response label in this record as the user's "
+            "authoritative answer regardless of label formatting. Supported labels are "
+            "`Your answer:`, `Answer:`, and `Response:`, case-insensitively, with optional "
+            "Markdown emphasis around the label (for example, `**Answer:**`). "
+            "Later explicit answers override earlier conflicting answers. Never re-ask a "
+            "settled question; create a follow-up only for a genuinely new blocking question "
+            "that no earlier answer record resolves. "
+            + (
+                "Do not merge it with another version; multiple directly linked QuestionRoundFile "
+                "artifacts are rejected before execution."
+                if document.is_current_question_round_answers else
+                "This historical record remains binding unless a later explicit answer conflicts with it."
+            )
+        )
+    elif document.is_execution_contract:
         heading = f"# Generated Execution Contract: {document.ref}"
         policy = (
             "This validated contract is binding for implementation scope, interfaces, "

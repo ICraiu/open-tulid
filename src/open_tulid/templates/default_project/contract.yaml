@@ -1,0 +1,25 @@
+schema: tulid.contract/v1
+runtime:
+  # Container user defaults to the invoking user; Tulid resolves the current uid.
+  container_user: "1000:1000"
+  # OpenCode/agent runtime-home lives outside the tracked change surface so it
+  # never leaks into the project repository.
+  opencode_config_home: .open-tulid/home
+# Global verification commands. Tulid runs these in the completed worker
+# workspace; there is no file/directory allowlist and no per-task contract.
+commands:
+  - name: backend_tests
+    argv: [npm, test, --prefix, backend]
+    working_directory: .
+    timeout_seconds: 300
+    expect:
+      exit_code: 0
+  - name: project_build
+    argv: [npm, run, build]
+    working_directory: .
+    timeout_seconds: 300
+    expect:
+      exit_code: 0
+retry:
+  max_attempts: 3
+  visible_feedback: true

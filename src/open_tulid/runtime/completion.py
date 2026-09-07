@@ -262,11 +262,12 @@ class CompletionService:
             )
 
         output_dir = Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output")))
+        submitted_artifacts = normalize_artifacts(submission.artifacts)
         promoted_artifacts = _promotion_plan(
             artifact_root=self.artifact_root,
             output_dir=output_dir,
             task_id=job.task_id,
-            artifacts=normalize_artifacts(submission.artifacts),
+            artifacts=submitted_artifacts,
             existing_task=self.adapter.read_task(job.task_id).task,
         )
         promoted_files = _changed_file_plan(
@@ -291,9 +292,13 @@ class CompletionService:
         derived_tasks, derivation_errors = _derived_task_plan(
             output_dir=output_dir,
             transition=transition,
-            artifacts=normalize_artifacts(submission.artifacts),
+            artifacts=submitted_artifacts,
             parent_id=job.task_id,
             existing_task_ids=existing_task_ids,
+            promoted_artifact_links={
+                (artifact.type, artifact.path): str(plan["link"])
+                for artifact, plan in zip(submitted_artifacts, promoted_artifacts)
+            },
         )
         if derivation_errors:
             return self._reject_completion(
@@ -522,16 +527,21 @@ class CompletionService:
             "verification_report": report.to_dict() if report is not None else None,
             "error_codes": [error.code for error in errors],
             "repair_ready": repair.eligible,
+            "retry_reason": repair.reason,
         })
+        terminal_rejection = not repair.eligible
         self.job_store.update_status(
             job.job_id,
-            ExecutionJobStatus.COMPLETION_REJECTED,
+            (ExecutionJobStatus.COMPLETION_REJECTED if not terminal_rejection else ExecutionJobStatus.FAILED),
             metadata={
                 "last_verification": message,
                 "repair_ready": repair.eligible,
                 "repair_packet": repair.packet,
                 "repair_blocked_reason": repair.reason,
+                "retry_reason": repair.reason,
+                "retry_attempt": int(metadata.get("repair_attempts", 0)),
                 "repair_history": tuple(repair_history),
+                **({"failure_reason": f"completion_rejected:{repair.reason}"} if terminal_rejection else {}),
                 "completion_submissions": _record_submission(
                     metadata,
                     submission_id,
@@ -1036,13 +1046,15 @@ def _derived_task_plan(
     artifacts: tuple[ArtifactSubmission, ...],
     parent_id: str,
     existing_task_ids: tuple[str, ...] = (),
+    promoted_artifact_links: Mapping[tuple[str, str], str] | None = None,
 ) -> tuple[tuple[Mapping[str, object], ...], tuple[DomainError, ...]]:
     if transition.derives is None:
         return (), ()
     selected = tuple(artifact for artifact in artifacts if artifact.type == transition.derives.artifact_type)
-    parsed: list[tuple[str, str, tuple[str, ...], str]] = []
+    parsed: list[tuple[str, str, tuple[str, ...], str, str | None]] = []
     errors: list[DomainError] = []
     local_ids: set[str] = set()
+    source_links = promoted_artifact_links or {}
     for artifact in selected:
         path = output_dir / artifact.path
         try:
@@ -1053,12 +1065,13 @@ def _derived_task_plan(
         if local_id in local_ids:
             errors.append(_error("task.derived_duplicate_local_id", f"Duplicate derived task local_id: {local_id}", local_id))
         local_ids.add(local_id)
-        parsed.append((local_id, title, dependencies, body))
+        source_link = source_links.get((artifact.type, artifact.path))
+        parsed.append((local_id, title, dependencies, body, source_link))
     if errors:
         return (), tuple(errors)
     ids = _allocate_numeric_task_ids(tuple(local_id for local_id, *_ in parsed), existing_task_ids)
     planned: list[Mapping[str, object]] = []
-    for local_id, title, dependencies, body in parsed:
+    for local_id, title, dependencies, body, source_link in parsed:
         unknown = tuple(dep for dep in dependencies if dep not in ids)
         if unknown:
             errors.append(_error(
@@ -1075,6 +1088,7 @@ def _derived_task_plan(
             current_state=transition.derives.state,
             task_type=transition.derives.task_type,
             dependencies=tuple(ids[dep] for dep in dependencies),
+            artifact_links=(source_link,) if source_link is not None else (),
             parent_id=parent_id,
             body=body,
         )

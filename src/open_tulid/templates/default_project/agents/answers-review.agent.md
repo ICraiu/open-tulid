@@ -1,8 +1,10 @@
+<!-- open-tulid:canonical-question-round-answers=v1 -->
+
 # Answer Clarity Review
 
 Decide whether the project is crystal clear enough to write a complete implementation specification without making an important product assumption.
 
-Read the current answered question card, the original idea, every earlier question-and-answer round in the parent context, and every linked specification artifact. Treat text beneath each `Your answer:` label as the user's answer. Reconcile all answers across rounds. A later explicit answer overrides an earlier conflicting answer. Model-written product, direction, and implementation artifacts are proposals, not evidence of user approval. For this clarification gate, important choices stated only in the original idea or a model artifact must still be explicitly confirmed in a QuestionRound answer.
+Read the current answered question card, the original idea, every earlier question-and-answer round in the parent context, and every linked specification artifact. When context marks a `QuestionRoundFile` as `Canonical QuestionRound Answers`, it is the sole authoritative answer record for that round; the current task body is a generated question template and is not an answer source. In that canonical record, treat text following these explicit response labels as the user's answer: `Your answer:`, `Answer:`, or `Response:`. Labels are case-insensitive and may have Markdown emphasis around them (for example, `**Answer:**`). Reconcile all answers across rounds. A later explicit answer overrides an earlier conflicting answer. Model-written product, direction, and implementation artifacts are proposals, not evidence of user approval. For this clarification gate, important choices stated only in the original idea or a model artifact must still be explicitly confirmed in a QuestionRound answer.
 
 Always write exactly one `ClarityAssessment` artifact at `output/clarity-assessment.md` with:
 

@@ -22,6 +22,7 @@ scenario = os.environ.get("SCRIPTED_RUNTIME_SCENARIO", "default")
 
 print(f"scripted runtime worker scenario={scenario} transition={transition_id} task={task_id}")
 print(f"prompt-bytes={len(prompt.encode('utf-8'))}")
+print(f"uid={os.getuid()} gid={os.getgid()}")
 
 
 def submit(payload):
@@ -118,63 +119,45 @@ if transition_id == "BreakDownImplementationSpec":
     })
     sys.exit(0 if status == 200 else 1)
 
-if transition_id == "PrepareExecutionContract":
-    write_output(
-        "implementation-contract.yaml",
-        (
-            "schema: tulid.implementation/v1\n"
-            "source:\n"
-            f'  task_id: "{task_id}"\n'
-            f'  source_intent_sha256: "{context["source_intent_sha256"]}"\n'
-            "profile: code_change\n"
-            "objective: Add a deterministic healthz entrypoint that returns ok.\n"
-            "change_surface:\n"
-            "  add: []\n"
-            "  edit: [app.py]\n"
-            "  forbidden: []\n"
-            "interfaces:\n"
-            "  - name: app.healthz\n"
-            "    behavior: Return the string ok.\n"
-            "requirements:\n"
-            "  - Preserve the repository's deterministic test and build checks.\n"
-            "failure_behavior: []\n"
-            "non_goals: []\n"
-            "checks:\n"
-            "  focused:\n"
-            "    - id: tests_pass\n"
-            "      argv: [python, check_repo.py, tests]\n"
-            "      timeout_seconds: 120\n"
-            "      expect:\n"
-            "        exit_code: 0\n"
-            "  invariants: []\n"
-        ),
-    )
-    status = submit({
-        "submission_id": "prepare-execution-contract",
-        "attempt": 1,
-        "summary": "execution contract prepared by scripted worker",
-        "artifacts": [
-            {
-                "type": "ImplementationContract",
-                "path": "implementation-contract.yaml",
-            },
-        ],
-        "changed_files": [],
-        "validation_evidence": {
-            "implementation_contract_valid": "contract matches task identity and source intent",
-        },
-    })
-    sys.exit(0 if status == 200 else 1)
-
 if transition_id == "ImplementTask":
+    if scenario in ("implementation_feedback_repair", "standard_contract"):
+        # The first container process deliberately leaves a scope violation and
+        # exits non-zero after the verifier rejects it.  Tulid must persist the
+        # rejection, start a fresh local-worker process with repair feedback,
+        # and accept the corrected submission without stranding the job.
+        repair_prompt = "# Open Tulid Repair" in prompt
+        forbidden = workspace / "forbidden-by-first-attempt.txt"
+        if not repair_prompt:
+            forbidden.write_text("remove me during repair\n", encoding="utf-8")
+            status = submit({
+                "submission_id": "implement-task-rejected",
+                "attempt": 1,
+                "summary": "deliberately rejected scoped attempt",
+                "artifacts": [],
+                "changed_files": ["forbidden-by-first-attempt.txt"],
+                "validation_evidence": {
+                    "tests_pass": "not run; verifier feedback required",
+                    "project_build": "not run; verifier feedback required",
+                },
+            })
+            sys.exit(1 if status == 400 else 2)
+        assert forbidden.exists(), "repair must resume the rejected workspace"
+        forbidden.unlink()
     (workspace / "app.py").write_text(
         "def healthz():\n    return 'ok'\n",
         encoding="utf-8",
     )
     status = submit({
-        "submission_id": "implement-task",
-        "attempt": 1,
-        "summary": "implementation task completed by scripted worker",
+        "submission_id": (
+            "implement-task-repaired"
+            if scenario in ("implementation_feedback_repair", "standard_contract")
+            else "implement-task"
+        ),
+        "attempt": 2 if scenario in ("implementation_feedback_repair", "standard_contract") else 1,
+        "summary": (
+            "implementation task corrected after verifier feedback"
+            if scenario != "default" else "implementation task completed by scripted worker"
+        ),
         "artifacts": [],
         "changed_files": ["app.py"],
         "validation_evidence": {

@@ -290,44 +290,15 @@ class DeterministicVerifier:
         workspace: Path,
         contract: ExecutionContract,
     ) -> tuple[VerificationReport, tuple[DomainError, ...]]:
-        errors: list[DomainError] = []
-        post = capture_repository_snapshot(workspace)
-        if not post.accepted or post.snapshot is None:
-            errors.extend(_error("verification.baseline_unavailable", error.message, error.location) for error in post.errors)
-            return VerificationReport(
-                VERIFICATION_REPORT_SCHEMA,
-                "baseline_failure",
-                contract.baseline_manifest.sha256,
-                None,
-            ), tuple(errors)
-        added, edited, removed, renamed = _manifest_changes(contract.baseline_manifest, post.snapshot.baseline)
-        surface = contract.generated_contract.change_surface
-        for path in added:
-            if not _path_allowed(path, surface.add):
-                errors.append(_error("verification.path_add_forbidden", f"Added file is outside the allowed add surface: {path}", path))
-        for path in edited:
-            if not _path_allowed(path, surface.edit):
-                errors.append(_error("verification.path_edit_forbidden", f"Edited file is outside the allowed edit surface: {path}", path))
-        for path in removed:
-            errors.append(_error("verification.deletion_forbidden", f"Contract does not permit deleting files: {path}", path))
-        for old, new in renamed:
-            errors.append(_error("verification.rename_forbidden", f"Contract does not permit renaming files: {old} -> {new}", new))
-        for path in (*added, *edited, *removed):
-            if _path_allowed(path, surface.forbidden):
-                errors.append(_error("verification.path_forbidden", f"Contract forbids changing: {path}", path))
-        changed_lines = _changed_line_count(workspace, contract.baseline_manifest, (*added, *edited, *removed))
-        changed_file_count = len(added) + len(edited) + len(removed) + (2 * len(renamed))
-        if surface.max_files is not None and changed_file_count > surface.max_files:
-            errors.append(_error("verification.max_files_exceeded", f"Contract permits at most {surface.max_files} changed files; found {changed_file_count}."))
-        if surface.max_changed_lines is not None and changed_lines > surface.max_changed_lines:
-            errors.append(_error("verification.changed_line_budget_exceeded", f"Contract permits at most {surface.max_changed_lines} changed lines; conservative count is {changed_lines}."))
+        # The only acceptance criterion is the project's configured global
+        # commands. A worker may freely create/edit/rename/delete files required
+        # by its task; file diffs are never part of this acceptance decision.
+        baseline_sha = contract.baseline_manifest.sha256
         checks, check_errors = _run_contract_checks(workspace, contract)
-        errors.extend(check_errors)
         return VerificationReport(
-            VERIFICATION_REPORT_SCHEMA, None, contract.baseline_manifest.sha256,
-            post.snapshot.baseline.sha256, added, edited, removed, renamed,
-            changed_lines, checks,
-        ), tuple(errors)
+            VERIFICATION_REPORT_SCHEMA, None, baseline_sha,
+            baseline_sha, (), (), (), (), 0, checks,
+        ), check_errors
 
     def _run_trusted_validations(
         self,
@@ -405,7 +376,20 @@ def _manifest_changes(
 
 def _path_allowed(path: str, patterns: Sequence[str]) -> bool:
     from fnmatch import fnmatchcase
-    return any(fnmatchcase(path, pattern) for pattern in patterns)
+    for pattern in patterns:
+        if fnmatchcase(path, pattern):
+            return True
+        if _path_under_directory(path, pattern):
+            return True
+    return False
+
+
+def _path_under_directory(path: str, base: str) -> bool:
+    base_parts = Path(base).parts
+    path_parts = Path(path).parts
+    if not base_parts or len(path_parts) < len(base_parts):
+        return False
+    return path_parts[: len(base_parts)] == base_parts and base_parts[-1] not in {"", "."}
 
 
 def _changed_line_count(workspace: Path, baseline: BaselineManifest, paths: Sequence[str]) -> int:
@@ -439,28 +423,59 @@ def _run_contract_checks(
     for check in contract.resolved_checks:
         if check.runner != "command":
             continue
+        command = _as_command_line(check.argv)
         cwd = _contained_path(workspace, check.working_directory)
         if cwd is None or not cwd.is_dir():
             results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr="working directory unavailable"))
-            errors.append(_error("verification.check_environment", f"Check {check.id!r} has no usable working directory.", check.id))
+            errors.append(_error("verification.check_environment", f"Verification command {check.id!r} has no usable working directory: {check.working_directory!r}.", check.id))
             continue
         try:
             completed = subprocess.run(check.argv, cwd=cwd, capture_output=True, text=True, timeout=check.timeout_seconds, check=False)
         except subprocess.TimeoutExpired as exc:
             results.append(VerificationCheckResult(check.id, "timeout", check.argv, stdout=_as_text(exc.stdout), stderr=_as_text(exc.stderr)))
-            errors.append(_error("verification.check_timeout", f"Frozen check timed out: {check.id}", check.id))
+            errors.append(_error("verification.check_timeout", f"Verification command {check.id!r} timed out after {check.timeout_seconds}s: {command}.", check.id))
             continue
         except OSError as exc:
             results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr=str(exc)))
-            errors.append(_error("verification.check_environment", f"Frozen check could not run: {check.id}: {exc}", check.id))
+            errors.append(_error("verification.check_environment", f"Verification command {check.id!r} could not be found or run ({command}): {exc}", check.id))
             continue
-        passed = (completed.returncode == check.expect.exit_code
-                  and all(value in completed.stdout for value in check.expect.stdout_contains)
-                  and all(value in completed.stderr for value in check.expect.stderr_contains))
+        expected = check.expect.exit_code
+        stdout_ok = all(value in completed.stdout for value in check.expect.stdout_contains)
+        stderr_ok = all(value in completed.stderr for value in check.expect.stderr_contains)
+        passed = completed.returncode == expected and stdout_ok and stderr_ok
         results.append(VerificationCheckResult(check.id, "passed" if passed else "failed", check.argv, completed.returncode, completed.stdout, completed.stderr))
         if not passed:
-            errors.append(_error("verification.check_failed", f"Frozen check failed expectations: {check.id}", check.id))
+            detail = _check_failure_detail(check.id, expected, completed, check.expect)
+            errors.append(_error("verification.check_failed", detail, check.id))
     return tuple(results), tuple(errors)
+
+
+def _as_command_line(argv: Sequence[str]) -> str:
+    import shlex
+    return shlex.join(argv)
+
+
+def _check_failure_detail(
+    check_id: str,
+    expected_exit_code: int | None,
+    completed: subprocess.CompletedProcess[str],
+    expect: object,
+) -> str:
+    reasons: list[str] = []
+    if completed.returncode != expected_exit_code:
+        reasons.append(
+            f"exit code {completed.returncode} (expected {expected_exit_code or 0})"
+        )
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    tail = "\n".join((stdout, stderr)).strip().splitlines()[-5:]
+    evidence = (" ".join(line.strip() for line in tail) if tail else "no output")
+    details = "; ".join(reasons) if reasons else "exit expectation was not met"
+    line_count = len(tail)
+    return (
+        f"Verification command {check_id!r} failed ({details}; "
+        f"{line_count} output line(s) captured: {evidence[:400]})"
+    )
 
 
 def _as_text(value: str | bytes | None) -> str:

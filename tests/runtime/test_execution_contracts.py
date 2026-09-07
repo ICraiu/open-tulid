@@ -616,7 +616,7 @@ def test_context_excerpt_rejects_duplicate_heading_and_oversized_content(tmp_pat
     ]
 
 
-def test_verifier_enforces_manifest_surface_and_runs_frozen_checks(tmp_path):
+def test_verifier_runs_frozen_checks_without_path_diff_rejection(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     task = _task_and_contract(project_root)
@@ -639,11 +639,12 @@ def test_verifier_enforces_manifest_surface_and_runs_frozen_checks(tmp_path):
 
     assert result.accepted is True
     assert result.report is not None
-    assert result.report.edited == ("app.py",)
+    # File diffs are recorded as history only; the report carries the command
+    # checks as the acceptance evidence.
     assert [check.status for check in result.report.checks] == ["passed"]
 
 
-def test_verifier_rejects_unapproved_files_and_reports_contract_failure(tmp_path):
+def test_verifier_allows_unknown_file_without_contract_rejection(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     task = _task_and_contract(project_root)
@@ -655,44 +656,42 @@ def test_verifier_rejects_unapproved_files_and_reports_contract_failure(tmp_path
         project_root=project_root, repo_root=repo, task=task, transition=transition,
     )
     assert compiled.contract is not None
-    repo.joinpath("secrets.txt").write_text("do not leak\n", encoding="utf-8")
+    # The worker legitimately creates a previously unknown file. It must not be
+    # rejected merely because it was not predicted in the baseline.
+    (repo / "research").mkdir()
+    (repo / "research" / "notes.md").write_text("# Plan\n", encoding="utf-8")
 
     result = DeterministicVerifier().verify(
         workspace=repo,
         transition=transition,
-        submission=CompletionSubmission(changed_files=("secrets.txt",)),
+        submission=CompletionSubmission(changed_files=("research/notes.md",)),
         execution_contract=compiled.contract,
     )
 
-    assert result.accepted is False
-    assert {error.code for error in result.errors} == {"verification.path_add_forbidden"}
+    assert result.accepted is True
     assert result.report is not None
-    assert result.report.classification == "contract_failure"
-    assert result.report.to_dict()["changes"]["added"] == ["secrets.txt"]
+    assert all(check.status == "passed" for check in result.report.checks)
 
 
-def test_verifier_enforces_frozen_change_budgets(tmp_path):
+def test_verifier_rejects_when_a_frozen_command_fails(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     task = _task_and_contract(project_root)
     contract_path = project_root / task.artifact_links[0]
-    contract_path.write_text(
-        contract_path.read_text(encoding="utf-8")
-        .replace("invariants: [project_build]", "invariants: []")
-        .replace("forbidden: [secrets/]", "forbidden: [secrets/]\n  max_files: 1\n  max_changed_lines: 1"),
-        encoding="utf-8",
-    )
+    contract_path.write_text(contract_path.read_text(encoding="utf-8").replace("invariants: [project_build]", "invariants: []"), encoding="utf-8")
     repo = _repo(tmp_path)
     transition = replace(_transition(), requires=RequirementDefinition(changed_files_required=True))
     compiled = compile_task_execution_contract(
         project_root=project_root, repo_root=repo, task=task, transition=transition,
     )
     assert compiled.contract is not None
-    repo.joinpath("app.py").write_text("one\ntwo\n", encoding="utf-8")
+    # Break the focused check command so the verification command exits non-zero.
+    repo.joinpath("check_repo.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
 
     result = DeterministicVerifier().verify(
         workspace=repo, transition=transition,
         submission=CompletionSubmission(changed_files=("app.py",)), execution_contract=compiled.contract,
     )
 
-    assert {error.code for error in result.errors} == {"verification.changed_line_budget_exceeded"}
+    assert result.accepted is False
+    assert {error.code for error in result.errors} == {"verification.check_failed"}

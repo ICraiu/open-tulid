@@ -78,6 +78,25 @@ def test_linked_context_includes_parent_links(tmp_path: Path):
     assert [doc.ref for doc in result.packet.documents] == ["parent-context"]
 
 
+def test_question_round_rejects_conflicting_current_answer_artifacts(tmp_path: Path):
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        Task(
+            id="question-round",
+            title="Questions",
+            path="tasks/questions.md",
+            current_state="AnswersReady",
+            task_type="QuestionRound",
+            artifact_links=(
+                "artifacts/2/QuestionRoundFile/initial.md",
+                "artifacts/2/QuestionRoundFile/edited-copy.md",
+            ),
+        ),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "context.question_round_answer_conflict"
+
+
 def test_linked_context_skips_parent_implementation_task_files(tmp_path: Path):
     (tmp_path / "artifacts" / "parent" / "ImplementationTaskFile").mkdir(parents=True)
     (tmp_path / "artifacts" / "parent" / "ImplementationSpec").mkdir(parents=True)

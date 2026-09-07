@@ -24,6 +24,24 @@ from open_tulid.adapters.obsidian import (
 
 TASK_ID = "01J00000000000000000000001"
 
+_SCHEMA_TASK = (
+    "# Add healthz\n"
+    "\n"
+    "Add a health check.\n"
+    "\n"
+    "## Why\n"
+    "Why the check matters.\n"
+    "\n"
+    "## What\n"
+    "What the check does.\n"
+    "\n"
+    "## How\n"
+    "Which seam to touch.\n"
+    "\n"
+    "## Acceptance\n"
+    "- the check is added\n"
+)
+
 
 def _adapter(project_root: Path) -> ObsidianAdapter:
     return ObsidianAdapter(ObsidianAdapterConfig(
@@ -90,8 +108,19 @@ def _write_task(project: Path, note: str, task_id: str = TASK_ID, state: str | N
         "\n"
         "# Add health-check endpoint\n"
         "\n"
-        "## Task\n"
-        "Add a /healthz endpoint.\n",
+        "Add a /healthz endpoint.\n"
+        "\n"
+        "## Why\n"
+        "Surface service liveness.\n"
+        "\n"
+        "## What\n"
+        "Add the endpoint.\n"
+        "\n"
+        "## How\n"
+        "Touch the router seam.\n"
+        "\n"
+        "## Acceptance\n"
+        "- the endpoint is added\n",
         encoding="utf-8",
     )
 
@@ -218,7 +247,7 @@ class TestObsidianAdapterLoadProject:
     def test_repair_assigns_missing_task_id_type_and_state_without_renaming_note_or_card(self, tmp_path: Path):
         project = _make_project(tmp_path)
         task_path = project / "tasks" / "Add healthz.md"
-        task_path.write_text("# Add healthz\n\n## Task\nAdd endpoint.\n", encoding="utf-8")
+        task_path.write_text(_SCHEMA_TASK, encoding="utf-8")
         board_path = project / "kanban" / "Work.md"
         original_board = "## Todo\n- [ ] [[Add healthz]]\n"
         board_path.write_text(original_board, encoding="utf-8")
@@ -241,7 +270,7 @@ class TestObsidianAdapterLoadProject:
 
     def test_repair_reports_missing_task_metadata_without_fix(self, tmp_path: Path):
         project = _make_project(tmp_path)
-        (project / "tasks" / "Add healthz.md").write_text("# Add healthz\n", encoding="utf-8")
+        (project / "tasks" / "Add healthz.md").write_text(_SCHEMA_TASK.strip(), encoding="utf-8")
         (project / "kanban" / "Work.md").write_text("## Todo\n- [ ] [[Add healthz]]\n", encoding="utf-8")
 
         result = _adapter(project).repair_project(fix=False)
@@ -462,3 +491,121 @@ class TestObsidianAdapterEffects:
         assert result.accepted is True
         assert (project / "tasks" / "2-derived-child.md").is_file()
         assert "[[2-derived-child]]" in (project / "kanban" / "Work.md").read_text(encoding="utf-8")
+
+
+_SCHEMA_BODY = (
+    "Add a health check.\n"
+    "\n"
+    "## Why\n"
+    "Why the check matters.\n"
+    "\n"
+    "## What\n"
+    "What the check does.\n"
+    "\n"
+    "## How\n"
+    "Which seam to touch.\n"
+    "\n"
+    "## Acceptance\n"
+    "- the check is added\n"
+)
+
+
+def _repair_errors(
+    tmp_path: Path,
+    body: str,
+    *,
+    task_id: str = "1",
+    declared_profile: str | None = None,
+) -> list[str]:
+    project = _make_project(tmp_path)
+    (project / "kanban" / "Work.md").write_text("## Todo\n", encoding="utf-8")
+    if declared_profile is not None:
+        (project / "acceptance.yaml").write_text(
+            "schema: tulid.acceptance/v1\n"
+            "policy:\n"
+            "  require_vertical_slice: false\n"
+            "profiles:\n"
+            f"  {declared_profile}:\n"
+            "    kind: unit\n"
+            "    argv: [pytest]\n",
+            encoding="utf-8",
+        )
+    (project / "tasks" / "schematic.md").write_text(
+        "---\n"
+        f"id: {task_id}\n"
+        "type: task\n"
+        "state: Todo\n"
+        "---\n"
+        "\n"
+        f"# Add healthz\n"
+        "\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+    return [error.code for error in _adapter(project).repair_project(fix=False)]
+
+
+class TestTaskFileSchema:
+    def test_five_part_task_file_validates(self, tmp_path: Path):
+        assert _repair_errors(tmp_path, _SCHEMA_BODY) == []
+
+    def test_missing_section_reports_section_missing(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace("## Why\nWhy the check matters.\n", "")
+
+        errors = _repair_errors(tmp_path, body)
+
+        assert "task.section_missing" in errors
+
+    def test_empty_section_reports_section_empty(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace("## Why\nWhy the check matters.\n", "## Why\n")
+
+        errors = _repair_errors(tmp_path, body)
+
+        assert "task.section_empty" in errors
+
+    def test_missing_description_reports_section_missing(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace("Add a health check.\n", "")
+
+        errors = _repair_errors(tmp_path, body)
+
+        assert "task.section_missing" in errors
+
+    def test_empty_acceptance_reports_criteria_missing(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace("- the check is added\n", "")
+
+        errors = _repair_errors(tmp_path, body)
+
+        assert "task.acceptance_criteria_missing" in errors
+
+    def test_undeclared_accepts_reports_run_unknown(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace(
+            "## Acceptance\n- the check is added\n",
+            "## Acceptance\naccepts: [undeclared]\n",
+        )
+
+        errors = _repair_errors(tmp_path, body)
+
+        assert "task.acceptance_run_unknown" in errors
+
+    def test_declared_accepts_resolves(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace(
+            "## Acceptance\n- the check is added\n",
+            "## Acceptance\naccepts: [unit]\naccepts_if:\n  - returns ok\n",
+        )
+
+        errors = _repair_errors(tmp_path, body, declared_profile="unit")
+
+        assert "task.acceptance_run_unknown" not in errors
+        assert errors == []
+
+    def test_per_task_run_command_list_rejected(self, tmp_path: Path):
+        body = _SCHEMA_BODY.replace(
+            "## Acceptance\n- the check is added\n",
+            "## Acceptance\naccepts: [unit]\nrun: [pytest]\n",
+        )
+
+        errors = _repair_errors(tmp_path, body, declared_profile="unit")
+
+        # Per-task command lists are forbidden even when the referenced profile
+        # is declared: verification commands are global at the project level.
+        assert "task.acceptance_run_forbidden" in errors

@@ -34,12 +34,16 @@ from .prompt_versions import (
     PROMPT_COMPILER_VERSION,
     SUPPORTED_PROMPT_COMPILER_VERSIONS,
 )
-from .acceptance_profiles import AcceptanceProfile, load_acceptance_profiles
+from .standard_contracts import (
+    ProjectCommand,
+    StandardContract,
+    load_standard_contract,
+)
 from .task_contracts import (
+    ChangeSurface,
     CheckExpectation,
     ContractCheck,
     ImplementationContractDraft,
-    PRODUCT_FACING_CONTRACT_PROFILES,
     SHELL_CONTROL_TOKENS,
     find_implementation_contract_path,
     parse_implementation_contract,
@@ -50,8 +54,16 @@ from .task_contracts import (
 
 EXECUTION_CONTRACT_SCHEMA = "tulid.execution/v1"
 EXECUTION_CONTRACT_COMPILER_VERSION = 1
-CONTEXT_EXCERPT_CHARACTER_LIMIT = 1_200
-CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT = 2_000
+GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA = "tulid.global_contract/v1"
+
+
+@dataclass(frozen=True)
+class FrozenContextExcerpt:
+    artifact: str
+    heading: str
+    reason: str
+    text: str
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -70,15 +82,6 @@ class ResolvedCheck:
 
 
 @dataclass(frozen=True)
-class FrozenContextExcerpt:
-    artifact: str
-    heading: str
-    reason: str
-    text: str
-    sha256: str
-
-
-@dataclass(frozen=True)
 class ExecutionContract:
     source_task: Task
     transition: TransitionDefinition
@@ -88,8 +91,25 @@ class ExecutionContract:
     repository_facts: RepositoryFacts
     baseline_manifest: BaselineManifest
     resolved_checks: tuple[ResolvedCheck, ...]
-    context_excerpts: tuple[FrozenContextExcerpt, ...]
-    sha256: str
+    # file/directory diffs are recorded as evidence but are NOT acceptance
+    # criteria; a worker may freely create/edit/rename/delete task files.
+    context_excerpts: tuple = ()
+    sha256: str = ""
+
+    @property
+    def commands(self) -> tuple[ProjectCommand, ...]:
+        """Snapshot of the global contract commands that this execution verifies."""
+        commands: list[ProjectCommand] = []
+        for check in self.resolved_checks:
+            if check.runner != "command":
+                continue
+            commands.append(ProjectCommand(
+                name=check.id,
+                argv=check.argv,
+                working_directory=check.working_directory,
+                timeout_seconds=check.timeout_seconds,
+            ))
+        return tuple(commands)
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,117 @@ class ExecutionContractResult:
         return not self.errors
 
 
+def compile_standard_execution_contract(
+    *,
+    project_root: Path,
+    repo_root: Path | None,
+    task: Task,
+    transition: TransitionDefinition,
+) -> ExecutionContractResult:
+    """Compile an execution contract from the project's single global command
+    contract (``contract.yaml``).
+
+    This is the live implementation/self-review path. The global contract is the
+    only source of verification commands; there is no per-task LLM-authored
+    ImplementationContract and no file allowlist.
+    """
+    standard = load_standard_contract(project_root)
+    if not standard.accepted or standard.contract is None:
+        if standard.errors:
+            return ExecutionContractResult(errors=standard.errors)
+        return ExecutionContractResult(errors=(_error(
+            "contract.missing",
+            "Implementation transitions require a project global contract.yaml.",
+            str(project_root / "contract.yaml"),
+        ),))
+
+    standard_contract: StandardContract = standard.contract
+    command_errors = _validate_global_commands(standard_contract)
+    if command_errors:
+        return ExecutionContractResult(errors=tuple(command_errors))
+
+    repository = capture_repository_snapshot(repo_root)
+    if not repository.accepted or repository.snapshot is None:
+        return ExecutionContractResult(errors=repository.errors)
+
+    checks = tuple(
+        sorted(
+            (_global_command_check(cmd) for cmd in standard_contract.commands),
+            key=lambda check: check.id,
+        )
+    )
+    draft = _global_contract_draft(task, standard_contract)
+    provisional = ExecutionContract(
+        source_task=task,
+        transition=transition,
+        generated_contract=draft,
+        generated_contract_artifact_path="",
+        generated_contract_sha256="",
+        repository_facts=repository.snapshot.facts,
+        baseline_manifest=repository.snapshot.baseline,
+        resolved_checks=checks,
+        context_excerpts=(),
+        sha256="",
+    )
+    contract_hash = canonical_sha256(_execution_contract_body(provisional))
+    return ExecutionContractResult(contract=replace(provisional, sha256=contract_hash))
+
+
+def _global_contract_draft(
+    task: Task,
+    standard: StandardContract,
+) -> ImplementationContractDraft:
+    """Synthesize the task-facing generated contract from the global command
+    policy. There is intentionally no change surface, no interfaces, no
+    invariants, no acceptance profiles, and no per-task authorship."""
+    return ImplementationContractDraft(
+        schema=GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA,
+        source_task_id=task.id,
+        source_intent_sha256=task_source_intent_sha256(task),
+        profile="code_change",
+        objective=task.body.strip() or f"Implement {task.title.strip()}.",
+        change_surface=ChangeSurface(add=(), edit=(), forbidden=()),
+        requirements=(),
+        focused_checks=(),
+        invariants=(),
+        acceptance_profiles=(),
+        context_excerpts=(),
+    )
+
+
+def _validate_global_commands(standard: StandardContract) -> tuple[DomainError, ...]:
+    """Structural guard: a global contract must resolve at least one command and
+    every command must be a deterministic, non-empty argv array. Malformed
+    definitions surface here as clear project configuration errors."""
+    errors: list[DomainError] = []
+    if not standard.commands:
+        errors.append(_error(
+            "contract.commands_missing",
+            "Project global contract must define at least one verification command.",
+            "contract.yaml:commands",
+        ))
+    for command in standard.commands:
+        if not command.argv:
+            errors.append(_error(
+                "contract.command_argv_empty",
+                f"Contract command {command.name!r} has an empty argv array.",
+                f"contract.yaml:commands.{command.name}",
+            ))
+    return tuple(errors)
+
+
+def _global_command_check(command: ProjectCommand) -> ResolvedCheck:
+    return ResolvedCheck(
+        id=command.name,
+        source="standard",
+        runner="command",
+        argv=command.argv,
+        working_directory=command.working_directory,
+        timeout_seconds=command.timeout_seconds,
+        expect=CheckExpectation(exit_code=command.expect.exit_code),
+    )
+
+
 def compile_task_execution_contract(
     *,
     project_root: Path,
@@ -109,6 +240,13 @@ def compile_task_execution_contract(
     task: Task,
     transition: TransitionDefinition,
 ) -> ExecutionContractResult:
+    """LEGACY: compile an execution contract from a per-task LLM-authored
+    ImplementationContract artifact.
+
+    Retained only so historical per-task artifacts remain readable/migratable.
+    It is not used by new runs: implementation tasks schedule directly under the
+    project global command contract and never require such an artifact.
+    """
     parsed = validate_task_implementation_contract(project_root, task)
     if not parsed.accepted or parsed.contract is None:
         return ExecutionContractResult(errors=parsed.errors)
@@ -139,10 +277,10 @@ def compile_task_execution_contract(
     repository = capture_repository_snapshot(repo_root)
     if not repository.accepted or repository.snapshot is None:
         return ExecutionContractResult(errors=repository.errors)
+
     checks, check_errors = _resolve_checks(project_root, parsed.contract, transition)
     if check_errors:
         return ExecutionContractResult(errors=check_errors)
-
     excerpts, excerpt_errors = _freeze_context_excerpts(project_root, task, parsed.contract.context_excerpts)
     if excerpt_errors:
         return ExecutionContractResult(errors=excerpt_errors)
@@ -216,10 +354,17 @@ def load_job_execution_contract(
         ),))
 
     try:
-        assert isinstance(prompt_compiler_version, int)
         source_task = _task_from_dict(_mapping(payload.get("source"), "source").get("task"))
         transition = _transition_from_dict(payload.get("transition"))
-        generated = _implementation_contract_from_dict(payload.get("generated_contract"))
+        generated_payload = _mapping(payload.get("generated_contract"), "generated_contract")
+        if generated_payload.get("schema") == GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA:
+            generated = _global_draft_from_dict(generated_payload)
+            artifact_path = str(generated_payload.get("artifact_path", ""))
+            artifact_hash = str(generated_payload.get("artifact_sha256", ""))
+        else:
+            generated = _implementation_contract_from_dict(generated_payload)
+            artifact_path = _required_string(generated_payload, "artifact_path")
+            artifact_hash = _required_string(generated_payload, "artifact_sha256")
         repository = _mapping(payload.get("repository"), "repository")
         facts = _repository_facts_from_dict(repository.get("facts"))
         baseline = _baseline_manifest_from_dict(repository.get("baseline_manifest"))
@@ -227,14 +372,6 @@ def load_job_execution_contract(
         context_excerpts = _context_excerpts_from_list(
             payload.get("context_excerpts", ()),
             legacy_missing_reason=prompt_compiler_version == 1,
-        )
-        artifact_path = _required_string(
-            _mapping(payload.get("generated_contract"), "generated_contract"),
-            "artifact_path",
-        )
-        artifact_hash = _required_string(
-            _mapping(payload.get("generated_contract"), "generated_contract"),
-            "artifact_sha256",
         )
     except (TypeError, ValueError, KeyError) as exc:
         return ExecutionContractResult(errors=(_error(
@@ -310,46 +447,13 @@ def _resolve_checks(
     contract: ImplementationContractDraft,
     transition: TransitionDefinition,
 ) -> tuple[tuple[ResolvedCheck, ...], tuple[DomainError, ...]]:
+    """LEGACY resolver: focus checks from a per-task artifact and the transition's
+    validations. The global command path uses :func:`_global_command_check`
+    instead and never consults acceptance profiles, invariants, or file surfaces."""
     checks: dict[str, ResolvedCheck] = {}
     errors: list[DomainError] = []
     for check in contract.focused_checks:
         checks[check.id] = _focused_check(check)
-
-    profiles = load_acceptance_profiles(project_root)
-    if not profiles.accepted or profiles.profiles is None:
-        return (), profiles.errors
-    for profile_id in contract.acceptance_profiles:
-        profile = profiles.profiles.get(profile_id)
-        if profile is None:
-            errors.append(_error(
-                "execution_contract.acceptance_profile_unknown",
-                f"Contract selects unknown acceptance profile: {profile_id}",
-                profile_id,
-            ))
-            continue
-        if profile_id in checks:
-            errors.append(_error(
-                "execution_contract.check_conflict",
-                f"Acceptance profile id conflicts with a focused check: {profile_id}",
-                profile_id,
-            ))
-            continue
-        checks[profile_id] = ResolvedCheck(
-            id=profile.id,
-            source="acceptance_profile",
-            runner="command",
-            argv=profile.argv,
-            working_directory=profile.working_directory,
-            timeout_seconds=profile.timeout_seconds,
-            expect=profile.expect,
-        )
-
-    _validate_vertical_slice_policy(
-        contract,
-        profiles.profiles,
-        profiles.require_vertical_slice,
-        errors,
-    )
 
     transition_calls: dict[str, ValidationCallDefinition] = {}
     for call in transition.requires.validations:
@@ -385,57 +489,10 @@ def _resolve_checks(
             validation_type=resolved.validation_type,
             validation_args=resolved.validation_args,
         )
-
-    for invariant in contract.invariants:
-        if invariant not in transition_calls:
-            errors.append(_error(
-                "execution_contract.invariant_unknown",
-                f"Contract selects unknown project invariant: {invariant}",
-                invariant,
-            ))
     return (
         tuple(checks[key] for key in sorted(checks)),
         tuple(errors),
     )
-
-
-def _validate_vertical_slice_policy(
-    contract: ImplementationContractDraft,
-    profiles: Mapping[str, AcceptanceProfile],
-    require_vertical_slice: bool,
-    errors: list[DomainError],
-) -> None:
-    """Enforce vertical-slice evidence for product-facing implementation work."""
-    selected = [
-        profiles[profile_id]
-        for profile_id in contract.acceptance_profiles
-        if profile_id in profiles
-    ]
-    has_vertical_slice = any(profile.kind == "vertical_slice" for profile in selected)
-    if contract.profile not in PRODUCT_FACING_CONTRACT_PROFILES:
-        if contract.vertical_slice_exemption is not None:
-            errors.append(_error(
-                "execution_contract.vertical_slice_exemption_unneeded",
-                "Only product-facing contracts may declare a vertical-slice exemption.",
-                "checks.vertical_slice_exemption",
-            ))
-        return
-    if has_vertical_slice and contract.vertical_slice_exemption is not None:
-        errors.append(_error(
-            "execution_contract.vertical_slice_exemption_conflict",
-            "Select a vertical-slice profile or record an exemption, not both.",
-            "checks.vertical_slice_exemption",
-        ))
-    elif (
-        require_vertical_slice
-        and not has_vertical_slice
-        and contract.vertical_slice_exemption is None
-    ):
-        errors.append(_error(
-            "execution_contract.vertical_slice_required",
-            "Product-facing contracts require a selected vertical-slice acceptance profile or an explicit exemption.",
-            "checks.profiles",
-        ))
 
 
 def _focused_check(check: ContractCheck) -> ResolvedCheck:
@@ -449,8 +506,12 @@ def _focused_check(check: ContractCheck) -> ResolvedCheck:
     )
 
 
-def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple[FrozenContextExcerpt, ...], tuple[DomainError, ...]]:
-    frozen: list[FrozenContextExcerpt] = []
+CONTEXT_EXCERPT_CHARACTER_LIMIT = 1_200
+CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT = 2_000
+
+
+def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple, tuple[DomainError, ...]]:
+    frozen: list = []
     errors: list[DomainError] = []
     total_characters = 0
     for selection in selections:
@@ -683,8 +744,37 @@ def _implementation_contract_to_dict(
     }
 
 
+def _global_draft_from_dict(raw: object) -> ImplementationContractDraft:
+    payload = _mapping(raw, "generated_contract")
+    source = _mapping(payload.get("source"), "source")
+    surface_payload = _mapping(payload.get("change_surface"), "change_surface")
+    checks_payload = _mapping(payload.get("checks"), "checks")
+    return ImplementationContractDraft(
+        schema=_required_string(payload, "schema"),
+        source_task_id=_required_string(source, "task_id"),
+        source_intent_sha256=_required_string(source, "source_intent_sha256"),
+        profile=_required_string(payload, "profile"),
+        objective=_required_string(payload, "objective"),
+        change_surface=ChangeSurface(
+            add=_string_tuple(surface_payload.get("add")),
+            edit=_string_tuple(surface_payload.get("edit")),
+            forbidden=_string_tuple(surface_payload.get("forbidden")),
+            max_files=_optional_int_value(surface_payload.get("max_files")),
+            max_changed_lines=_optional_int_value(surface_payload.get("max_changed_lines")),
+        ),
+        requirements=_string_tuple(payload.get("requirements")),
+        focused_checks=(),
+        invariants=_string_tuple(checks_payload.get("invariants")),
+        acceptance_profiles=_string_tuple(checks_payload.get("profiles")),
+        vertical_slice_exemption=_optional_string_value(checks_payload.get("vertical_slice_exemption")),
+        interfaces=(),
+        failure_behavior=_string_tuple(payload.get("failure_behavior")),
+        non_goals=_string_tuple(payload.get("non_goals")),
+        context_excerpts=(),
+    )
+
+
 def _implementation_contract_from_dict(raw: object) -> ImplementationContractDraft:
-    # Reuse the public parser so frozen contracts follow the same v1 schema.
     payload = _mapping(raw, "generated_contract")
     contract_payload = {
         key: value
@@ -943,10 +1033,10 @@ def _context_excerpts_from_list(
     raw: object,
     *,
     legacy_missing_reason: bool = False,
-) -> tuple[FrozenContextExcerpt, ...]:
+) -> tuple:
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise ValueError("context_excerpts must be a list")
-    excerpts: list[FrozenContextExcerpt] = []
+    excerpts = []
     for item in raw:
         payload = _mapping(item, "context_excerpts[]")
         text = _required_string(payload, "text")
@@ -990,6 +1080,22 @@ def _string_tuple(raw: object) -> tuple[str, ...]:
     if any(not value for value in values):
         raise ValueError("list values must be non-empty strings")
     return values
+
+
+def _optional_int_value(raw: object) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError("value must be an integer or null")
+    return raw
+
+
+def _optional_string_value(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw or None
+    raise ValueError("value must be a string or null")
 
 
 def _json_value(raw: object) -> object:

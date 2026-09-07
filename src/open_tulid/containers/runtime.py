@@ -85,6 +85,11 @@ def request_for_worker(
         worker_mounts = (*worker_mounts, *debug_mounts)
         merged_env = {**debug_env, **merged_env}
         container_user = _host_container_user()
+    elif worker_id == "local_llm":
+        # Local LLM images write directly into the bind-mounted workspace.
+        # Run them as the host owner so deterministic host-side verification
+        # can safely replace dependency trees (for example `npm ci`).
+        container_user = _host_container_user()
     return AgentRunRequest(
         agent_id=worker_id,
         image=image,

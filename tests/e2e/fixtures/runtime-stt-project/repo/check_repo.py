@@ -21,6 +21,10 @@ def main() -> int:
             print(str(exc), file=sys.stderr)
             return 1
         return 0
+    if mode == "vertical":
+        import app
+
+        return 0 if app.healthz() == "ok" else 1
     print(f"unknown mode: {mode}", file=sys.stderr)
     return 2
 

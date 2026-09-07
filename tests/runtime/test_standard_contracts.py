@@ -1,0 +1,516 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import MappingProxyType
+
+from open_tulid.domain import RequirementDefinition, Task, TransitionDefinition
+from open_tulid.runtime.execution_contracts import compile_standard_execution_contract
+from open_tulid.runtime.executor import (
+    _project_standard_runtime,
+    _write_opencode_model_config_if_needed,
+)
+from open_tulid.runtime.standard_contracts import (
+    STANDARD_CONTRACT_FILENAME,
+    load_standard_contract,
+    standard_contract_configured,
+)
+from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
+from open_tulid.vault.validator import validate_project
+from open_tulid.models import Project
+
+
+CONTRACT = """\
+schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: ".open-tulid/home"
+commands:
+  - name: tests
+    argv: [python, check_verify.py, tests]
+    working_directory: .
+    timeout_seconds: 300
+    expect:
+      exit_code: 0
+  - name: build
+    argv: [python, check_verify.py, build]
+    working_directory: backend
+    timeout_seconds: 120
+    expect:
+      exit_code: 0
+retry:
+  max_attempts: 3
+  visible_feedback: true
+"""
+
+
+def _contract(project_root: Path, text: str = CONTRACT) -> Path:
+    path = project_root / STANDARD_CONTRACT_FILENAME
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _transition():
+    return TransitionDefinition(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        to_state="SelfReview",
+        worker="qwen",
+        requires=RequirementDefinition(changed_files_required=True),
+        transaction=None,
+    )
+
+
+def _repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "app.js").write_text("module.exports = () => 'pending';\n", encoding="utf-8")
+    (repo / "backend").mkdir()
+    script = "import sys\nprint('verifying ' + sys.argv[1])\nraise SystemExit(0)\n"
+    (repo / "check_verify.py").write_text(script, encoding="utf-8")
+    (repo / "backend" / "check_verify.py").write_text(script, encoding="utf-8")
+    return repo
+
+
+def test_command_only_contract_loads_and_configured_flag(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+
+    assert standard_contract_configured(project_root) is True
+    loaded = load_standard_contract(project_root)
+
+    assert loaded.accepted is True
+    assert loaded.contract is not None
+    assert loaded.contract.schema == "tulid.contract/v1"
+    assert loaded.contract.runtime.container_user == "1000:1000"
+    assert loaded.contract.runtime.opencode_config_home == ".open-tulid/home"
+    assert len(loaded.contract.commands) == 2
+    tests = loaded.contract.commands[0]
+    assert tests.name == "tests"
+    assert tests.argv == ("python", "check_verify.py", "tests")
+    assert tests.working_directory == "."
+    assert tests.timeout_seconds == 300
+    assert tests.expect.exit_code == 0
+    build = loaded.contract.commands[1]
+    assert build.working_directory == "backend"
+    assert build.timeout_seconds == 120
+    assert loaded.contract.retry.max_attempts == 3
+
+
+def test_malformed_and_empty_argv_rejected(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+
+    _contract(project_root, """schema: tulid.contract/v1
+commands:
+  - name: empty_cmd
+    argv: []
+""")
+    empty = load_standard_contract(project_root)
+    assert empty.accepted is False
+    assert any(error.code == "contract.command_argv_empty" for error in empty.errors)
+
+    _contract(project_root, """schema: tulid.contract/v1
+commands:
+  - name: bad_cmd
+    argv: npm test
+""")
+    malformed = load_standard_contract(project_root)
+    assert malformed.accepted is False
+    assert any(error.code == "contract.command_argv_invalid" for error in malformed.errors)
+
+
+def test_command_only_contract_invalid_yaml_and_unknown_fields_rejected(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root, "schema: tulid.contract/v1\ncommands: nonsense\n")
+    loaded = load_standard_contract(project_root)
+    assert loaded.accepted is False
+    assert any(error.code == "contract.commands_invalid" for error in loaded.errors)
+
+    _contract(project_root, """schema: tulid.contract/v1
+baseline:
+  change_surfaces: [src]
+commands: []
+""")
+    unknown = load_standard_contract(project_root)
+    assert unknown.accepted is False
+    assert any(error.code == "contract.unknown_field" for error in unknown.errors)
+
+
+def test_global_e2e_verifier_runs_commands_in_configured_dir_with_exit_expectation(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    task = Task(
+        id="task-1",
+        title="Add health",
+        path="tasks/task-1.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Add a deterministic health endpoint.",
+    )
+    repo = _repo(tmp_path)
+    transition = _transition()
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=transition,
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    assert compiled.contract is not None
+    assert [check.id for check in compiled.contract.resolved_checks] == ["build", "tests"]
+    build_check = compiled.contract.resolved_checks[0]
+    assert build_check.argv == ("python", "check_verify.py", "build")
+    assert build_check.working_directory == "backend"
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(changed_files=("src/app.js",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is True
+    assert result.report is not None
+    assert [check.status for check in result.report.checks] == ["passed", "passed"]
+    # exit status captured as verification evidence
+    assert all(check.exit_code == 0 for check in result.report.checks)
+    assert all(check.stdout for check in result.report.checks)
+
+
+def test_global_verifier_captures_stdout_stderr_and_rejects_nonzero_exit(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root, """schema: tulid.contract/v1
+commands:
+  - name: failing
+    argv: [node, -e, "console.error('boom'); process.exit(3);"]
+    working_directory: .
+    timeout_seconds: 60
+""")
+    task = Task(
+        id="task-1",
+        title="Add health",
+        path="tasks/task-1.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Add a deterministic health endpoint.",
+    )
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=_transition(),
+    )
+    assert compiled.contract is not None
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=_transition(),
+        submission=CompletionSubmission(changed_files=("src/app.js",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is False
+    assert result.report is not None
+    assert result.report.checks[0].status == "failed"
+    assert result.report.checks[0].exit_code == 3
+    assert "boom" in result.report.checks[0].stderr
+    # actionable feedback includes the command, its exit code, and captured output
+    message = "; ".join(error.message for error in result.errors)
+    assert "failing" in message
+    assert "exit code 3 (expected 0)" in message
+    assert "boom" in message
+
+
+def test_global_verifier_reports_command_not_found_and_timeout(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root, """schema: tulid.contract/v1
+commands:
+  - name: missing_binary
+    argv: [definitely_not_a_real_binary_xyz, --flag]
+    working_directory: .
+    timeout_seconds: 30
+""")
+    task = Task(
+        id="task-1", title="x", path="tasks/task-1.md",
+        current_state="Todo", task_type="ImplementationTask", body="x",
+    )
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=_transition(),
+    )
+    assert compiled.contract is not None
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=_transition(),
+        submission=CompletionSubmission(changed_files=("src/app.js",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is False
+    assert {error.code for error in result.errors} == {"verification.check_environment"}
+    message = "; ".join(error.message for error in result.errors)
+    assert "missing_binary" in message
+
+
+def test_verifier_allows_worker_to_add_previously_unknown_file_and_directory(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    task = Task(
+        id="task-1",
+        title="Add research",
+        path="tasks/task-1.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Add a research/ directory with notes.",
+    )
+    repo = _repo(tmp_path)
+    transition = _transition()
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=transition,
+    )
+    assert compiled.contract is not None
+    # The worker legitimately creates research/notes.md that was absent from the
+    # baseline. This must NOT be rejected merely because it was unpredicted.
+    (repo / "research").mkdir()
+    (repo / "research" / "notes.md").write_text("# Plan\n", encoding="utf-8")
+
+    result = DeterministicVerifier().verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(changed_files=("research/notes.md",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is True
+    assert result.report is not None
+    assert all(check.status == "passed" for check in result.report.checks)
+    assert {error.code for error in result.errors} == set()
+
+
+def test_every_implementation_task_inherits_the_same_global_commands(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    repo = _repo(tmp_path)
+    transition = _transition()
+
+    tasks = (
+        Task(
+            id="task-1", title="Add health", path="tasks/task-1.md",
+            current_state="Todo", task_type="ImplementationTask",
+            body="Add a deterministic health endpoint.",
+        ),
+        Task(
+            id="task-2", title="Refactor build", path="tasks/task-2.md",
+            current_state="Todo", task_type="ImplementationTask",
+            body="Refactor the build pipeline in a separate boundary.",
+        ),
+    )
+
+    compiled = [
+        compile_standard_execution_contract(
+            project_root=project_root, repo_root=repo, task=task, transition=transition,
+        )
+        for task in tasks
+    ]
+
+    assert all(result.accepted for result in compiled)
+    contracts = [result.contract for result in compiled]
+    assert all(contract is not None for contract in contracts)
+    # No per-task commands exist: every implementation task resolves the exact
+    # same project global command set, independent of its body or scope.
+    command_sets = {tuple(check.id for check in contract.resolved_checks) for contract in contracts}
+    argv_sets = {tuple(check.argv for check in contract.resolved_checks) for contract in contracts}
+    assert command_sets == {("build", "tests")}
+    assert argv_sets == {(
+        ("python", "check_verify.py", "build"),
+        ("python", "check_verify.py", "tests"),
+    )}
+
+
+def test_task_added_tests_are_picked_up_by_the_global_suite(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    script = (
+        "import subprocess, sys, pathlib\n"
+        "tests = sorted(pathlib.Path('tests').glob('test_*.py'))\n"
+        "if not tests:\n    raise SystemExit(1)\n"
+        "for path in tests:\n"
+        "    subprocess.run([sys.executable, str(path)], check=True)\n"
+        "print(f'ran {len(tests)} tests')\n"
+    )
+    # A true global test command: it runs every test_*.py file under tests/.
+    _contract(project_root, """schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: .open-tulid/home
+commands:
+  - name: project_tests
+    argv: [python, run_tests.py]
+    working_directory: .
+    timeout_seconds: 300
+retry:
+  max_attempts: 3
+  visible_feedback: true
+""")
+    (project_root / "run_tests.py").write_text(script, encoding="utf-8")
+    (project_root / "tests").mkdir()
+    (project_root / "tests" / "test_base.py").write_text(
+        "def test_base():\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    task = Task(
+        id="task-1", title="Add evidence cards", path="tasks/task-1.md",
+        current_state="Todo", task_type="ImplementationTask",
+        body="Add evidence card extraction.",
+    )
+    transition = _transition()
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=project_root, task=task, transition=transition,
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    assert compiled.contract is not None
+
+    # The task adds a new test file as ordinary work; it is NOT a separate
+    # per-task validation command, yet the global suite picks it up.
+    (project_root / "tests" / "test_evidence.py").write_text(
+        "def test_evidence():\n    assert len('card') > 0\n",
+        encoding="utf-8",
+    )
+
+    result = DeterministicVerifier().verify(
+        workspace=project_root,
+        transition=transition,
+        submission=CompletionSubmission(changed_files=("tests/test_evidence.py",)),
+        execution_contract=compiled.contract,
+    )
+
+    assert result.accepted is True
+    assert result.report is not None
+    assert [check.status for check in result.report.checks] == ["passed"]
+    assert "ran 2 tests" in result.report.checks[0].stdout
+
+
+def test_legacy_per_task_artifact_remains_readable_but_new_run_uses_global_commands(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    task = Task(
+        id="task-1",
+        title="Add health",
+        path="tasks/task-1.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Add a deterministic health endpoint.",
+    )
+    # A legacy per-task ImplementationContract artifact may still exist for
+    # history; it is readable but must NOT govern a new run.
+    relative = Path("artifacts/task-1/ImplementationContract/implementation-contract.yaml")
+    legacy = project_root / relative
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        "schema: tulid.implementation/v1\n"
+        "source:\n"
+        f"  task_id: \"{task.id}\"\n"
+        f"  source_intent_sha256: \"{'a' * 64}\"\n"
+        "profile: code_change\n"
+        "objective: x\n"
+        "change_surface:\n  add: []\n  edit: [src/app.py]\n  forbidden: []\n"
+        "checks:\n  focused: []\n  invariants: []\n",
+        encoding="utf-8",
+    )
+    task = Task(
+        id="task-1", title="Add health", path="tasks/task-1.md",
+        current_state="Todo", task_type="ImplementationTask",
+        body="Add a deterministic health endpoint.",
+        artifact_links=(relative.as_posix(),),
+    )
+    repo = _repo(tmp_path)
+    transition = _transition()
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=repo, task=task, transition=transition,
+    )
+    assert compiled.accepted is True
+    assert compiled.contract is not None
+    # The new run governs by the global commands, not the legacy file surface.
+    assert [check.id for check in compiled.contract.resolved_checks] == ["build", "tests"]
+    assert compiled.contract.generated_contract.schema == "tulid.global_contract/v1"
+
+
+def test_executor_resolves_standard_runtime_and_places_opencode_config_off_root(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+
+    _Config = type("_Config", (), {"project_root": project_root})
+    _Adapter = type("_Adapter", (), {"config": _Config()})
+
+    discovered = _project_standard_runtime(_Adapter())
+    assert discovered.container_user == "1000:1000"
+    assert discovered.opencode_config_home == ".open-tulid/home"
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = _write_opencode_model_config_if_needed(
+        workspace=workspace,
+        runtime=type("Runtime", (), {
+            "container_workspace": "/workspace/project",
+            "worker_types": {"qwen_27b": "opencode"},
+        })(),
+        worker_id="qwen_27b",
+        implementation_id="qwen_27b",
+        args=("run", "--model", "tulid-qwen/Qwen3.6-27B-MTP-UD-Q6_K_XL.gguf"),
+        env={
+            "OPEN_TULID_MODEL_ENDPOINT": "http://127.0.0.1:8787",
+            "OPEN_TULID_MODEL_PROXY_ID": "qwen",
+            "OPEN_TULID_MODEL_SESSION_TOKEN": "secret",
+        },
+        opencode_config_home=discovered.opencode_config_home,
+    )
+
+    assert not (workspace / "opencode.json").exists()
+    assert config_path == "/workspace/project/.open-tulid/home/.config/opencode/opencode.json"
+    assert (workspace / ".open-tulid" / "home" / ".config" / "opencode" / "opencode.json").is_file()
+
+
+def test_wealthy_scholar_node_command_only_contract_validates(tmp_path):
+    # Wealthy Scholar is a Node-based project: backend tests and a project build,
+    # never Python pytest. This is the project's real command-only global config.
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root, """schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: .open-tulid/home
+commands:
+  - name: backend_tests
+    argv: [npm, test, --prefix, backend]
+    working_directory: .
+    timeout_seconds: 300
+    expect:
+      exit_code: 0
+  - name: project_build
+    argv: [npm, run, build]
+    working_directory: .
+    timeout_seconds: 300
+    expect:
+      exit_code: 0
+retry:
+  max_attempts: 3
+  visible_feedback: true
+""")
+    for name in ["kanban", "docs", "tasks", "agents"]:
+        (project_root / name).mkdir()
+    (project_root / "workflow.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+
+    report = validate_project(Project(name="Agent", path=project_root))
+
+    assert report.passed is True
+    assert not any("contract" in error.message for error in report.errors)

@@ -1,0 +1,20 @@
+schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: .open-tulid/home
+commands:
+  - name: build
+    argv: [python, check_repo.py, build]
+    working_directory: .
+    timeout_seconds: 120
+    expect:
+      exit_code: 0
+  - name: tests
+    argv: [python, check_repo.py, tests]
+    working_directory: .
+    timeout_seconds: 120
+    expect:
+      exit_code: 0
+retry:
+  max_attempts: 3
+  visible_feedback: true

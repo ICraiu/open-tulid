@@ -713,11 +713,13 @@ def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
         }),
     )
     adapter = DeriveAdapter(_task())
+    artifact_root = tmp_path / "artifacts"
     service = CompletionService(
         workflow=workflow,
         adapter=adapter,
         job_store=store,
         event_store=JsonlEventStore(tmp_path / "events"),
+        artifact_root=artifact_root,
     )
 
     result = service.submit(
@@ -737,6 +739,8 @@ def test_completion_derives_child_tasks_and_links_parent(tmp_path: Path):
     assert [task.id for task in adapter.created] == ["1", "2"]
     assert adapter.created[0].parent_id == TASK_ID
     assert adapter.created[1].dependencies == ("1",)
+    assert adapter.created[0].artifact_links == ("artifacts/01J00000000000000000000001/child_task/one.md",)
+    assert adapter.created[1].artifact_links == ("artifacts/01J00000000000000000000001/child_task/two.md",)
     assert adapter.written_parent is not None
     assert "## Derived tasks" in adapter.written_parent.body
     assert [event.event_type for event in JsonlEventStore(tmp_path / "events").iter_events()].count("TaskDerived") == 2

@@ -79,18 +79,19 @@ class TestProjectCreation:
         assert review_answers.derives.required is False
         assert review_answers.derives.parent_to_if_derived == "Done"
         assert "ReadyToImplement" in loaded_workflow.definition.states
-        prepare = loaded_workflow.definition.transitions["PrepareExecutionContract"]
-        assert prepare.from_state == "Todo"
-        assert prepare.to_state == "ReadyToImplement"
-        assert prepare.worker == "codex_contract"
-        assert prepare.requires.artifacts == ("ImplementationContract",)
-        assert [call.type for call in prepare.requires.validations] == [
-            "implementation_contract_valid",
-        ]
-        assert loaded_workflow.definition.transitions["ImplementTask"].from_state == "ReadyToImplement"
+        # The per-task PrepareExecutionContract workflow is gone; Todo tasks go
+        # straight to implementation under the project global contract.
+        assert "PrepareExecutionContract" not in loaded_workflow.definition.transitions
+        assert "InvalidateExecutionContract" not in loaded_workflow.definition.transitions
+        assert loaded_workflow.definition.transitions["ImplementTask"].from_state == "Todo"
+        assert loaded_workflow.definition.transitions["ImplementTask"].to_state == "SelfReview"
         assert loaded_workflow.definition.transitions["ImplementTask"].worker == "peon-llm"
         assert loaded_workflow.definition.transitions["ImplementTask"].requires.validations == ()
         assert loaded_workflow.definition.transitions["ImplementTask"].requires.changed_files_required is True
+        assert (
+            loaded_workflow.definition.transitions["ImplementFromReadyToImplement"].from_state
+            == "ReadyToImplement"
+        )
         assert loaded_workflow.definition.transitions["SelfReview"].requires.validations == ()
         assert loaded_workflow.definition.transitions["SelfReview"].worker == "peon-llm"
         assert loaded_workflow.definition.transitions["SelfReview"].requires.changed_files_required is False
@@ -114,9 +115,14 @@ class TestProjectCreation:
         assert "STT" not in agent_text
         assert "repository files" in agent_text
         assert agent_text.count("## Validation Failure Policy") == 0
-        assert "Edit or create a Markdown file only when it is inside the allowed change surface" in agent_text
-        assert "The user may structure the task in any way." in agent_text
-        assert "output/implementation-contract.yaml" in agent_text
+        # No per-task LLM contract-authoring agent is scaffolded anymore; the
+        # project global command contract in contract.yaml is authoritative.
+        assert "execution-contract-authoring" not in agent_text
+        assert "output/implementation-contract.yaml" not in agent_text
+        assert (tmp_vault / "Engine" / "contract.yaml").is_file()
+        assert "<!-- open-tulid:canonical-question-round-answers=v1 -->" in (
+            tmp_vault / "Engine" / "agents" / "answers-review.agent.md"
+        ).read_text(encoding="utf-8")
 
     def test_project_fails_when_exists(self, valid_config: Config):
         create_project(valid_config, "Engine")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from open_tulid.adapters.base import AdapterCapability, LoadProjectResult, ReadTaskResult, WriteResult
+from open_tulid.containers.runtime import AgentRunResult
 from open_tulid.domain import (
     BoardPosition,
     DomainError,
@@ -18,24 +20,32 @@ from open_tulid.domain import (
     Task,
     TaskTypeDefinition,
     TransitionDefinition,
+    ValidationCallDefinition,
     WorkflowDefinition,
 )
-from open_tulid.models import ResourceConfig
+from open_tulid.models import ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import (
     FileExecutionJobStore,
     FileResourceLeaseStore,
+    JobExecutor,
     JsonlEventStore,
     Scheduler,
     TransactionJournalStore,
     recover_job_creation_transactions,
 )
+from open_tulid.runtime.observability import WorkerObservability
 from open_tulid.runtime.execution_contracts import (
+    GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA,
+    compile_standard_execution_contract,
     compile_task_execution_contract,
     execution_contract_to_dict,
     load_job_execution_contract,
 )
 from open_tulid.runtime.prompts import compile_execution_prompt
-from open_tulid.runtime.task_contracts import task_source_intent_sha256
+from open_tulid.runtime.task_contracts import (
+    parse_implementation_contract,
+    task_source_intent_sha256,
+)
 
 
 TASK_ID = "01J00000000000000000000001"
@@ -127,74 +137,81 @@ def _workflow(*, ambiguous: bool = False, review: bool = False) -> WorkflowDefin
     )
 
 
-def _contract_workflow() -> WorkflowDefinition:
+def _global_contract_workflow(*, review: bool = False) -> WorkflowDefinition:
+    transitions = {
+        "implement": TransitionDefinition(
+            id="implement",
+            task_type="ImplementationTask",
+            from_state="Todo",
+            to_state="SelfReview",
+            worker="qwen",
+            requires=RequirementDefinition(changed_files_required=True),
+            transaction=None,
+            default_for_scheduler=True,
+        ),
+        "invalidate_review": TransitionDefinition(
+            id="invalidate_review",
+            task_type="ImplementationTask",
+            from_state="SelfReview",
+            to_state="Todo",
+            worker=None,
+            requires=RequirementDefinition(),
+            transaction=None,
+        ),
+    }
+    if review:
+        transitions["review"] = TransitionDefinition(
+            id="review",
+            task_type="ImplementationTask",
+            from_state="SelfReview",
+            to_state="Done",
+            worker="qwen",
+            requires=RequirementDefinition(),
+            transaction=None,
+            default_for_scheduler=True,
+        )
     return WorkflowDefinition(
         schema_version=1,
         states=MappingProxyType({
             "Todo": StateDefinition(id="Todo"),
-            "ReadyToImplement": StateDefinition(id="ReadyToImplement"),
             "SelfReview": StateDefinition(id="SelfReview"),
+            "Done": StateDefinition(id="Done"),
         }),
         task_types=MappingProxyType({
-            "task": TaskTypeDefinition(
-                id="task",
-                requirements_by_state=MappingProxyType({
-                    "ReadyToImplement": RequirementDefinition(
-                        artifacts=("ImplementationContract",),
-                    ),
-                    "SelfReview": RequirementDefinition(
-                        artifacts=("ImplementationContract",),
-                    ),
-                }),
+            "ImplementationTask": TaskTypeDefinition(
+                id="ImplementationTask",
+                requirements_by_state=MappingProxyType({}),
             ),
         }),
         artifact_types=MappingProxyType({}),
         validation_types=MappingProxyType({}),
         operation_types=MappingProxyType({}),
         workers=MappingProxyType({}),
-        transitions=MappingProxyType({
-            "prepare": TransitionDefinition(
-                id="prepare",
-                task_type="task",
-                from_state="Todo",
-                to_state="ReadyToImplement",
-                worker="codex",
-                requires=RequirementDefinition(
-                    artifacts=("ImplementationContract",),
-                ),
-                transaction=None,
-                default_for_scheduler=True,
-            ),
-            "implement": TransitionDefinition(
-                id="implement",
-                task_type="task",
-                from_state="ReadyToImplement",
-                to_state="SelfReview",
-                worker="qwen",
-                requires=RequirementDefinition(),
-                transaction=None,
-                default_for_scheduler=True,
-            ),
-            "invalidate": TransitionDefinition(
-                id="invalidate",
-                task_type="task",
-                from_state="ReadyToImplement",
-                to_state="Todo",
-                worker=None,
-                requires=RequirementDefinition(),
-                transaction=None,
-            ),
-            "invalidate_review": TransitionDefinition(
-                id="invalidate_review",
-                task_type="task",
-                from_state="SelfReview",
-                to_state="Todo",
-                worker=None,
-                requires=RequirementDefinition(),
-                transaction=None,
-            ),
-        }),
+        transitions=MappingProxyType(transitions),
     )
+
+
+def _write_global_contract(project_root: Path) -> Path:
+    path = project_root / "contract.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """\
+schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: .open-tulid/home
+commands:
+  - name: tests
+    argv: [python, check_repo.py, tests]
+    working_directory: .
+    timeout_seconds: 300
+retry:
+  max_attempts: 3
+  visible_feedback: true
+""",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _write_contract(project_root: Path, task: Task, *, source_hash: str) -> Task:
@@ -385,23 +402,19 @@ def test_scheduler_creates_first_runnable_job_in_board_order(tmp_path: Path):
     assert [skip.code for skip in result.skipped] == ["task.dependency_missing"]
 
 
-def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: Path):
+def test_todo_implementation_task_schedules_directly_with_global_contract(tmp_path: Path):
     project_root = tmp_path / "project"
+    _write_global_contract(project_root)
     task = Task(
         id=TASK_ID,
         title="Free-form implementation request",
         path="tasks/request.md",
-        current_state="ReadyToImplement",
-        task_type="task",
+        current_state="Todo",
+        task_type="ImplementationTask",
         body="Please add healthz in whatever structure is appropriate.",
     )
-    task = _write_contract(
-        project_root,
-        task,
-        source_hash=task_source_intent_sha256(task),
-    )
     scheduler = Scheduler(
-        workflow=_contract_workflow(),
+        workflow=_global_contract_workflow(),
         adapter=FakeAdapter(_snapshot(task)),
         job_store=FileExecutionJobStore(tmp_path / "jobs"),
         workspace_root=tmp_path / "workspaces",
@@ -410,6 +423,9 @@ def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: P
 
     result = scheduler.schedule_one("Agent")
 
+    # A Todo ImplementationTask schedules straight to the implementation worker
+    # under the project global contract — no per-task contract, no LLM
+    # contract-authoring step.
     assert result.accepted is True
     assert result.scheduled is True
     assert result.transition_id == "implement"
@@ -419,68 +435,94 @@ def test_scheduler_schedules_qwen_when_generated_contract_is_current(tmp_path: P
     assert result.job.metadata["execution_contract"]["source"]["task"]["body"] == (
         "Please add healthz in whatever structure is appropriate."
     )
-    assert result.events[0].data["execution_contract_sha256"] == (
-        result.job.metadata["execution_contract_sha256"]
-    )
+    # The frozen contract is the project-global contract.
     frozen = load_job_execution_contract(result.job, required=True)
     assert frozen.contract is not None
+    assert frozen.contract.generated_contract.schema == GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA
+    # The task body directly describes the work to the worker.
+    assert "Please add healthz" in result.job.metadata["prompt_packet"]
     preview = compile_execution_prompt(frozen.contract)
     assert preview.text == result.job.metadata["prompt_packet"]
     assert preview.manifest.packet_sha256 == result.job.metadata["prompt_packet_sha256"]
 
-    contract_path = project_root / task.artifact_links[0]
-    contract_path.write_text(
-        contract_path.read_text(encoding="utf-8").replace(
-            "Add a health endpoint.",
-            "Mutated live objective.",
-        ),
-        encoding="utf-8",
+
+def test_todo_implementation_task_creates_no_contract_author_job(tmp_path: Path):
+    project_root = tmp_path / "project"
+    _write_global_contract(project_root)
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Please add healthz in whatever structure is appropriate.",
     )
-    historical = compile_execution_prompt(
-        load_job_execution_contract(result.job, required=True).contract
+    adapter = FakeAdapter(_snapshot(task))
+    event_store = JsonlEventStore(project_root / "events")
+    scheduler = Scheduler(
+        workflow=_global_contract_workflow(),
+        adapter=adapter,
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        event_store=event_store,
+        project_root=project_root,
     )
-    assert historical.text == result.job.metadata["prompt_packet"]
-    assert "Mutated live objective" not in historical.text
+
+    result = scheduler.schedule_one("Agent")
+
+    # No codex_contract/PrepareExecutionContract worker job is ever created; the
+    # single produced job is the implementation worker itself.
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.transition_id == "implement"
+    assert result.job.worker_id == "qwen"
+    assert adapter.moves == []
+
+
+def test_scheduler_does_not_enter_contract_preparation_or_invalidate_todo(tmp_path: Path):
+    project_root = tmp_path / "project"
+    _write_global_contract(project_root)
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    adapter = FakeAdapter(_snapshot(task))
+    event_store = JsonlEventStore(project_root / "events")
+    scheduler = Scheduler(
+        workflow=_global_contract_workflow(),
+        adapter=adapter,
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        event_store=event_store,
+        project_root=project_root,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.scheduled is True
+    assert result.transition_id == "implement"
+    assert adapter.moves == []
+    assert [event.event_type for event in result.events] == ["ExecutionJobCreated"]
+    assert not any(e.event_type == "ContractInvalidated" for e in result.events)
 
 
 def test_scheduler_compiles_self_review_from_prior_verification_evidence(tmp_path: Path):
     project_root = tmp_path / "project"
+    _write_global_contract(project_root)
     task = Task(
         id=TASK_ID,
         title="Free-form implementation request",
         path="tasks/request.md",
         current_state="SelfReview",
-        task_type="task",
+        task_type="ImplementationTask",
         body="Please add healthz in whatever structure is appropriate.",
     )
-    task = _write_contract(
-        project_root,
-        task,
-        source_hash=task_source_intent_sha256(task),
-    )
-    workflow = _contract_workflow()
-    review = TransitionDefinition(
-        id="review",
-        task_type="task",
-        from_state="SelfReview",
-        to_state="Done",
-        worker="qwen",
-        requires=RequirementDefinition(changed_files_required=False),
-        transaction=None,
-        default_for_scheduler=True,
-    )
-    workflow = replace(
-        workflow,
-        states=MappingProxyType({
-            **workflow.states,
-            "Done": StateDefinition(id="Done"),
-        }),
-        transitions=MappingProxyType({
-            **workflow.transitions,
-            "review": review,
-        }),
-    )
-    prior_contract = compile_task_execution_contract(
+    workflow = _global_contract_workflow(review=True)
+    prior_contract = compile_standard_execution_contract(
         project_root=project_root,
         repo_root=None,
         task=task,
@@ -533,39 +575,30 @@ def test_scheduler_compiles_self_review_from_prior_verification_evidence(tmp_pat
     assert '"edited":["app.py"]' in result.job.metadata["prompt_packet"]
 
 
-def test_scheduler_invalidates_stale_contract_before_qwen_is_scheduled(tmp_path: Path):
+def test_scheduler_rejects_scheduling_when_global_contract_is_missing(tmp_path: Path):
     project_root = tmp_path / "project"
     task = Task(
         id=TASK_ID,
         title="Free-form implementation request",
         path="tasks/request.md",
-        current_state="ReadyToImplement",
-        task_type="task",
-        body="Please add healthz and preserve metrics.",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Please add healthz in whatever structure is appropriate.",
     )
-    task = _write_contract(project_root, task, source_hash="0" * 64)
-    adapter = FakeAdapter(_snapshot(task))
-    event_store = JsonlEventStore(project_root / "events")
     scheduler = Scheduler(
-        workflow=_contract_workflow(),
-        adapter=adapter,
+        workflow=_global_contract_workflow(),
+        adapter=FakeAdapter(_snapshot(task)),
         job_store=FileExecutionJobStore(tmp_path / "jobs"),
         workspace_root=tmp_path / "workspaces",
-        event_store=event_store,
         project_root=project_root,
     )
 
     result = scheduler.schedule_one("Agent")
 
-    assert result.accepted is True
+    # Without the project global contract, scheduling fails cleanly at creation
+    # time and never moves the task back to Todo or fires a contract invalidation.
+    assert result.accepted is False
     assert result.scheduled is False
-    assert result.transition_id == "invalidate"
-    assert result.skipped[-1].code == "task.contract_invalidated"
-    assert adapter.moves == [(TASK_ID, "Todo")]
-    assert result.events_persisted is True
-    events = event_store.iter_events()
-    assert [event.event_type for event in events] == ["ContractInvalidated"]
-    assert events[0].data["error_codes"] == ["contract.source_hash_mismatch"]
     assert FileExecutionJobStore(tmp_path / "jobs").list().jobs == ()
 
 
@@ -594,7 +627,293 @@ def test_scheduler_skips_when_active_job_exists(tmp_path: Path):
     assert result.skipped[0].code == "repo_lane.active_job_exists"
 
 
+def test_todo_implementation_task_resolves_declared_tests_without_generated_contract(tmp_path: Path):
+    # A task may naturally require tests. Tulid must not invent a per-task
+    # contract around them: the task body carries the request and the frozen
+    # global contract resolves the deterministic test checks to run afterward.
+    project_root = tmp_path / "project"
+    _write_global_contract(project_root)
+    workflow = replace(
+        _global_contract_workflow(),
+        validation_types=MappingProxyType({}),
+        transitions=MappingProxyType({
+            **_global_contract_workflow().transitions,
+            "implement": TransitionDefinition(
+                id="implement",
+                task_type="ImplementationTask",
+                from_state="Todo",
+                to_state="SelfReview",
+                worker="qwen",
+                requires=RequirementDefinition(
+                    changed_files_required=True,
+                    validations=(ValidationCallDefinition(
+                        type="tests_pass",
+                        args=MappingProxyType(
+                            {"command": "python check_repo.py tests"},
+                        ),
+                    ),),
+                ),
+                transaction=None,
+                default_for_scheduler=True,
+            ),
+        }),
+    )
+    task = Task(
+        id=TASK_ID,
+        title="Add tests for healthz",
+        path="tasks/request.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Implement healthz plus a unit test in tests/test_healthz.py.",
+    )
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        project_root=project_root,
+    )
+    result = scheduler.schedule_one("Agent")
+
+    assert result.scheduled is True
+    assert result.job is not None
+    # The task body directly describes the test requirement.
+    assert "unit test in tests/test_healthz.py" in result.job.metadata["prompt_packet"]
+    frozen = load_job_execution_contract(result.job, required=True)
+    assert frozen.contract is not None
+    # The frozen global contract resolves the project's configured global command
+    # (tests); the transition-declared test stays an ordinary validation and is
+    # not turned into a generated contract check.
+    resolved_ids = {check.id for check in frozen.contract.resolved_checks}
+    assert "tests" in resolved_ids
+    assert "tests_pass" not in resolved_ids
+    validation_ids = [call.type for call in frozen.contract.transition.requires.validations]
+    assert "tests_pass" in validation_ids
+
+
+def test_legacy_per_task_contract_artifact_remains_readable_and_migratable(tmp_path: Path):
+    project_root = tmp_path / "project"
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="ReadyToImplement",
+        task_type="task",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    task = _write_contract(
+        project_root,
+        task,
+        source_hash=task_source_intent_sha256(task),
+    )
+    # The legacy per-task artifact is still located and parsed by the historical
+    # loader path (kept for backward compatibility and migration), so old
+    # executions and frozen contracts never become unreadable.
+    legacy = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=None,
+        task=task,
+        transition=_legacy_prepare_workflow()["implement"],
+    )
+    assert legacy.accepted is True
+    assert legacy.contract is not None
+    assert legacy.contract.generated_contract.schema == "tulid.implementation/v1"
+    # Round-trip through the frozen job loader.
+    loaded = load_job_execution_contract(
+        ExecutionJob(
+            job_id="01J00000000000000000000JOB",
+            project_id="Agent",
+            task_id=TASK_ID,
+            transition_id="implement",
+            worker_id="qwen",
+            workspace_path=str(tmp_path / "work"),
+            metadata={
+                "execution_contract": execution_contract_to_dict(legacy.contract),
+                "execution_contract_sha256": legacy.contract.sha256,
+            },
+        ),
+        required=True,
+    )
+    assert loaded.accepted is True
+    assert loaded.contract is not None
+    assert loaded.contract.generated_contract.source_task_id == TASK_ID
+    # Re-parsing the historical artifact directly still works.
+    parsed = parse_implementation_contract(
+        (project_root / task.artifact_links[0]).read_text(encoding="utf-8"),
+        expected_task_id=TASK_ID,
+        expected_source_intent_sha256=task_source_intent_sha256(task),
+    )
+    assert parsed.accepted is True and parsed.contract is not None
+
+
+def _legacy_prepare_workflow() -> dict[str, object]:
+    return {
+        "implement": TransitionDefinition(
+            id="implement",
+            task_type="task",
+            from_state="ReadyToImplement",
+            to_state="SelfReview",
+            worker="qwen",
+            requires=RequirementDefinition(),
+            transaction=None,
+            default_for_scheduler=True,
+        ),
+    }
+
+
 def test_scheduler_backs_off_after_recent_failed_job(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": datetime.now(timezone.utc).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.recent_failure"
+
+
+def test_scheduler_failed_worker_yields_fresh_attempt_without_backoff(tmp_path: Path):
+    """A failed worker is treated uniformly: with backoff disabled, the same
+    task is scheduled for a fresh attempt and no classification is consulted."""
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": datetime.now(timezone.utc).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.job_id != "01J00000000000000000000JOB"
+    assert [error.code for error in result.skipped] == []
+
+
+def test_scheduler_failed_worker_respects_configured_backoff(tmp_path: Path):
+    """All worker failures observe the pre-existing configurable backoff."""
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": datetime.now(timezone.utc).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=60,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.recent_failure"
+
+
+def test_scheduler_fresh_attempt_after_worker_unexpected_exit_is_immediate(tmp_path: Path):
+    """A worker_unexpected_exit failure does not count toward the recent-failure
+    backoff: the same task is scheduled for an immediate fresh attempt."""
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "failure_reason": "worker_unexpected_exit",
+        },
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=60,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+    assert result.job.job_id != "01J00000000000000000000JOB"
+    assert [error.code for error in result.skipped] == []
+
+
+def test_scheduler_failed_workers_still_respect_retry_limit(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    now = datetime.now(timezone.utc).isoformat()
+    for index in range(2):
+        assert store.create(ExecutionJob(
+            job_id=f"01J00000000000000000000J{index:02d}",
+            project_id="Agent",
+            task_id=TASK_ID,
+            transition_id="implement",
+            worker_id="qwen",
+            workspace_path=str(tmp_path / f"work-{index}"),
+            status="failed",
+            metadata={
+                "updated_at": now,
+            },
+        )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        max_failed_attempts_per_transition=2,
+        runtime_session_started_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+        failed_job_backoff_seconds=0,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.retry_limit_reached"
+
+
+def test_scheduler_unclassified_failed_job_keeps_existing_backoff(tmp_path: Path):
     store = FileExecutionJobStore(tmp_path / "jobs")
     assert store.create(ExecutionJob(
         job_id="01J00000000000000000000JOB",
@@ -644,6 +963,86 @@ def test_scheduler_uses_configured_failed_job_backoff(tmp_path: Path):
 
     assert result.accepted is True
     assert result.scheduled is True
+
+
+def test_e2e_worker_dies_without_completion_driver_schedules_fresh_attempt(tmp_path: Path, monkeypatch):
+    """Drive schedule -> run -> unexpected worker exit -> schedule; the same task
+    gets an immediate fresh attempt and its Kanban state is left unchanged."""
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    events = JsonlEventStore(tmp_path / "events")
+    (tmp_path / "repo").mkdir(parents=True, exist_ok=True)
+    adapter = FakeAdapter(_snapshot())
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=60,
+    )
+
+    first = scheduler.schedule_one("Agent")
+    assert first.accepted is True and first.job is not None
+    first_job_id = first.job.job_id
+
+    class ControllableProbe:
+        def __init__(self) -> None:
+            self._dead = threading.Event()
+        def die(self) -> None:
+            self._dead.set()
+        def is_alive(self) -> bool:
+            return not self._dead.is_set()
+
+    worker_started = threading.Event()
+    probe = ControllableProbe()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        worker_started.set()
+        threading.Event().wait()
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_args={"codex": ("exec", "{prompt_packet}")},
+            default_timeout_seconds=1,
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent", repo_root=tmp_path / "repo"),
+        observability=WorkerObservability(check_interval_seconds=0.001),
+        liveness_probe=probe,
+    )
+    run_box: dict[str, object] = {}
+    run_thread = threading.Thread(
+        target=lambda: run_box.update(result=executor.run(first_job_id)),
+        name="test-driver-run",
+    )
+    run_thread.start()
+    assert worker_started.wait(timeout=5)
+    probe.die()
+    run_thread.join(timeout=15)
+    result = run_box["result"]
+
+    assert result.accepted is True
+    assert result.run is None
+    failed_job = store.get(first_job_id).job
+    assert failed_job is not None
+    assert failed_job.status == "failed"
+    assert failed_job.metadata["failure_reason"] == "worker_unexpected_exit"
+
+    second = scheduler.schedule_one("Agent")
+    assert second.accepted is True
+    assert second.scheduled is True
+    assert second.job is not None
+    assert second.job.job_id != first_job_id
+    assert second.job.task_id == TASK_ID
+    assert [error.code for error in second.skipped] == []
+    assert adapter.moves == []
+    assert adapter.snapshot.tasks[TASK_ID].current_state == "Todo"
 
 
 def test_scheduler_can_stop_after_configured_failed_attempts(tmp_path: Path):

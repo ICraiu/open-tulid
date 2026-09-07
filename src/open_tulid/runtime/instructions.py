@@ -7,6 +7,15 @@ from pathlib import Path
 from open_tulid.domain import DomainError, TaskTypeDefinition, TransitionDefinition, WorkerDefinition
 
 
+CANONICAL_QUESTION_ROUND_ANSWER_POLICY_VERSION = "v1"
+CANONICAL_QUESTION_ROUND_ANSWER_POLICY_MARKER = (
+    "<!-- open-tulid:canonical-question-round-answers=v1 -->"
+)
+CANONICAL_QUESTION_ROUND_ANSWER_POLICY = """# Binding runtime policy: Canonical QuestionRound answers (v1)
+
+This policy is binding and takes precedence over conflicting project-local agent wording. When context marks a `QuestionRoundFile` as `Canonical QuestionRound Answers` or `Canonical QuestionRound Answer History`, that file is the sole authoritative answer record for its round. The current task body is a generated question template, not an answer source. In the canonical record, text following `Your answer:`, `Answer:`, or `Response:` is a user answer; labels are case-insensitive and may use Markdown emphasis (for example, `**Answer:**`). Reconcile every supplied canonical answer record in chronological order; a later explicit answer overrides an earlier conflict. Given an explicit decision to proceed, do not create another question round that repeats a settled question. A follow-up may contain only a genuinely new blocking question that no earlier answer record resolves. Do not infer that answers are blank from the generated task body, and do not merge a current canonical record with another directly linked QuestionRoundFile.\n"""
+
+
 @dataclass(frozen=True)
 class InstructionDocument:
     ref: str
@@ -60,6 +69,21 @@ class AgentInstructionResolver:
                 errors.append(resolved)
                 continue
             docs.append(resolved)
+        if _requires_canonical_question_round_answer_policy(task_type, transition):
+            answer_review = next((
+                doc for doc in docs if doc.path.name == "answers-review.agent.md"
+            ), None)
+            if answer_review is not None and CANONICAL_QUESTION_ROUND_ANSWER_POLICY_MARKER not in answer_review.content:
+                errors.append(DomainError(
+                    "instructions.stale_canonical_question_round_policy",
+                    "agents/answers-review.agent.md predates canonical QuestionRound answer policy v1. "
+                    "Tulid will not silently replace project-local instructions. Review and merge the "
+                    "current policy, then add the marker "
+                    f"{CANONICAL_QUESTION_ROUND_ANSWER_POLICY_MARKER} to acknowledge the upgrade. "
+                    "The runtime policy is applied after project instructions and is binding.",
+                    str(answer_review.path),
+                ))
+            docs.append(_canonical_question_round_answer_policy_document())
         if errors:
             return PromptPacketResult(errors=tuple(errors))
         text = "\n\n".join(
@@ -117,6 +141,28 @@ class AgentInstructionResolver:
             content=content,
             sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
         )
+
+
+def _requires_canonical_question_round_answer_policy(
+    task_type: TaskTypeDefinition | None,
+    transition: TransitionDefinition,
+) -> bool:
+    """Identify the standard answer-review gate without relying on a mutable prompt file."""
+    return (
+        task_type is not None
+        and task_type.id == "QuestionRound"
+        and transition.from_state == "AnswersReady"
+    )
+
+
+def _canonical_question_round_answer_policy_document() -> InstructionDocument:
+    content = CANONICAL_QUESTION_ROUND_ANSWER_POLICY
+    return InstructionDocument(
+        ref=f"runtime/canonical-question-round-answers-{CANONICAL_QUESTION_ROUND_ANSWER_POLICY_VERSION}",
+        path=Path("<open-tulid runtime policy>"),
+        content=content,
+        sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    )
 
 
 def _unique_refs(refs: tuple[str, ...]) -> tuple[str, ...]:

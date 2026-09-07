@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +36,7 @@ from open_tulid.runtime.executor import (
     _frozen_prompt_packet,
     render_execution_prompt,
 )
+from open_tulid.runtime.observability import WorkerExited, WorkerObservability
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 from socket_utils import can_bind_localhost
 
@@ -359,6 +362,97 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     loaded = store.get(JOB_ID)
     assert loaded.job is not None
     assert loaded.job.status == "accepted"
+
+
+def test_executor_retries_rejected_local_completion_with_feedback_until_accepted(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A rejected completion keeps the same local job alive for a scoped repair."""
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="local_llm",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    adapter = FakeAdapter()
+    seen: list[dict[str, object]] = []
+
+    def submit(request, payload):
+        http_request = urllib.request.Request(
+            str(request.env["OPEN_TULID_COMPLETION_ENDPOINT"]),
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "content-type": "application/json",
+                "x-open-tulid-completion-token": "secret",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(http_request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def fake_run_agent_container(request, *, docker_executable):
+        attempt = len(seen) + 1
+        prompt = (Path(request.workspace) / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
+        if attempt == 1:
+            status, feedback = submit(request, {
+                "submission_id": "first-rejected",
+                "summary": "first attempt",
+                "artifacts": [],
+                "changed_files": [],
+                "validation_evidence": {},
+            })
+            seen.append({"prompt": prompt, "status": status, "feedback": feedback})
+        else:
+            assert "# Open Tulid Repair" in prompt
+            assert "completion.artifact_missing" in prompt
+            output = Path(request.workspace) / "output"
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "result.md").write_text("scoped correction\n", encoding="utf-8")
+            status, feedback = submit(request, {
+                "submission_id": "repair-accepted",
+                "summary": "scoped correction after verifier feedback",
+                "artifacts": [{"type": "result.md", "path": "result.md"}],
+                "changed_files": [],
+                "validation_evidence": {},
+            })
+            seen.append({"prompt": prompt, "status": status, "feedback": feedback})
+        return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=0)
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    result = JobExecutor(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1", max_repair_attempts=1),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    ).run(JOB_ID)
+
+    assert result.accepted is True
+    assert [item["status"] for item in seen] == [400, 200]
+    assert seen[0]["feedback"]["accepted"] is False
+    assert seen[0]["feedback"]["errors"] == [{
+            "code": "completion.artifact_missing",
+            "location": "result.md",
+            "message": "Required artifact was not submitted: result.md",
+    }]
+    assert seen[0]["feedback"]["retry"] == {"ready": True, "attempt": 0, "reason": None}
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "accepted"
+    assert loaded.job.attempts == 2
+    assert loaded.job.metadata["repair_attempts"] == 1
+    assert loaded.job.metadata["repair_history"][0]["error_codes"] == ["completion.artifact_missing"]
+    assert adapter.moved_to == "CodeReview"
 
 
 def test_executor_fails_successful_worker_without_explicit_completion_evidence(
@@ -761,6 +855,235 @@ def test_executor_injects_linked_context_and_instructions(tmp_path: Path, monkey
     assert result.accepted is True
 
 
+def test_review_answers_uses_linked_question_round_file_as_current_answer_source(tmp_path: Path):
+    """A generated QuestionRound must review its persisted answer artifact, not its stale body."""
+    project = tmp_path / "project"
+    answer_ref = "artifacts/2/QuestionRoundFile/initial-questions.md"
+    answer_path = project / answer_ref
+    answer_path.parent.mkdir(parents=True)
+    answer_path.write_text(
+        "# Questions — Round 1\n\n## 1. Who is this for?\n\nYour answer: Individual builders.\n",
+        encoding="utf-8",
+    )
+
+    product_idea = Task(
+        id="2",
+        title="Product idea",
+        path="tasks/2.md",
+        current_state="Done",
+        task_type="ProductIdea",
+        body="Original idea.",
+    )
+    question_round = Task(
+        id="3",
+        title="Questions — Round 1",
+        path="tasks/3.md",
+        current_state="AnswersReady",
+        task_type="QuestionRound",
+        parent_id=product_idea.id,
+        artifact_links=(answer_ref,),
+        body="# Questions — Round 1\n\n## 1. Who is this for?\n\nYour answer:\n",
+    )
+
+    class ProjectAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+        def read_task(self, task_id: str) -> ReadTaskResult:
+            tasks = {product_idea.id: product_idea, question_round.id: question_round}
+            return ReadTaskResult(task=tasks[task_id]) if task_id in tasks else ReadTaskResult()
+
+    review = TransitionDefinition(
+        id="ReviewAnswers",
+        task_type="QuestionRound",
+        from_state="AnswersReady",
+        to_state="ReadyForSpec",
+        worker="codex_clarity",
+        requires=RequirementDefinition(artifacts=("ClarityAssessment",)),
+        transaction=None,
+        derives=DerivesDefinition(
+            task_type="QuestionRound",
+            state="Questions",
+            artifact_type="QuestionRoundFile",
+            required=False,
+            parent_to_if_derived="Done",
+        ),
+    )
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            state: StateDefinition(id=state)
+            for state in ("AnswersReady", "ReadyForSpec", "Questions", "Done")
+        }),
+        task_types=MappingProxyType({
+            "ProductIdea": TaskTypeDefinition(id="ProductIdea", requirements_by_state=MappingProxyType({})),
+            "QuestionRound": TaskTypeDefinition(id="QuestionRound", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({"codex_clarity": WorkerDefinition(id="codex_clarity")}),
+        transitions=MappingProxyType({review.id: review}),
+    )
+
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=ProjectAdapter(),
+        task=question_round,
+        transition=review,
+        worker_id="codex_clarity",
+        job_id="review-answers",
+        completion_endpoint="http://example.invalid/complete",
+    )
+
+    assert rendered.accepted is True
+    assert "Individual builders." in rendered.text
+    assert f"Canonical QuestionRound Answers: {answer_ref}" in rendered.text
+    assert "Supported labels are `Your answer:`, `Answer:`, and `Response:`" in rendered.text
+    assert "task body is the generated question template and is not an answer source" in rendered.text
+
+
+def test_review_answers_accepts_emphasized_answer_label_in_canonical_answer_source(tmp_path: Path):
+    """Canonical answers remain authoritative when a human uses ``**Answer:**``."""
+    project = tmp_path / "project"
+    answer_ref = "artifacts/2/QuestionRoundFile/initial-questions.md"
+    answer_path = project / answer_ref
+    answer_path.parent.mkdir(parents=True)
+    answer_path.write_text(
+        "# Questions — Round 1\n\n## 1. Who should the first version serve?\n\n**Answer:** Individual builders.\n",
+        encoding="utf-8",
+    )
+
+    product_idea = Task(
+        id="2",
+        title="Product idea",
+        path="tasks/2.md",
+        current_state="Done",
+        task_type="ProductIdea",
+        body="Original idea.",
+    )
+    question_round = Task(
+        id="3",
+        title="Questions — Round 1",
+        path="tasks/3.md",
+        current_state="AnswersReady",
+        task_type="QuestionRound",
+        parent_id=product_idea.id,
+        artifact_links=(answer_ref,),
+        body="# Questions — Round 1\n\n## 1. Who should the first version serve?\n\nYour answer:\n",
+    )
+
+    class ProjectAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+        def read_task(self, task_id: str) -> ReadTaskResult:
+            tasks = {product_idea.id: product_idea, question_round.id: question_round}
+            return ReadTaskResult(task=tasks[task_id]) if task_id in tasks else ReadTaskResult()
+
+    review = TransitionDefinition(
+        id="ReviewAnswers",
+        task_type="QuestionRound",
+        from_state="AnswersReady",
+        to_state="ReadyForSpec",
+        worker="codex_clarity",
+        requires=RequirementDefinition(artifacts=("ClarityAssessment",)),
+        transaction=None,
+        derives=DerivesDefinition(
+            task_type="QuestionRound",
+            state="Questions",
+            artifact_type="QuestionRoundFile",
+            required=False,
+            parent_to_if_derived="Done",
+        ),
+    )
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            state: StateDefinition(id=state)
+            for state in ("AnswersReady", "ReadyForSpec", "Questions", "Done")
+        }),
+        task_types=MappingProxyType({
+            "ProductIdea": TaskTypeDefinition(id="ProductIdea", requirements_by_state=MappingProxyType({})),
+            "QuestionRound": TaskTypeDefinition(id="QuestionRound", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({"codex_clarity": WorkerDefinition(id="codex_clarity")}),
+        transitions=MappingProxyType({review.id: review}),
+    )
+
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=ProjectAdapter(),
+        task=question_round,
+        transition=review,
+        worker_id="codex_clarity",
+        job_id="review-answers",
+        completion_endpoint="http://example.invalid/complete",
+    )
+
+    assert rendered.accepted is True
+    assert "**Answer:** Individual builders." in rendered.text
+    assert "Treat text following a supported response label in this record as the user's authoritative answer" in rendered.text
+    assert "with optional Markdown emphasis around the label (for example, `**Answer:**`)" in rendered.text
+    assert "Your answer:\n" in rendered.text
+
+
+def test_review_answers_includes_three_round_canonical_answer_history(tmp_path: Path):
+    """A third derived review receives every answered round, oldest to newest."""
+    project = tmp_path / "project"
+    refs = (
+        "artifacts/2/QuestionRoundFile/round-1.md",
+        "artifacts/3/QuestionRoundFile/round-2.md",
+        "artifacts/4/QuestionRoundFile/round-3.md",
+    )
+    answers = (
+        "Round 1 answer: individual builders.",
+        "Round 2 answer: approve roots together.",
+        "Round 3 answer: the rubric judge gates Phase 0.",
+    )
+    for ref, answer in zip(refs, answers, strict=True):
+        path = project / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        question = "Who should the first version serve?" if ref == refs[0] else "A later decision"
+        path.write_text(
+            f"# Answered questions\n\n## {question}\n\nYour answer: {answer}\n",
+            encoding="utf-8",
+        )
+
+    product = Task(id="2", title="Idea", path="tasks/2.md", current_state="Done", task_type="ProductIdea")
+    round_1 = Task(id="3", title="Round 1", path="tasks/3.md", current_state="Done", task_type="QuestionRound", parent_id="2", artifact_links=(refs[0],))
+    round_2 = Task(id="4", title="Round 2", path="tasks/4.md", current_state="Done", task_type="QuestionRound", parent_id="3", artifact_links=(refs[1],))
+    round_3 = Task(id="5", title="Round 3", path="tasks/5.md", current_state="AnswersReady", task_type="QuestionRound", parent_id="4", artifact_links=(refs[2],), body="## Phase 0 gate\n\nYour answer:")
+
+    class ProjectAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+        def read_task(self, task_id: str) -> ReadTaskResult:
+            tasks = {item.id: item for item in (product, round_1, round_2, round_3)}
+            return ReadTaskResult(task=tasks[task_id]) if task_id in tasks else ReadTaskResult()
+
+    review = TransitionDefinition(
+        id="ReviewAnswers", task_type="QuestionRound", from_state="AnswersReady", to_state="ReadyForSpec",
+        worker="codex_clarity", requires=RequirementDefinition(artifacts=("ClarityAssessment",)), transaction=None,
+    )
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({state: StateDefinition(id=state) for state in ("AnswersReady", "ReadyForSpec", "Done")} ),
+        task_types=MappingProxyType({"ProductIdea": TaskTypeDefinition(id="ProductIdea", requirements_by_state=MappingProxyType({})), "QuestionRound": TaskTypeDefinition(id="QuestionRound", requirements_by_state=MappingProxyType({}))}),
+        artifact_types=MappingProxyType({}), validation_types=MappingProxyType({}), operation_types=MappingProxyType({}),
+        workers=MappingProxyType({"codex_clarity": WorkerDefinition(id="codex_clarity")}), transitions=MappingProxyType({review.id: review}),
+    )
+
+    rendered = render_execution_prompt(workflow=workflow, adapter=ProjectAdapter(), task=round_3, transition=review, worker_id="codex_clarity", job_id="review-answers", completion_endpoint="http://example.invalid/complete")
+
+    assert rendered.accepted is True
+    assert all(answer in rendered.text for answer in answers)
+    assert rendered.text.index(answers[0]) < rendered.text.index(answers[1]) < rendered.text.index(answers[2])
+    assert "Who should the first version serve?" in rendered.text
+    assert "do not create another question round that repeats a settled question" in rendered.text
+
+
 def test_executor_strips_generated_derived_task_sections_and_guides_multi_artifact_derivation(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace"
     project = tmp_path / "project"
@@ -1037,6 +1360,181 @@ def test_executor_redacts_scoped_tokens_from_persisted_command_log(tmp_path: Pat
     assert "provider-secret" not in trace_text
 
 
+def _opencode_workflow() -> WorkflowDefinition:
+    workflow = _workflow()
+    return WorkflowDefinition(
+        schema_version=workflow.schema_version,
+        states=workflow.states,
+        task_types=workflow.task_types,
+        artifact_types=workflow.artifact_types,
+        validation_types=workflow.validation_types,
+        operation_types=workflow.operation_types,
+        workers=workflow.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="qwen",
+                requires=RequirementDefinition(artifacts=("result.md",)),
+                transaction=None,
+            ),
+        }),
+    )
+
+
+def test_executor_does_not_fail_completion_for_vanished_worker_when_completion_is_pending(tmp_path: Path, monkeypatch):
+    """Unexpected worker exits are treated uniformly, never classified.
+
+    A worker that stops with a doom-loop/Unauthorized signature and no accepted
+    completion is a faulty worker. The executor must fail it without parsing the
+    OpenCode log text, and must never emit `failure_code`/`retryable` metadata.
+    """
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="qwen",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+
+    def fake_run_agent_container(request, *, docker_executable):
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=1,
+            stderr="Error: Unauthorized: unauthorized\n",
+            stdout="OpenCode edited/generated fixture hashes repeatedly.\n",
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    executor = JobExecutor(
+        workflow=_opencode_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_types={"qwen": "opencode"},
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    meta = loaded.job.metadata
+    assert meta["worker_returncode"] == 1
+    assert "failure_code" not in meta
+    assert "failure_category" not in meta
+    assert "retryable" not in meta
+    assert "failure_evidence" not in meta
+    assert "failure_reason" not in meta
+    failed_events = [e for e in events.iter_events() if e.event_type == "ExecutionFailed"]
+    assert failed_events
+    data = failed_events[-1].data
+    assert "failure_code" not in data
+    assert "retryable" not in data
+
+
+def test_executor_leaves_non_opencode_worker_failure_unclassified(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+
+    def fake_run_agent_container(request, *, docker_executable):
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=1,
+            stderr="Error: Unauthorized: unauthorized\n",
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    meta = loaded.job.metadata
+    assert meta["worker_returncode"] == 1
+    assert "failure_code" not in meta
+    assert "retryable" not in meta
+
+
+def test_executor_successful_completion_is_not_classified(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+
+    def fake_run_agent_container(request, *, docker_executable):
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow_without_requirements(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
+    assert "failure_code" not in loaded.job.metadata
+    assert [e.event_type for e in events.iter_events()] == ["ExecutionStarted", "ExecutionFailed"]
+
+
 def test_executor_marks_job_failed_when_internal_error_occurs_after_running(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace"
     store = FileExecutionJobStore(tmp_path / "jobs")
@@ -1194,7 +1692,7 @@ def test_executor_writes_opencode_config_for_tulid_model_proxy(tmp_path: Path, m
 
     def fake_run(request, *, docker_executable):
         seen["args"] = request.args
-        seen["config"] = json.loads((Path(request.workspace) / "opencode.json").read_text(encoding="utf-8"))
+        seen["config"] = json.loads((Path(request.workspace) / ".open-tulid" / "home" / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8"))
         seen["env"] = request.env
         return AgentRunResult(agent_id=request.agent_id, image=request.image, command=("fake",), returncode=1)
 
@@ -1351,6 +1849,356 @@ def test_executor_mounts_subscription_auth_without_proxy_session(tmp_path: Path,
 
     assert seen["mounts"] == (ContainerMount(auth_home, "/root/.codex"),)
     assert "OPEN_TULID_MODEL_ENDPOINT" not in seen["env"]
+
+
+class _ControllableLivenessProbe:
+    """A real WorkerLivenessProbe fixture whose aliveness the test flips."""
+
+    def __init__(self) -> None:
+        self._dead = threading.Event()
+
+    def die(self) -> None:
+        self._dead.set()
+
+    def is_alive(self) -> bool:
+        return not self._dead.is_set()
+
+
+def _wait_status(store: FileExecutionJobStore, status: str, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        loaded = store.get(JOB_ID)
+        if loaded.accepted and loaded.job is not None and str(loaded.job.status) == status:
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def test_executor_unexpected_worker_exit_fails_job_and_scrubs_and_releases_lease(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    leases = FileResourceLeaseStore(
+        tmp_path / "leases",
+        {"gpu": ResourceConfig(kind="model", capacity=1)},
+    )
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="gpu",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    worker_started = threading.Event()
+    probe = _ControllableLivenessProbe()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        worker_started.set()
+        # The worker vanished mid-run without any accepted completion: it never
+        # returns, so the executor's liveness probe is the only signal left.
+        threading.Event().wait()
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        lease_store=leases,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_resources={"gpu": ("gpu",)},
+            worker_args={"gpu": ("exec", "{prompt_packet}")},
+            default_timeout_seconds=1,
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        observability=WorkerObservability(check_interval_seconds=0.001),
+        liveness_probe=probe,
+    )
+
+    run_box: dict[str, object] = {}
+    run_thread = threading.Thread(
+        target=lambda: run_box.update(result=executor.run(JOB_ID)),
+        name="test-executor-run",
+    )
+    run_thread.start()
+    assert worker_started.wait(timeout=5)
+    probe.die()
+    run_thread.join(timeout=15)
+    result = run_box["result"]
+
+    assert result.accepted is True
+    assert result.run is None
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "worker_unexpected_exit"
+    assert not workspace.exists()
+    assert not leases.job_holds(("gpu",), JOB_ID)
+    accepted = [event for event in events.iter_events() if event.event_type == "ExecutionAccepted"]
+    assert accepted == []
+
+
+def test_executor_duplicate_worker_exit_notices_are_harmless(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    worker_started = threading.Event()
+    probe = _ControllableLivenessProbe()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        worker_started.set()
+        threading.Event().wait()
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            default_timeout_seconds=1,
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        observability=WorkerObservability(check_interval_seconds=0.001),
+        liveness_probe=probe,
+    )
+
+    run_box: dict[str, object] = {}
+    run_thread = threading.Thread(
+        target=lambda: run_box.update(result=executor.run(JOB_ID)),
+        name="test-executor-run",
+    )
+    run_thread.start()
+    assert worker_started.wait(timeout=5)
+    probe.die()
+    run_thread.join(timeout=15)
+    result = run_box["result"]
+
+    assert result.accepted is True
+    assert result.run is None
+    failed_events = [event for event in events.iter_events() if event.event_type == "ExecutionFailed"]
+    assert len(failed_events) == 1
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "worker_unexpected_exit"
+    # A duplicate notice is idempotent: rerunning the fail flow regardless of the
+    # worker's returncode must not fail the job again or add another event.
+    executor._fail_worker_after_unexpected_exit(
+        loaded.job,
+        WorkerExited(job_id=JOB_ID, attempt_id="1", returncode=1),
+        request=None,
+    )
+    assert len([e for e in events.iter_events() if e.event_type == "ExecutionFailed"]) == 1
+    assert store.get(JOB_ID).job.status == "failed"
+
+
+def test_executor_worker_exit_after_accepted_completion_is_normal(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    probe = _ControllableLivenessProbe()
+
+    def fake_run_agent_container(request, *, docker_executable):
+        worker_started.set()
+        output = Path(request.workspace) / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "result.md").write_text("done\n", encoding="utf-8")
+        payload = json.dumps({
+            "summary": "done",
+            "artifacts": [{"type": "result.md", "path": "result.md"}],
+            "changed_files": [],
+            "validation_evidence": {},
+        }).encode("utf-8")
+        http_request = urllib.request.Request(
+            str(request.env["OPEN_TULID_COMPLETION_ENDPOINT"]),
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "x-open-tulid-completion-token": "secret",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(http_request, timeout=5) as response:
+            assert json.loads(response.read()) == {"accepted": True, "next_state": "CodeReview"}
+        release_worker.wait()
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        observability=WorkerObservability(check_interval_seconds=0.001),
+        liveness_probe=probe,
+    )
+
+    run_box: dict[str, object] = {}
+    run_thread = threading.Thread(
+        target=lambda: run_box.update(result=executor.run(JOB_ID)),
+        name="test-executor-run",
+    )
+    run_thread.start()
+    assert worker_started.wait(timeout=5)
+    assert _wait_status(store, "accepted")
+    # The worker vanishes after the completion is accepted: not a fault.
+    probe.die()
+    release_worker.set()
+    run_thread.join(timeout=15)
+    result = run_box["result"]
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "accepted"
+    assert executor.adapter.moved_to == "CodeReview"
+    assert [e for e in events.iter_events() if e.event_type == "ExecutionFailed"] == []
+
+
+def test_executor_worker_exit_under_completion_validation_is_kept_alive(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    worker_started = threading.Event()
+    release_validation = threading.Event()
+    probe = _ControllableLivenessProbe()
+    real_verify = None
+
+    def fake_run_agent_container(request, *, docker_executable):
+        worker_started.set()
+        output = Path(request.workspace) / "output"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "result.md").write_text("done\n", encoding="utf-8")
+        payload = json.dumps({
+            "summary": "done",
+            "artifacts": [{"type": "result.md", "path": "result.md"}],
+            "changed_files": [],
+            "validation_evidence": {},
+        }).encode("utf-8")
+        http_request = urllib.request.Request(
+            str(request.env["OPEN_TULID_COMPLETION_ENDPOINT"]),
+            data=payload,
+            headers={
+                "content-type": "application/json",
+                "x-open-tulid-completion-token": "secret",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(http_request, timeout=10) as response:
+            return AgentRunResult(
+                agent_id=request.agent_id,
+                image=request.image,
+                command=("fake",),
+                returncode=0,
+                stdout="accepted",
+            )
+
+    import open_tulid.runtime.completion as completion_module
+
+    class BlockingVerifier:
+        def verify(self, *args, **kwargs):
+            release_validation.wait()
+            return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "open_tulid.runtime.executor.run_agent_container",
+        fake_run_agent_container,
+    )
+    # Hold validation open so the job sits in completion_submitted while the
+    # worker is still in flight; the observer must not fail it during validation.
+    real_verify = completion_module.DeterministicVerifier(
+        artifact_templates={},
+        validation_implementations=VALIDATION_IMPLEMENTATIONS,
+    ).verify
+    monkeypatch.setattr(
+        "open_tulid.runtime.completion.DeterministicVerifier",
+        type("_BlockingVerifier", (completion_module.DeterministicVerifier,), {"verify": BlockingVerifier.verify}),
+    )
+    events = JsonlEventStore(tmp_path / "events")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        observability=WorkerObservability(check_interval_seconds=0.001),
+        liveness_probe=probe,
+    )
+
+    run_box: dict[str, object] = {}
+    run_thread = threading.Thread(
+        target=lambda: run_box.update(result=executor.run(JOB_ID)),
+        name="test-executor-run",
+    )
+    run_thread.start()
+    assert worker_started.wait(timeout=5)
+    assert _wait_status(store, "completion_submitted")
+    # The worker is gone while a completion is under validation: kept alive.
+    probe.die()
+    time.sleep(0.1)
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "completion_submitted"
+    assert [e for e in events.iter_events() if e.event_type == "ExecutionFailed"] == []
+
+    release_validation.set()
+    run_thread.join(timeout=15)
+    result = run_box["result"]
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "accepted"
+    assert [e for e in events.iter_events() if e.event_type == "ExecutionFailed"] == []
 
 
 def _workflow() -> WorkflowDefinition:

@@ -219,7 +219,7 @@ def lint_compiled_prompt(
             ))
         for check in contract.resolved_checks:
             command = shlex.join(check.argv) if check.argv else ""
-            if validation.count(f"- {check.id}:") != 1 or (command and validation.count(command) != 1):
+            if validation.count(f"- {check.id}:") != 1 or (command and validation.count(command) < 1):
                 errors.append(_lint_error(
                     "prompt.validation_mismatch",
                     f"Resolved validation {check.id!r} is not represented exactly once.",
@@ -365,15 +365,15 @@ def _compile_implementation_prompt(contract: ExecutionContract) -> CompiledPromp
         ),
         _section(
             "execution_procedure", "Execution Procedure", "\n".join((
-                "1. Read the mission, allowed scope, interfaces, and checks.",
-                "2. Inspect only the named paths and integration seams before editing.",
-                "3. Make the smallest coherent implementation.",
-                "4. Run the narrowest focused check, then every required project check.",
-                "5. Compare actual changes with the allowed surface.",
-                "6. Submit evidence, or stop on an out-of-scope, baseline, or environment blocker.",
+                "1. Read the mission, requirements, and required verification commands.",
+                "2. Inspect the workspace and integration seams before editing.",
+                "3. Make the smallest coherent implementation for this task.",
+                "4. Run every required project verification command locally.",
+                "5. Fix failures inside the task boundary; do not chase unrelated or environmental failures.",
+                "6. Submit completion evidence, or stop on an out-of-scope, baseline, or environment blocker.",
             )),
             "runtime_policy", f"compiler/v{PROMPT_COMPILER_VERSION}",
-            "Provides one implementation-model inspect-implement-test-audit-submit loop.",
+            "Provides one implementation-model inspect-implement-test-submit loop.",
         ),
         _section(
             "completion_submission", "Completion Submission", _completion_text(contract),
@@ -561,20 +561,12 @@ def _contract_text(
     include_requirements: bool = True,
 ) -> str:
     generated = contract.generated_contract
-    surface = generated.change_surface
     lines = [f"Objective: {generated.objective}"]
-    lines.append("Allowed additions: " + (", ".join(surface.add) or "none"))
-    lines.append("Allowed edits: " + (", ".join(surface.edit) or "none"))
-    if surface.forbidden:
-        lines.append("Forbidden paths: " + ", ".join(surface.forbidden))
-    if generated.interfaces:
-        lines.append("Interfaces:")
-        lines.extend(
-            f"- {item.symbol}"
-            + (f" {item.signature}" if item.signature else "")
-            + f": {item.behavior}"
-            for item in generated.interfaces
-        )
+    lines.append(
+        "Acceptance: the project global verification commands below must "
+        "pass. There is no file/directory allowlist; you may create, edit, rename, "
+        "or delete any files the task requires."
+    )
     if include_requirements and generated.requirements:
         lines.append("Requirements:")
         lines.extend(f"- {item}" for item in generated.requirements)
@@ -584,10 +576,6 @@ def _contract_text(
     if generated.non_goals:
         lines.append("Non-goals:")
         lines.extend(f"- {item}" for item in generated.non_goals)
-    if generated.vertical_slice_exemption is not None:
-        lines.append(
-            "Vertical-slice exemption: " + generated.vertical_slice_exemption
-        )
     return "\n".join(lines)
 
 

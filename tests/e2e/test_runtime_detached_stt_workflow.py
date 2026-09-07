@@ -99,7 +99,6 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "ApproveDirection",
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
-            "PrepareExecutionContract",
             "ImplementTask",
             "SelfReview",
         }
@@ -123,7 +122,6 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
             "DraftDirection",
             "WriteImplementationSpec",
             "BreakDownImplementationSpec",
-            "PrepareExecutionContract",
             "ImplementTask",
             "SelfReview",
         ):
@@ -212,6 +210,123 @@ def test_runtime_self_review_accepts_no_change_with_fresh_validation(
         _print_system_logs(project, capsys)
 
 
+def test_runtime_retries_rejected_local_worker_completion_after_process_exit(
+    tmp_path: Path,
+    scripted_runtime_worker_image: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exercise container exit -> verifier feedback -> repair -> acceptance."""
+    project = _make_runtime_project(
+        tmp_path,
+        scripted_runtime_worker_image,
+        scenario="implementation_feedback_repair",
+    )
+
+    try:
+        started = _run_tulid(project.root, "runtime", "start", "--interval", "0.2")
+        assert started.returncode == 0, started.stdout + started.stderr
+        _wait_for(
+            lambda: _task_state(project.project, "1") == "HumanReview",
+            "product idea to reach HumanReview",
+        )
+        manual = _run_tulid(project.root, "transition", "Agent", "1", "ApproveDirection")
+        assert manual.returncode == 0, manual.stdout + manual.stderr
+        _wait_for(
+            lambda: _task_state(project.project, "2") == "Done",
+            "rejected implementation completion to be repaired and accepted",
+            timeout=50.0,
+        )
+
+        job = _job_payload_for_transition(project, "ImplementTask")
+        assert job["status"] == "accepted"
+        assert job["attempts"] == 2
+        submissions = job["metadata"]["completion_submissions"]
+        assert submissions["implement-task-rejected"]["accepted"] is False
+        assert submissions["implement-task-repaired"]["accepted"] is True
+        workspace = Path(job["workspace_path"])
+        assert not (workspace / "forbidden-by-first-attempt.txt").exists()
+        assert "# Open Tulid Repair" in (workspace / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
+
+        events = JsonlEventStore(project.project / "events").iter_events()
+        assert any(event.event_type == "ExecutionCompletionRejected" and event.job_id == job["job_id"] for event in events)
+        assert any(event.event_type == "TransitionAccepted" and event.job_id == job["job_id"] for event in events)
+        # --rm must leave no exited container behind, and the accepted record
+        # proves that the earlier non-zero process exit did not strand RUNNING.
+        inspected = subprocess.run(
+            ("docker", "container", "inspect", f"open-tulid-job-{job['job_id'].lower()}"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert inspected.returncode != 0
+    finally:
+        _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
+        _print_system_logs(project, capsys)
+
+
+def test_runtime_rejected_completion_retries_under_global_contract_without_contract_recovery(
+    tmp_path: Path,
+    scripted_runtime_worker_image: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A rejected implementation completion retries on the *same* implement job
+    under project-global policy. It never re-enters PrepareExecutionContract and
+    never resets the task to Todo to regenerate a per-task contract."""
+    project = _make_runtime_project(
+        tmp_path,
+        scripted_runtime_worker_image,
+        scenario="implementation_feedback_repair",
+    )
+
+    try:
+        started = _run_tulid(project.root, "runtime", "start", "--interval", "0.2")
+        assert started.returncode == 0, started.stdout + started.stderr
+
+        _wait_for(
+            lambda: _task_state(project.project, "1") == "HumanReview",
+            "product idea to reach HumanReview",
+        )
+        manual = _run_tulid(project.root, "transition", "Agent", "1", "ApproveDirection")
+        assert manual.returncode == 0, manual.stdout + manual.stderr
+
+        _wait_for(
+            lambda: _task_state(project.project, "2") == "Done",
+            "implementation task to be repaired and accepted under the global contract",
+            timeout=50.0,
+        )
+
+        events = JsonlEventStore(project.project / "events").iter_events()
+        rejected = [event for event in events if event.event_type == "ExecutionCompletionRejected"]
+        assert len(rejected) == 1
+
+        # No contract-regeneration machinery: no PrepareExecutionContract jobs,
+        # no ContractInvalidated events, and the task is never reset to Todo.
+        assert all(
+            payload.get("transition_id") != "PrepareExecutionContract"
+            for payload in _job_payloads(project)
+        )
+        assert not any(event.event_type == "ContractInvalidated" for event in events)
+        transitions = {
+            event.transition_id
+            for event in events
+            if event.event_type == "TransitionAccepted"
+        }
+        assert "ImplementTask" in transitions
+
+        job = _job_payload_for_transition(project, "ImplementTask")
+        assert job["status"] == "accepted"
+        assert job["attempts"] == 2
+        scheduler_stdout = _scheduler_stdout(project)
+        assert "code=task.contract_invalidated" not in scheduler_stdout
+        assert (project.repo / "app.py").read_text(encoding="utf-8").startswith(
+            "def healthz():\n    return 'ok'\n"
+        )
+    finally:
+        _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
+        _print_system_logs(project, capsys)
+
+
 def _make_runtime_project(
     tmp_path: Path,
     worker_image: str,
@@ -227,6 +342,10 @@ def _make_runtime_project(
     shutil.copytree(fixture_project / "Agent", project)
     shutil.copytree(fixture_project / "repo", repo)
     shutil.copy2(fixture_project / "workflow.yaml", project / "workflow.yaml")
+    shutil.copy2(fixture_project / "acceptance.yaml", project / "acceptance.yaml")
+    shutil.copy2(fixture_project / "contract.yaml", project / "contract.yaml")
+    (project / "docs").mkdir(mode=0o755)
+    (project / "events").mkdir(mode=0o755)
     (root / CONFIG_DIRNAME).mkdir(parents=True)
     config_template = (fixture_project / "config.yaml.template").read_text(encoding="utf-8")
     (root / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(

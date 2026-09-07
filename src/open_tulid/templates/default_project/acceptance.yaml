@@ -1,4 +1,8 @@
 schema: tulid.acceptance/v1
 policy:
-  require_vertical_slice: true
+  # Acceptance profiles are optional standalone infrastructure. They are NOT part
+  # of the command-only global contract: project acceptance is governed by the
+  # commands in contract.yaml, never by a file allowlist or generated per-task
+  # contract.
+  require_vertical_slice: false
 profiles: {}

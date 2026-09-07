@@ -34,6 +34,7 @@ class RuntimeConfig:
     completion_port: int = 0
     completion_container_host: str = "host.docker.internal"
     container_volume_relabel: bool = False
+    worker_liveness_check_interval_seconds: float = 60.0
 
 
 @dataclass(frozen=True)

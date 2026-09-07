@@ -35,6 +35,7 @@ from open_tulid.domain import (
 from open_tulid.models import Config, ProjectConfig, ValidationReport
 from open_tulid.runtime import (
     ArtifactSubmission,
+    standard_contract_configured,
     CompletionService,
     CompletionEndpointConfig,
     CompletionSubmission,
@@ -54,6 +55,7 @@ from open_tulid.runtime import (
     build_event,
     check_backend_readiness,
     cleanup_job_workspaces,
+    compile_standard_execution_contract,
     compile_task_execution_contract,
     compiled_prompt_from_metadata,
     find_review_evidence,
@@ -69,7 +71,10 @@ from open_tulid.runtime import (
     human_event_type,
     new_ulid,
 )
-from open_tulid.runtime.task_contracts import find_implementation_contract_path
+from open_tulid.runtime.task_contracts import (
+    find_implementation_contract_path,
+    task_uses_global_contract,
+)
 from open_tulid.vault.project import create_project
 from open_tulid.vault.validator import validate_vault
 from open_tulid.workflow.runtime import load_workflow_definition
@@ -658,6 +663,7 @@ def run_job(
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
         containers=ctx["containers"],
+        worker_liveness_check_interval_seconds=ctx["config"].runtime.worker_liveness_check_interval_seconds,
     )
     result = executor.run(job_id)
     if not result.accepted:
@@ -785,11 +791,7 @@ def runtime_start(
     proxy_state_path = _proxy_state_path(config)
     proxy_state = _load_runtime_state(proxy_state_path)
     proxy_command = _self_cli_command("model-proxy", "serve")
-    proxy_running = proxy_state is not None and _state_process_is_running(
-        proxy_state,
-        "proxy_pid",
-        expected_command=proxy_command,
-    )
+    proxy_running = proxy_state is not None and _proxy_is_running(config)
     scheduler_states: dict[str, tuple[Path, dict[str, object] | None, bool]] = {}
     for project_name in projects:
         state_path = _runtime_state_path(config, project_name)
@@ -935,11 +937,7 @@ def runtime_stop(
     if not _any_scheduler_running(config):
         proxy_state_path = _proxy_state_path(config)
         proxy_state = _load_runtime_state(proxy_state_path)
-        if proxy_state is not None and _state_process_is_running(
-            proxy_state,
-            "proxy_pid",
-            expected_command=_self_cli_command("model-proxy", "serve"),
-        ):
+        if proxy_state is not None and _proxy_is_running(config):
             os.kill(int(proxy_state["proxy_pid"]), signal.SIGTERM)
             if not _wait_for_pid_exit(int(proxy_state["proxy_pid"])):
                 console.print(_runtime_log_line(
@@ -965,11 +963,7 @@ def runtime_status(
     """Show whether the detached runtime processes are running."""
     config = _load_cli_config()
     proxy_state = _load_runtime_state(_proxy_state_path(config))
-    proxy_running = proxy_state is not None and _state_process_is_running(
-        proxy_state,
-        "proxy_pid",
-        expected_command=_self_cli_command("model-proxy", "serve"),
-    )
+    proxy_running = proxy_state is not None and _proxy_is_running(config)
     projects = _resolve_projects(config, project)
     lines: list[str] = []
     for project_name in projects:
@@ -1302,18 +1296,11 @@ def _render_prompt_preview(
 
     assert transition.worker is not None
     execution_contract = None
-    task_type = getattr(workflow, "task_types", {}).get(task.task_type)
-    source_requirements = (
-        task_type.requirements_by_state.get(transition.from_state)
-        if task_type is not None
-        else None
-    )
     if (
-        source_requirements is not None
-        and "ImplementationContract" in source_requirements.artifacts
-        and find_implementation_contract_path(project_path, task) is not None
+        task_uses_global_contract(task, workflow)
+        and standard_contract_configured(project_path)
     ):
-        compiled = compile_task_execution_contract(
+        compiled = compile_standard_execution_contract(
             project_root=project_path,
             repo_root=_project_config(config, project).repo_root,
             task=task,
@@ -1325,6 +1312,30 @@ def _render_prompt_preview(
         execution_contract = compiled.contract
         task = execution_contract.source_task
         transition = execution_contract.transition
+    else:
+        task_type = getattr(workflow, "task_types", {}).get(task.task_type)
+        source_requirements = (
+            task_type.requirements_by_state.get(transition.from_state)
+            if task_type is not None
+            else None
+        )
+        if (
+            source_requirements is not None
+            and "ImplementationContract" in source_requirements.artifacts
+            and find_implementation_contract_path(project_path, task) is not None
+        ):
+            compiled = compile_task_execution_contract(
+                project_root=project_path,
+                repo_root=_project_config(config, project).repo_root,
+                task=task,
+                transition=transition,
+            )
+            if not compiled.accepted or compiled.contract is None:
+                _print_domain_errors(compiled.errors)
+                raise typer.Exit(1)
+            execution_contract = compiled.contract
+            task = execution_contract.source_task
+            transition = execution_contract.transition
     render_kwargs = {}
     if (
         execution_contract is not None
@@ -2220,6 +2231,17 @@ def _proxy_listener_ready(
         except OSError:
             time.sleep(poll_interval)
     return False
+
+
+def _proxy_is_running(config: Config) -> bool:
+    proxy_state = _load_runtime_state(_proxy_state_path(config))
+    if proxy_state is None:
+        return False
+    return _state_process_is_running(
+        proxy_state,
+        "proxy_pid",
+        expected_command=_self_cli_command("model-proxy", "serve"),
+    )
 
 
 def _any_scheduler_running(config: Config) -> bool:

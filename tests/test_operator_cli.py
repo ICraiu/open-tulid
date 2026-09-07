@@ -55,6 +55,41 @@ def _with_cwd(path: Path):
     return Cwd()
 
 
+def _recorded_start_time() -> int:
+    return 100
+
+
+def _scheduler_state_json(project: str, pid: int, start_time: int = 100) -> str:
+    return json.dumps({
+        "scheduler_pid": pid,
+        "pid_start_time": start_time,
+        "command": cli_main._self_cli_command("jobs", "daemon", project, "--interval", "30.0"),
+        "project": project,
+    }, sort_keys=True)
+
+
+def _proxy_state_json(pid: int, start_time: int = 100) -> str:
+    return json.dumps({
+        "proxy_pid": pid,
+        "pid_start_time": start_time,
+        "command": cli_main._self_cli_command("model-proxy", "serve"),
+    }, sort_keys=True)
+
+
+def _write_scheduler_state(root: Path, project: str, pid: int) -> Path:
+    state_path = root / CONFIG_DIRNAME / "runtime" / f"{project}.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(_scheduler_state_json(project, pid), encoding="utf-8")
+    return state_path
+
+
+def _patch_start_time(monkeypatch, start_time: int = 100) -> None:
+    monkeypatch.setattr(
+        "open_tulid.cli.main._process_start_time_ticks",
+        lambda pid: start_time,
+    )
+
+
 def test_log_with_count_prints_recent_human_event_lines(tmp_path: Path):
     _write_config(tmp_path)
     events = tmp_path / "Agent" / "events"
@@ -257,6 +292,9 @@ def test_runtime_start_reuses_running_scheduler_when_only_proxy_is_down(tmp_path
     monkeypatch.setattr("open_tulid.cli.main.check_backend_readiness", lambda *args, **kwargs: ())
     monkeypatch.setattr("open_tulid.cli.main._proxy_listener_ready", lambda config: True)
     monkeypatch.setattr("open_tulid.cli.main._ensure_project_runtime_images", lambda config, project: None)
+    # pid 9876 may coincide with a real host process; the scheduler-state guard
+    # must fall back to the recorded state, not the live /proc command lines
+    monkeypatch.setattr("open_tulid.cli.main._process_cmdline", lambda pid: [])
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "start"])
@@ -378,6 +416,43 @@ def test_runtime_state_process_accepts_matching_start_time_when_cmdline_unavaila
     ) is True
 
 
+def test_runtime_state_process_accepts_valid_proxy_matching_start_time(monkeypatch):
+    proxy_command = cli_main._self_cli_command("model-proxy", "serve")
+    state = {
+        "proxy_pid": 9876,
+        "pid_start_time": 100,
+        "command": proxy_command,
+    }
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value == 9876)
+    # A pid that coincides with an unrelated host process must still be
+    # recognized as the proxy when its recorded start time matches.
+    monkeypatch.setattr("open_tulid.cli.main._process_start_time_ticks", lambda pid: 100)
+    monkeypatch.setattr("open_tulid.cli.main._process_cmdline", lambda pid: ["/usr/bin/unrelated"])
+
+    assert cli_main._state_process_is_running(
+        state,
+        "proxy_pid",
+        expected_command=proxy_command,
+    ) is True
+
+
+def test_runtime_state_process_rejects_reused_proxy_pid_with_different_start_time(monkeypatch):
+    proxy_command = cli_main._self_cli_command("model-proxy", "serve")
+    state = {
+        "proxy_pid": 9876,
+        "pid_start_time": 100,
+        "command": proxy_command,
+    }
+    monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value == 9876)
+    monkeypatch.setattr("open_tulid.cli.main._process_start_time_ticks", lambda pid: 200)
+
+    assert cli_main._state_process_is_running(
+        state,
+        "proxy_pid",
+        expected_command=proxy_command,
+    ) is False
+
+
 def test_runtime_start_fails_active_jobs_even_without_prior_state_file(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
     job_store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
@@ -444,11 +519,14 @@ def test_proxy_listener_ready_retries_until_listener_accepts(monkeypatch):
 
 def test_runtime_status_reports_running_processes(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"scheduler_pid": 4321, "proxy_pid": 9876, "project": "Agent"}', encoding="utf-8")
-    (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    state_path = _write_scheduler_state(tmp_path, "Agent", 4321)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["proxy_pid"] = 9876
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
+    proxy_state.write_text(_proxy_state_json(9876), encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
+    _patch_start_time(monkeypatch)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "status"])
@@ -461,10 +539,11 @@ def test_runtime_status_without_project_reports_all_projects(tmp_path: Path, mon
     _write_config(tmp_path, projects=("Agent", "Beta"))
     state_root = tmp_path / CONFIG_DIRNAME / "runtime"
     state_root.mkdir(parents=True)
-    (state_root / "Agent.json").write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
-    (state_root / "Beta.json").write_text('{"scheduler_pid": 5432, "project": "Beta"}', encoding="utf-8")
-    (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    (state_root / "Agent.json").write_text(_scheduler_state_json("Agent", 4321), encoding="utf-8")
+    (state_root / "Beta.json").write_text(_scheduler_state_json("Beta", 5432), encoding="utf-8")
+    (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text(_proxy_state_json(9876), encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 5432, 9876})
+    _patch_start_time(monkeypatch)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "status"])
@@ -479,15 +558,17 @@ def test_runtime_status_without_project_reports_all_projects(tmp_path: Path, mon
 
 def test_runtime_stop_signals_processes_and_removes_state(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"scheduler_pid": 4321, "proxy_pid": 9876, "project": "Agent"}', encoding="utf-8")
+    state_path = _write_scheduler_state(tmp_path, "Agent", 4321)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["proxy_pid"] = 9876
+    state_path.write_text(json.dumps(state), encoding="utf-8")
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
-    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    proxy_state.write_text(_proxy_state_json(9876), encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
     monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: True)
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: killed.append((pid, sig)))
+    _patch_start_time(monkeypatch)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "stop"])
@@ -504,15 +585,16 @@ def test_runtime_stop_without_project_stops_all_projects(tmp_path: Path, monkeyp
     _write_config(tmp_path, projects=("Agent", "Beta"))
     state_root = tmp_path / CONFIG_DIRNAME / "runtime"
     state_root.mkdir(parents=True)
-    (state_root / "Agent.json").write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
-    (state_root / "Beta.json").write_text('{"scheduler_pid": 5432, "project": "Beta"}', encoding="utf-8")
+    (state_root / "Agent.json").write_text(_scheduler_state_json("Agent", 4321), encoding="utf-8")
+    (state_root / "Beta.json").write_text(_scheduler_state_json("Beta", 5432), encoding="utf-8")
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
-    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    proxy_state.write_text(_proxy_state_json(9876), encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 5432, 9876})
     monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: True)
     monkeypatch.setattr("open_tulid.cli.main._reconcile_active_runtime_jobs", lambda *args, **kwargs: None)
     killed: list[tuple[int, int]] = []
     monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: killed.append((pid, sig)))
+    _patch_start_time(monkeypatch)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "stop"])
@@ -611,13 +693,12 @@ def test_runtime_stop_fails_completion_submitted_jobs(tmp_path: Path, monkeypatc
 
 def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    state_path = _write_scheduler_state(tmp_path, "Agent", 4321)
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
-    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    proxy_state.write_text(_proxy_state_json(9876), encoding="utf-8")
     alive = {4321, 9876}
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in alive)
+    _patch_start_time(monkeypatch)
 
     waited = []
 
@@ -657,16 +738,15 @@ def test_runtime_stop_refuses_to_claim_success_when_scheduler_does_not_exit(tmp_
 
 def test_runtime_stop_refuses_to_claim_success_when_proxy_does_not_exit(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    state_path = _write_scheduler_state(tmp_path, "Agent", 4321)
     proxy_state = tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json"
-    proxy_state.write_text('{"proxy_pid": 9876}', encoding="utf-8")
+    proxy_state.write_text(_proxy_state_json(9876), encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
     waits = iter((True, False))
     monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: next(waits))
     monkeypatch.setattr("open_tulid.cli.main._any_scheduler_running", lambda config: False)
     monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: None)
+    _patch_start_time(monkeypatch)
 
     with _with_cwd(tmp_path):
         result = runner.invoke(app, ["runtime", "stop"])

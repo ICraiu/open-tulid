@@ -33,16 +33,26 @@ def test_implementation_failure_gets_evidence_only_bounded_repair_packet():
     assert "Execution Contract" not in plan.packet
 
 
-def test_non_implementation_failure_does_not_spend_or_create_repair():
+def test_contract_failure_gets_a_bounded_repair_packet():
     plan = plan_repair(
         report=_report("contract_failure"),
         errors=(DomainError(code="verification.path_forbidden", message="outside scope"),),
         repair_attempts=0,
     )
 
+    assert plan.eligible is True
+    assert plan.packet is not None
+
+
+def test_environment_failure_does_not_create_a_worker_repair():
+    plan = plan_repair(
+        report=_report("environment_failure"),
+        errors=(DomainError(code="verification.check_environment", message="unavailable"),),
+        repair_attempts=0,
+    )
+
     assert plan.eligible is False
-    assert plan.reason == "contract_failure"
-    assert plan.packet is None
+    assert plan.reason == "environment_failure"
 
 
 def test_repair_limit_blocks_additional_packet():

@@ -81,11 +81,6 @@ statements:
   - kind: task_type
     id: ImplementationTask
     instructions: [default]
-    requirements:
-      ReadyToImplement:
-        artifacts: [ImplementationContract]
-      SelfReview:
-        artifacts: [ImplementationContract]
 
   - kind: validation_type
     id: tests_pass
@@ -97,12 +92,6 @@ statements:
     args:
       command:
         type: string
-  - kind: validation_type
-    id: implementation_contract_valid
-    args:
-      path:
-        type: string
-        required: true
 
   - kind: artifact_type
     id: ProductSpec
@@ -120,9 +109,6 @@ statements:
     template: implementation-spec.md
   - kind: artifact_type
     id: ImplementationTaskFile
-  - kind: artifact_type
-    id: ImplementationContract
-    template: implementation-contract.yaml
 
   - kind: worker
     id: codex_direction
@@ -144,10 +130,6 @@ statements:
     id: codex_breakdown
     type: codex
     instructions: [default, task-breakdown]
-  - kind: worker
-    id: codex_contract
-    type: codex
-    instructions: [default, execution-contract-authoring]
   - kind: worker
     id: peon-llm
     type: local_llm
@@ -225,22 +207,24 @@ statements:
       state: Todo
       artifact_type: ImplementationTaskFile
 
-  - kind: transition
-    id: PrepareExecutionContract
-    task_type: ImplementationTask
-    from: Todo
-    to: ReadyToImplement
-    worker: codex_contract
-    default_for_scheduler: true
-    requires:
-      artifacts: [ImplementationContract]
-      validations:
-        - type: implementation_contract_valid
-          args:
-            path: output/implementation-contract.yaml
-
+  # Implementation tasks schedule directly with the project global contract.
+  # There is no per-task PrepareExecutionContract/LLM contract-authoring step.
   - kind: transition
     id: ImplementTask
+    task_type: ImplementationTask
+    from: Todo
+    to: SelfReview
+    worker: peon-llm
+    default_for_scheduler: true
+    requires:
+      changed_files:
+        required: true
+
+  # Backward-compatible migration path: tasks that were prepared under the old
+  # per-task contract workflow and still sit in ReadyToImplement may advance
+  # directly to implementation under the global contract, skipping regeneration.
+  - kind: transition
+    id: ImplementFromReadyToImplement
     task_type: ImplementationTask
     from: ReadyToImplement
     to: SelfReview
@@ -249,12 +233,6 @@ statements:
     requires:
       changed_files:
         required: true
-
-  - kind: transition
-    id: InvalidateExecutionContract
-    task_type: ImplementationTask
-    from: ReadyToImplement
-    to: Todo
 
   - kind: transition
     id: InvalidateReviewedExecutionContract

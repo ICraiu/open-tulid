@@ -18,6 +18,7 @@ from open_tulid.domain import (
 
 from .events import build_event, new_ulid
 from .execution_contracts import (
+    compile_standard_execution_contract,
     compile_task_execution_contract,
     execution_contract_to_dict,
 )
@@ -28,6 +29,7 @@ from .prompts import (
 )
 from .task_contracts import (
     implementation_contract_required,
+    task_uses_global_contract,
 )
 
 
@@ -227,13 +229,30 @@ class TaskManager:
             ),))
         frozen_contract = None
         compiled_prompt = None
-        if implementation_contract_required(task, self.workflow):
-            if self.project_root is None:
+        uses_global_contract = task_uses_global_contract(task, self.workflow)
+        if self.project_root is None:
+            if uses_global_contract:
                 return CommandResult(accepted=False, errors=(_error(
                     "execution_contract.project_root_missing",
-                    "Contract-backed execution requires a project tracker root.",
+                    "Global-contract execution requires a project tracker root.",
                     task.id,
                 ),))
+        elif uses_global_contract:
+            # Primary path: compile from the project global contract (contract.yaml)
+            # plus acceptance.yaml. No per-task LLM-authored contract is needed.
+            compiled = compile_standard_execution_contract(
+                project_root=self.project_root,
+                repo_root=self.repo_root,
+                task=task,
+                transition=transition,
+            )
+            if not compiled.accepted or compiled.contract is None:
+                return CommandResult(accepted=False, errors=compiled.errors)
+            frozen_contract = compiled.contract
+        elif implementation_contract_required(task, self.workflow):
+            # Backward-compatible legacy path: a workflow still requires a
+            # per-task ImplementationContract artifact. Kept only for historical
+            # and migrated projects; new workflows never take this branch.
             compiled = compile_task_execution_contract(
                 project_root=self.project_root,
                 repo_root=self.repo_root,
@@ -243,6 +262,7 @@ class TaskManager:
             if not compiled.accepted or compiled.contract is None:
                 return CommandResult(accepted=False, errors=compiled.errors)
             frozen_contract = compiled.contract
+        if frozen_contract is not None:
             review_evidence = None
             if is_review_transition(transition):
                 if self.history_job_store is None:

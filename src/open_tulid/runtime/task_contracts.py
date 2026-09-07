@@ -130,6 +130,9 @@ def implementation_contract_required(
     task: Task,
     workflow: WorkflowDefinition,
 ) -> bool:
+    """Deprecated: True only for legacy task types that still require a generated
+    per-task ImplementationContract artifact. New projects use the project global
+    contract (see :func:`task_uses_global_contract`) and do not require one."""
     task_type = workflow.task_types.get(task.task_type)
     if task_type is None:
         return False
@@ -138,6 +141,18 @@ def implementation_contract_required(
         requirements is not None
         and "ImplementationContract" in requirements.artifacts
     )
+
+
+def task_uses_global_contract(task: Task, workflow: WorkflowDefinition) -> bool:
+    """A task is global-contract driven when its task type is the implementation
+    type. Worker transitions for such tasks are scheduled directly under the
+    project global contract (``contract.yaml``) instead of a per-task
+    LLM-authored implementation contract."""
+    task_types = getattr(workflow, "task_types", None) or {}
+    task_type = task_types.get(task.task_type)
+    if task_type is None:
+        return False
+    return task.task_type == "ImplementationTask"
 
 
 def parse_implementation_contract_file(

@@ -9,9 +9,7 @@ import fcntl
 from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import (
     DomainError,
-    EventActor,
     EventEnvelope,
-    EventType,
     ExecutionJob,
     ExecutionJobStatus,
     ProjectSnapshot,
@@ -20,14 +18,10 @@ from open_tulid.domain import (
     WorkflowDefinition,
 )
 
-from .events import build_event, new_ulid
+from .events import new_ulid
 from .events import JsonlEventStore, TransactionJournalStore
 from .jobs import FileExecutionJobStore, JobStoreResult
 from .resources import FileResourceLeaseStore
-from .task_contracts import (
-    implementation_contract_required,
-    validate_task_implementation_contract,
-)
 from .task_manager import CreateExecutionJob, TaskManager
 from .transactions import FileTransactionRuntime
 
@@ -144,74 +138,6 @@ class Scheduler:
             if dependency_error is not None:
                 skipped.append(dependency_error)
                 continue
-
-            if (
-                self.project_root is not None
-                and implementation_contract_required(task, self.workflow)
-            ):
-                contract = validate_task_implementation_contract(self.project_root, task)
-                if not contract.accepted:
-                    recovery = _contract_recovery_transition(task, self.workflow)
-                    if isinstance(recovery, DomainError):
-                        skipped.append(recovery)
-                        continue
-                    moved = self.adapter.move_task(task.id, recovery.to_state)
-                    if not moved.accepted:
-                        return ScheduleResult(
-                            scheduled=False,
-                            task_id=task.id,
-                            errors=moved.errors or (_error(
-                                "contract.invalidation_move_failed",
-                                f"Could not move task {task.id!r} back to {recovery.to_state!r}.",
-                                task.id,
-                            ),),
-                            skipped=tuple(skipped),
-                        )
-                    event = build_event(
-                        project_id=project_id,
-                        actor=EventActor(type="system", id="contract-readiness-guard"),
-                        event_type=EventType.ContractInvalidated,
-                        correlation_id=new_ulid(),
-                        task_id=task.id,
-                        transition_id=recovery.id,
-                        data={
-                            "from_state": task.current_state,
-                            "to_state": recovery.to_state,
-                            "error_codes": [error.code for error in contract.errors],
-                            "reason": "generated_contract_missing_or_stale",
-                        },
-                    )
-                    events_persisted = False
-                    if self.event_store is not None:
-                        appended = self.event_store.append(event)
-                        if not appended.accepted:
-                            return ScheduleResult(
-                                scheduled=False,
-                                task_id=task.id,
-                                errors=(appended.error or _error(
-                                    "event.append_failed",
-                                    "Could not record contract invalidation.",
-                                    task.id,
-                                ),),
-                                skipped=tuple(skipped),
-                            )
-                        events_persisted = True
-                    invalidated = _error(
-                        "task.contract_invalidated",
-                        (
-                            f"Task {task.id!r} changed after its execution contract was "
-                            f"prepared; moved it to {recovery.to_state!r} for regeneration."
-                        ),
-                        task.id,
-                    )
-                    return ScheduleResult(
-                        scheduled=False,
-                        task_id=task.id,
-                        transition_id=recovery.id,
-                        skipped=(*skipped, invalidated),
-                        events=(event,),
-                        events_persisted=events_persisted,
-                    )
 
             transition_result = select_scheduler_transition(task, self.workflow)
             if isinstance(transition_result, DomainError):
@@ -334,13 +260,13 @@ class Scheduler:
                 if required_resources and self.lease_store is not None:
                     self.lease_store.release_job(reserved_job_id)
                 return ScheduleResult(
-                scheduled=False,
-                task_id=task.id,
-                transition_id=transition.id,
-                errors=created.errors,
-                skipped=tuple(skipped),
-                events=created.events,
-            )
+                    scheduled=False,
+                    task_id=task.id,
+                    transition_id=transition.id,
+                    errors=created.errors,
+                    skipped=tuple(skipped),
+                    events=created.events,
+                )
             return ScheduleResult(
                 scheduled=True,
                 job=created.job,
@@ -540,6 +466,7 @@ def _find_recent_failed_job(
         and job.task_id == task_id
         and job.transition_id == transition_id
         and _status_value(job.status) == ExecutionJobStatus.FAILED.value
+        and job.metadata.get("failure_reason") != "worker_unexpected_exit"
         and (updated_at := _job_timestamp(job)) is not None
         and updated_at >= cutoff
         and (session_cutoff is None or updated_at >= session_cutoff)
@@ -648,37 +575,6 @@ def _has_scheduler_eligible_transition(task: Task, workflow: WorkflowDefinition)
         and transition.from_state == task.current_state
         and transition.worker is not None
         for transition in workflow.transitions.values()
-    )
-
-
-def _contract_recovery_transition(
-    task: Task,
-    workflow: WorkflowDefinition,
-) -> TransitionDefinition | DomainError:
-    preparation_sources = {
-        transition.from_state
-        for transition in workflow.transitions.values()
-        if transition.task_type == task.task_type
-        and "ImplementationContract" in transition.requires.artifacts
-    }
-    candidates = tuple(
-        transition
-        for transition in workflow.transitions.values()
-        if transition.task_type == task.task_type
-        and transition.from_state == task.current_state
-        and transition.to_state in preparation_sources
-        and transition.worker is None
-    )
-    if len(candidates) == 1:
-        return candidates[0]
-    return _error(
-        "contract.invalidation_transition_missing",
-        (
-            f"Task {task.id!r} has a missing or stale ImplementationContract, but "
-            f"workflow state {task.current_state!r} has no single workerless recovery "
-            "transition back to contract preparation."
-        ),
-        task.id,
     )
 
 

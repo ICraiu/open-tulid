@@ -120,6 +120,29 @@ def test_contract_rejects_stale_source_and_shell_control_tokens() -> None:
     }
 
 
+def test_contract_rejects_blank_commands_and_prose_invariants() -> None:
+    task = _task()
+    contract = _contract(task).replace(
+        "requirements:\n  - Preserve all existing endpoints.",
+        "requirements:\n  - Preserve all existing endpoints.\n  - ",
+    ).replace(
+        "argv: [python, -m, pytest, tests/test_health.py, -q]",
+        "argv: [python, '', pytest, tests/test_health.py, -q]",
+    ).replace(
+        "invariants: []",
+        "invariants:\n  - Importing the app must never listen.",
+    )
+
+    parsed = parse_implementation_contract(contract)
+
+    assert parsed.accepted is False
+    assert {error.code for error in parsed.errors} >= {
+        "contract.list_item_invalid",
+        "contract.check_argv_empty",
+        "contract.invariant_id_invalid",
+    }
+
+
 def test_documentation_profile_requires_markdown_change_surface() -> None:
     task = _task()
 

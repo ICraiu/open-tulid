@@ -78,7 +78,19 @@ def _make_task(vault_root: Path, project_name: str, task_name: str) -> Path:
         "state: Todo\n"
         "---\n"
         "\n"
-        f"## Idea\n\nIdea: {task_name}\n",
+        f"Idea {task_name} captures an unmet product need.\n"
+        "\n"
+        "## Why\n"
+        "Background for why the idea matters.\n"
+        "\n"
+        "## What\n"
+        "What product behavior the idea changes.\n"
+        "\n"
+        "## How\n"
+        "Which seam to touch first.\n"
+        "\n"
+        "## Acceptance\n"
+        "- the idea is described\n",
         encoding="utf-8",
     )
     return task_file
@@ -205,7 +217,23 @@ class TestVaultValidateHappyPath:
             "Work.md": "## Idea\n- [ ] [[New product idea]]\n",
         })
         task_path = project / "tasks" / "New product idea.md"
-        task_path.write_text("# New product idea\n\nBuild something useful.\n", encoding="utf-8")
+        task_path.write_text(
+            "# New product idea\n\n"
+            "Build something useful.\n"
+            "\n"
+            "## Why\n"
+            "Why the product needs it.\n"
+            "\n"
+            "## What\n"
+            "What changes.\n"
+            "\n"
+            "## How\n"
+            "Which seam to touch.\n"
+            "\n"
+            "## Acceptance\n"
+            "- the idea is accepted\n",
+            encoding="utf-8",
+        )
 
         original = os.getcwd()
         try:
@@ -628,7 +656,21 @@ def test_project_validation_uses_runtime_workflow_semantics(tmp_path: Path):
         "Work.md": f"## Review\n- [ ] [[{TASK_ID}-task]]\n",
     })
     (project_dir / "tasks" / f"{TASK_ID}-task.md").write_text(
-        f"---\nid: {TASK_ID}\ntype: task\nstate: Review\n---\n\n# Task\n",
+        f"---\nid: {TASK_ID}\ntype: task\nstate: Review\n---\n\n"
+        "# Task\n"
+        "The task body.\n"
+        "\n"
+        "## Why\n"
+        "Why the task matters.\n"
+        "\n"
+        "## What\n"
+        "What the task changes.\n"
+        "\n"
+        "## How\n"
+        "Which seam to touch.\n"
+        "\n"
+        "## Acceptance\n"
+        "- the task is reviewed\n",
         encoding="utf-8",
     )
     workflow = WorkflowDefinition(

@@ -11,6 +11,10 @@ from open_tulid.adapters import (
 )
 from open_tulid.models import Config, Project, ValidationError, ValidationReport
 from open_tulid.runtime import TaskManager, ValidateProject
+from open_tulid.runtime.standard_contracts import (
+    standard_contract_configured,
+    load_standard_contract,
+)
 from open_tulid.vault.links import validate_kanban_file
 from open_tulid.vault.project import iter_configured_projects
 from open_tulid.workflow.runtime import load_workflow_definition
@@ -46,6 +50,19 @@ def validate_project(
             line=None,
             message=f"Project '{project.name}' is missing required file: workflow.yaml",
         ))
+
+    # Validate the project standard contract before any runtime is started.
+    if standard_contract_configured(abs_project):
+        standard_result = load_standard_contract(abs_project)
+        if not standard_result.accepted:
+            report.errors.extend(
+                ValidationError(
+                    path=Path(error.location) if error.location is not None else abs_project,
+                    line=None,
+                    message=f"{error.code}: {error.message}",
+                )
+                for error in standard_result.errors
+            )
 
     # Validate kanban directory contents
     kanban_dir = abs_project / "kanban"

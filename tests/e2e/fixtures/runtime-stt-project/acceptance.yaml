@@ -1,0 +1,10 @@
+schema: tulid.acceptance/v1
+policy:
+  require_vertical_slice: true
+profiles:
+  health_vertical_slice:
+    kind: vertical_slice
+    argv: [python, check_repo.py, vertical]
+    timeout_seconds: 120
+    expect:
+      exit_code: 0

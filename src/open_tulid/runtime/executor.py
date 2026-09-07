@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace_request
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
@@ -15,6 +17,7 @@ from open_tulid.domain import (
     DomainError,
     EventActor,
     EventType,
+    ExecutionJob,
     ExecutionJobStatus,
     Task,
     TransitionDefinition,
@@ -38,12 +41,13 @@ from open_tulid.runtime.prompts import (
     compiled_prompt_from_metadata,
 )
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
-from open_tulid.runtime.task_contracts import (
-    implementation_contract_required,
-    validate_task_implementation_contract,
-)
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
+from open_tulid.runtime.observability import (
+    WorkerExited,
+    WorkerLivenessProbe,
+    WorkerObservability,
+)
 from open_tulid.runtime.workspaces import WorkspacePreparer
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -59,6 +63,7 @@ COMPLETION_SETTLE_STATUSES = frozenset({
 
 DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS = 1800.0
 OPENCODE_TULID_AGENT = "tulid-build"
+_WORKER_POLL_SECONDS = 0.05
 _active_containers_service: ContainersService | None = None
 
 
@@ -205,6 +210,9 @@ class JobExecutor:
         validation_context_factory: object | None = None,
         completion_settle_timeout_seconds: float = DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS,
         containers: ContainersService | None = None,
+        observability: WorkerObservability | None = None,
+        worker_liveness_check_interval_seconds: float | None = None,
+        liveness_probe: WorkerLivenessProbe | None = None,
     ) -> None:
         self.workflow = workflow
         self.adapter = adapter
@@ -223,6 +231,20 @@ class JobExecutor:
         self.validation_context_factory = validation_context_factory
         self.completion_settle_timeout_seconds = completion_settle_timeout_seconds
         self.containers = containers or build_containers_service()
+        if observability is not None:
+            self.observability = observability
+        else:
+            interval = (
+                worker_liveness_check_interval_seconds
+                if worker_liveness_check_interval_seconds is not None
+                else getattr(
+                    runtime,
+                    "worker_liveness_check_interval_seconds",
+                    60.0,
+                )
+            )
+            self.observability = WorkerObservability(check_interval_seconds=interval)
+        self.liveness_probe = liveness_probe
 
     def run(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
@@ -258,21 +280,6 @@ class JobExecutor:
             if frozen.contract is not None
             else task_result.task
         )
-        project_root = _adapter_project_root(self.adapter)
-        if (
-            frozen.contract is None
-            and project_root is not None
-            and implementation_contract_required(
-                task_result.task,
-                self.workflow,
-            )
-        ):
-            contract = validate_task_implementation_contract(
-                project_root,
-                task_result.task,
-            )
-            if not contract.accepted:
-                return self._fail_before_run(job, contract.errors[0])
 
         required_resources = self.runtime.worker_resources.get(job.worker_id, ())
         lease_acquired = False
@@ -384,6 +391,7 @@ class JobExecutor:
 
             implementation_id = _execution_worker_id(worker, job.worker_id)
             model_proxy_env = self._model_proxy_env(job.job_id, job.worker_id, required_resources)
+            standard_runtime = _project_standard_runtime(self.adapter)
             worker_args = _worker_args(
                 runtime=self.runtime,
                 worker_id=job.worker_id,
@@ -391,15 +399,15 @@ class JobExecutor:
                 container_workspace=self.runtime.container_workspace,
                 completion_endpoint=endpoint.url,
             )
-            _write_opencode_model_config_if_needed(
+            opencode_config = _write_opencode_model_config_if_needed(
                 workspace=prepared.workspace,
                 runtime=self.runtime,
                 worker_id=job.worker_id,
                 implementation_id=implementation_id,
                 args=worker_args,
                 env=model_proxy_env,
+                opencode_config_home=standard_runtime.opencode_config_home,
             )
-
             request = self.containers.request_for_worker(
                 worker_id=_execution_worker_id(worker, job.worker_id),
                 workspace=prepared.workspace,
@@ -411,9 +419,14 @@ class JobExecutor:
                     "OPEN_TULID_OUTPUT_DIR": f"{self.runtime.container_workspace}/output",
                     "OPEN_TULID_COMPLETION_ENDPOINT": endpoint.url,
                     "OPEN_TULID_PROMPT_PACKET": f"{self.runtime.container_workspace}/.open-tulid/prompt-packet.md",
+                    **({"OPENCODE_CONFIG": opencode_config} if opencode_config is not None else {}),
                     **model_proxy_env,
                 },
                 mounts=self._subscription_mounts(required_resources),
+            )
+            request = _replace_request(
+                request,
+                container_user=standard_runtime.container_user or request.container_user,
             )
             log_dir = _agent_log_dir(prepared.workspace)
             started_at = _utc_now()
@@ -426,18 +439,22 @@ class JobExecutor:
             )
             result = None
             try:
-                result = _run_agent_container_with_logs(
-                    self.containers,
-                    request,
-                    docker_executable=self.runtime.docker_executable,
+                result = self._run_worker_monitored(
+                    job=job,
+                    request=request,
                     log_dir=log_dir,
                 )
-                if result.succeeded:
+                if result is not None and result.succeeded:
                     self._wait_for_completion_settlement(job.job_id)
             finally:
                 endpoint.stop()
-            assert result is not None
             finished_at = _utc_now()
+            if result is None:
+                # The worker vanished before it had an accepted completion. The
+                # failure flow already failed the job, stopped/cleaned the
+                # worker, scrubbed its workspace, and released its lease. The
+                # task itself remains in its existing state for a fresh attempt.
+                return ExecutorRunResult(True, run=None)
             _write_run_logs_with_metadata(
                 Path(job.workspace_path),
                 result,
@@ -458,47 +475,32 @@ class JobExecutor:
             )
             if status_after_run == ExecutionJobStatus.ACCEPTED.value:
                 return ExecutorRunResult(True, run=result)
+            if status_after_run == ExecutionJobStatus.COMPLETION_REJECTED.value:
+                repaired = self.job_store.get(job.job_id)
+                if (
+                    repaired.accepted
+                    and repaired.job is not None
+                    and repaired.job.metadata.get("repair_ready") is True
+                ):
+                    # A rejected completion is feedback, not task completion.
+                    # Restart the same frozen job in its preserved workspace so
+                    # the worker receives the structured repair packet and can
+                    # submit a new completion without a daemon tick/manual run.
+                    return self.run(job.job_id)
+                return ExecutorRunResult(True, run=result)
             if status_after_run in {
                 ExecutionJobStatus.FAILED.value,
                 ExecutionJobStatus.STALE.value,
                 ExecutionJobStatus.CANCELLED.value,
             }:
+                # A terminal outcome was already recorded; reconcile the
+                # workspace that can no longer be completed.
+                _scrub_workspace_for_job(job)
                 return ExecutorRunResult(True, run=result)
-            if status_after_run == ExecutionJobStatus.COMPLETION_REJECTED.value:
-                return ExecutorRunResult(True, run=result)
-            if not result.succeeded:
-                self.job_store.update_status(
-                    job.job_id,
-                    ExecutionJobStatus.FAILED,
-                    metadata={"worker_returncode": result.returncode},
-                )
-                self.event_store.append(build_event(
-                    project_id=job.project_id,
-                    actor=EventActor(type="system", id="executor"),
-                    event_type=EventType.ExecutionFailed,
-                    correlation_id=job.job_id,
-                    task_id=job.task_id,
-                    job_id=job.job_id,
-                    transition_id=job.transition_id,
-                    data={"returncode": result.returncode},
-                ))
-            else:
-                self.job_store.update_status(
-                    job.job_id,
-                    ExecutionJobStatus.FAILED,
-                    metadata={"worker_returncode": result.returncode, "failure_reason": "completion_not_accepted"},
-                )
-                self.event_store.append(build_event(
-                    project_id=job.project_id,
-                    actor=EventActor(type="system", id="executor"),
-                    event_type=EventType.ExecutionFailed,
-                    correlation_id=job.job_id,
-                    task_id=job.task_id,
-                    job_id=job.job_id,
-                    transition_id=job.transition_id,
-                    data={"returncode": result.returncode, "reason": "completion_not_accepted"},
-                ))
-            return ExecutorRunResult(True, run=result)
+            # The worker exited without an accepted completion. That is a faulty
+            # worker: fail the job, scrub its workspace, and release its lease
+            # so a fresh scheduler attempt can reuse the same task.
+            return self._fail_completed_worker_without_completion(job, result)
         except Exception as exc:
             self.job_store.update_status(
                 job.job_id,
@@ -653,6 +655,211 @@ class JobExecutor:
             mounts.append(ContainerMount(proxy.auth_home, proxy.container_auth_home))
         return tuple(mounts)
 
+    def _run_worker_monitored(
+        self,
+        *,
+        job: ExecutionJob,
+        request,
+        log_dir: Path,
+    ):
+        """Run a worker while supervising its liveness.
+
+        The worker runs in a background thread so the executor can respond to a
+        liveness failure without waiting for the blocking run to return. Liveness
+        is registered with the executor-owned observability before/around the
+        process start so immediate exits are caught, and it is keyed by the
+        current job plus attempt identity so a stale worker/job can never affect
+        the current attempt.
+        """
+        result_box: dict[str, object] = {}
+        exit_event = threading.Event()
+        exited: list[WorkerExited] = []
+        run_holder: list[threading.Thread | None] = [None]
+
+        def container_run() -> None:
+            try:
+                result_box["result"] = _run_agent_container_with_logs(
+                    self.containers,
+                    request,
+                    docker_executable=self.runtime.docker_executable,
+                    log_dir=log_dir,
+                )
+            except Exception as exc:
+                result_box["error"] = exc
+
+        attempt_id = str(job.attempts)
+        if self.liveness_probe is not None:
+            probe = self.liveness_probe
+        else:
+            probe = _RunLifecycleLivenessProbe(run_holder)
+
+        def on_exited(event: WorkerExited) -> None:
+            # A run that already finished (successful or failed) is reconciled by
+            # the normal post-run/exception processing below; do not
+            # double-handle it here. Only a worker that vanished while its run
+            # was still in flight triggers the proactive failure path.
+            if "result" in result_box or "error" in result_box:
+                return
+            exited.append(event)
+            exit_event.set()
+
+        thread = threading.Thread(
+            target=container_run,
+            name=f"open-tulid-worker-{job.job_id}",
+            daemon=True,
+        )
+        run_holder[0] = thread
+        self.observability.register(
+            job_id=job.job_id,
+            attempt_id=attempt_id,
+            task_id=job.task_id,
+            probe=probe,
+            read_status=lambda job_id: _job_status_str(self.job_store.get(job_id)),
+            on_exited=on_exited,
+        )
+        thread.start()
+
+        try:
+            while True:
+                if exit_event.is_set():
+                    self._fail_worker_after_unexpected_exit(job, exited[0], request=request)
+                    thread.join(timeout=self._worker_stop_timeout())
+                    break
+                if not thread.is_alive():
+                    break
+                time.sleep(_WORKER_POLL_SECONDS)
+        finally:
+            self.observability.unregister(job_id=job.job_id)
+
+        error = result_box.get("error")
+        if "result" not in result_box and error is not None:
+            raise error  # type: ignore[misc]
+        return result_box.get("result")
+
+    def _fail_worker_after_unexpected_exit(self, job, event: WorkerExited, *, request) -> None:
+        self._fail_worker(
+            job,
+            reason="worker_unexpected_exit",
+            detail=None,
+            returncode=event.returncode,
+            request=request,
+            stop_container=True,
+            scrub=True,
+        )
+
+    def _fail_completed_worker_without_completion(self, job, result) -> ExecutorRunResult:
+        if result.succeeded:
+            self._fail_worker(
+                job,
+                reason="completion_not_accepted",
+                detail=None,
+                returncode=result.returncode,
+                request=None,
+                stop_container=False,
+            )
+        else:
+            self._fail_worker(
+                job,
+                reason=None,
+                detail=None,
+                returncode=result.returncode,
+                request=None,
+                stop_container=False,
+            )
+        return ExecutorRunResult(True, run=result)
+
+    def _fail_worker(
+        self,
+        job,
+        *,
+        reason: str | None,
+        detail: str | None,
+        returncode: int | None,
+        request,
+        stop_container: bool,
+        scrub: bool = False,
+    ) -> None:
+        """Atomically fail an orphaned/faulty worker. Idempotent and race-safe.
+
+        Does nothing if the job already reached an accepted/terminal outcome so
+        a duplicate health notification can never create duplicate retries,
+        cleanup races, or clobber an accepted completion.
+        """
+        loaded = self.job_store.get(job.job_id)
+        if not loaded.accepted or loaded.job is None:
+            return
+        status = _job_status_str(loaded)
+        if status == ExecutionJobStatus.ACCEPTED.value:
+            return
+        if status in TERMINAL_JOB_STATUSES:
+            return
+        # A completion is being validated when the worker exit races the
+        # observer. Fail only after validation resolves; doing otherwise would
+        # tear an imminent acceptance out from under the validation flow.
+        if status == ExecutionJobStatus.COMPLETION_SUBMITTED.value:
+            return
+        metadata: dict[str, object] = {"worker_returncode": returncode} if returncode is not None else {}
+        event_data: dict[str, object] = {"returncode": returncode} if returncode is not None else {}
+        if reason is not None:
+            metadata["failure_reason"] = reason
+            event_data["reason"] = reason
+        if detail is not None:
+            metadata["failure_detail"] = detail
+        self.job_store.update_status(job.job_id, ExecutionJobStatus.FAILED, metadata=metadata)
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="executor"),
+            event_type=EventType.ExecutionFailed,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            data=event_data,
+        ))
+        if stop_container:
+            self._stop_worker(job.job_id, request=request)
+        if scrub:
+            _scrub_workspace_for_job(job)
+        if self.lease_store is not None:
+            self.lease_store.release_job(job.job_id)
+
+    def _stop_worker(self, job_id: str, *, request) -> None:
+        stop = getattr(self.containers, "stop_worker_container", None)
+        if stop is None:
+            return
+        try:
+            stop(self.runtime.docker_executable, job_id)
+        except Exception:
+            # Best-effort cleanup; the container may already be gone (docker
+            # `--rm`) or stopping may be unsupported by the active backend.
+            return
+
+    def _worker_stop_timeout(self) -> float:
+        return max(0.1, min(self.runtime.default_timeout_seconds, 30.0))
+
+
+class _RunLifecycleLivenessProbe:
+    """Liveness probe over the blocking worker run.
+
+    Reports alive while the worker process/container run is in flight and not
+    alive once it has exited. This reflects actual process/container liveness
+    (the foreground ``docker run`` for a container worker), never GPU usage and
+    never a stored job status.
+    """
+
+    __slots__ = ("_holder",)
+
+    def __init__(self, holder: list[threading.Thread | None]) -> None:
+        self._holder = holder
+
+    def is_alive(self) -> bool:
+        thread = self._holder[0]
+        if thread is None or thread.ident is None:
+            # Registered before/around process start but not yet begun. The
+            # worker is still expected to be running, so report alive.
+            return True
+        return thread.is_alive()
+
 
 @dataclass(frozen=True)
 class _ManagedCompletionEndpoint:
@@ -716,7 +923,7 @@ def _write_run_logs_with_metadata(
     job,
     started_at: datetime,
     finished_at: datetime,
-) -> None:
+) -> str | None:
     try:
         _write_run_logs(
             workspace,
@@ -740,7 +947,7 @@ def _write_run_logs(
     job=None,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
-) -> None:
+) -> str | None:
     log_dir = _agent_log_dir(workspace)
     log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
@@ -1283,23 +1490,30 @@ def _write_opencode_model_config_if_needed(
     implementation_id: str,
     args: tuple[str, ...],
     env: Mapping[str, str],
-) -> None:
+    opencode_config_home: str | None = None,
+) -> str | None:
     worker_type = runtime.worker_types.get(worker_id, runtime.worker_types.get(implementation_id, implementation_id))
     if worker_type != "opencode" and implementation_id != "opencode":
-        return
+        return None
     endpoint = env.get("OPEN_TULID_MODEL_ENDPOINT")
     proxy_id = env.get("OPEN_TULID_MODEL_PROXY_ID")
     if not endpoint or not proxy_id or "OPEN_TULID_MODEL_SESSION_TOKEN" not in env:
-        return
+        return None
     model_ref = _model_arg(args)
     if model_ref is None or "/" not in model_ref:
-        return
+        return None
     provider_id, model_id = model_ref.split("/", 1)
     expected_provider_id = f"tulid-{proxy_id}"
     if provider_id != expected_provider_id or not model_id:
-        return
+        return None
 
-    path = workspace / "opencode.json"
+    # This is Tulid runtime configuration, not implementation output.  Keep it
+    # beneath the verifier-excluded runtime directory so it cannot appear as a
+    # contract-breaking repository change.
+    install_home_rel = (opencode_config_home or ".open-tulid/home").lstrip("/").rstrip("/")
+    install_home = workspace / install_home_rel
+    path = install_home / ".config" / "opencode" / "opencode.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     config: dict[str, object] = {}
     try:
         if path.is_file():
@@ -1341,6 +1555,7 @@ def _write_opencode_model_config_if_needed(
     }
     config["agent"] = agents
     path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return f"{runtime.container_workspace}/{install_home_rel}/.config/opencode/opencode.json"
 
 
 def _model_arg(args: tuple[str, ...]) -> str | None:
@@ -1357,10 +1572,57 @@ def _execution_worker_id(worker, fallback: str) -> str:
     return str(implementation_id) if implementation_id else fallback
 
 
+def _job_status_str(result) -> str:
+    if not result.accepted or result.job is None:
+        return ""
+    status = result.job.status
+    return status.value if hasattr(status, "value") else str(status)
+
+
+def _scrub_workspace_for_job(job: ExecutionJob) -> None:
+    """Idempotently remove the current job workspace (including generated files).
+
+    Durable task history/events are preserved; only the transient worker
+    workspace is scrubbed. Missing or already-cleared workspaces are no-ops.
+    """
+    workspace = Path(job.workspace_path)
+    if not workspace.is_dir():
+        return
+    try:
+        shutil.rmtree(workspace)
+    except OSError:
+        return
+
+
 def _adapter_project_root(adapter: StorageAdapter) -> Path | None:
     config = getattr(adapter, "config", None)
     project_root = getattr(config, "project_root", None)
     return project_root if isinstance(project_root, Path) else None
+
+
+def _project_standard_runtime(adapter: StorageAdapter) -> object:
+    """Resolve the project standard contract's runtime settings, if configured."""
+    from .standard_contracts import load_standard_contract
+
+    project_root = _adapter_project_root(adapter)
+    if project_root is None:
+        return _StandardRuntimeDiscovery(None, ".open-tulid/home")
+    loaded = load_standard_contract(project_root)
+    if not loaded.accepted or loaded.contract is None:
+        return _StandardRuntimeDiscovery(None, ".open-tulid/home")
+    contract = loaded.contract
+    return _StandardRuntimeDiscovery(
+        container_user=contract.runtime.container_user,
+        opencode_config_home=contract.runtime.opencode_config_home,
+    )
+
+
+class _StandardRuntimeDiscovery:
+    __slots__ = ("container_user", "opencode_config_home")
+
+    def __init__(self, container_user: str | None, opencode_config_home: str) -> None:
+        self.container_user = container_user
+        self.opencode_config_home = opencode_config_home
 
 
 def _load_parent_tasks(adapter: StorageAdapter, task: Task) -> tuple[Task, ...]:
@@ -1399,7 +1661,7 @@ def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> st
 
 def _task_for_prompt_context(task: Task, transition: TransitionDefinition) -> Task:
     excluded_artifact_types = set(transition.requires.artifacts)
-    if transition.derives is not None:
+    if transition.derives is not None and transition.derives.task_type != task.task_type:
         excluded_artifact_types.add(transition.derives.artifact_type)
     artifact_links = tuple(
         link for link in task.artifact_links

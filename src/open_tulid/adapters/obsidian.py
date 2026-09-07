@@ -29,6 +29,7 @@ from .base import (
     WriteResult,
 )
 from .obsidian_format import parse_task_row
+from open_tulid.vault.task_schema import declared_ids_for_project, validate_task_schema
 
 
 ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
@@ -287,6 +288,7 @@ class ObsidianAdapter:
         used_numeric_ids = _existing_numeric_task_ids(self._tasks_root())
         next_numeric_id = max(used_numeric_ids, default=0) + 1
         writes: list[_PreparedWrite] = []
+        declared_ids = declared_ids_for_project(self.config.project_root)
 
         for task_path in sorted(self._tasks_root().glob("*.md")):
             try:
@@ -302,6 +304,12 @@ class ObsidianAdapter:
             except ValueError as exc:
                 errors.append(_error("task.invalid_frontmatter", str(exc), str(task_path)))
                 continue
+
+            errors.extend(validate_task_schema(
+                body,
+                declared_ids,
+                location=str(task_path),
+            ))
 
             changed = False
             task_id = frontmatter.get("id")

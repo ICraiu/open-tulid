@@ -50,11 +50,6 @@ statements:
   - kind: task_type
     id: ImplementationTask
     instructions: [default]
-    requirements:
-      ReadyToImplement:
-        artifacts: [ImplementationContract]
-      SelfReview:
-        artifacts: [ImplementationContract]
   - kind: validation_type
     id: tests_pass
     args:
@@ -139,21 +134,26 @@ statements:
       task_type: ImplementationTask
       state: Todo
       artifact_type: ImplementationTaskFile
-  - kind: transition
-    id: PrepareExecutionContract
-    task_type: ImplementationTask
-    from: Todo
-    to: ReadyToImplement
-    worker: codex_contract
-    default_for_scheduler: true
-    requires:
-      artifacts: [ImplementationContract]
-      validations:
-        - type: implementation_contract_valid
-          args:
-            path: output/implementation-contract.yaml
+  # Implementation tasks schedule directly with the project global contract.
   - kind: transition
     id: ImplementTask
+    task_type: ImplementationTask
+    from: Todo
+    to: SelfReview
+    worker: qwen_27b
+    default_for_scheduler: true
+    requires:
+      changed_files:
+        required: true
+      validations:
+        - type: tests_pass
+          args:
+            command: python check_repo.py tests
+        - type: project_build
+          args:
+            command: python check_repo.py build
+  - kind: transition
+    id: ImplementFromReadyToImplement
     task_type: ImplementationTask
     from: ReadyToImplement
     to: SelfReview
@@ -184,11 +184,6 @@ statements:
         - type: project_build
           args:
             command: python check_repo.py build
-  - kind: transition
-    id: InvalidateExecutionContract
-    task_type: ImplementationTask
-    from: ReadyToImplement
-    to: Todo
   - kind: transition
     id: InvalidateReviewedExecutionContract
     task_type: ImplementationTask
