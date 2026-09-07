@@ -26,6 +26,7 @@ from .attempts import (
     attempt_record_from_dict,
     attempt_record_to_dict,
     attempt_records_from_metadata,
+    count_consumed_attempts,
     task_semantic_revision,
 )
 from .baseline import (
@@ -93,9 +94,11 @@ from .prompts import (
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairPlan, build_repair_packet, plan_repair
 from .failures import ExecutionFailure, FailureCategory, classify_worker_failure
 from .scheduler import (
+    RecoveryPolicy,
     ScheduleResult,
     Scheduler,
     recover_job_creation_transactions,
+    resolve_recovery_policy,
     select_scheduler_transition,
 )
 from .resources import FileResourceLeaseStore, ResourceLease, ResourceLeaseResult
@@ -194,6 +197,7 @@ __all__ = [
     "attempt_record_from_dict",
     "attempt_record_to_dict",
     "attempt_records_from_metadata",
+    "count_consumed_attempts",
     "task_semantic_revision",
     "RUNTIME_BASELINE_FILENAME",
     "RUNTIME_BASELINE_SCHEMA",
@@ -250,9 +254,11 @@ __all__ = [
     "ExecutionFailure",
     "FailureCategory",
     "classify_worker_failure",
+    "RecoveryPolicy",
     "ScheduleResult",
     "Scheduler",
     "recover_job_creation_transactions",
+    "resolve_recovery_policy",
     "select_scheduler_transition",
     "FileResourceLeaseStore",
     "ResourceLease",

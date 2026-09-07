@@ -211,6 +211,27 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
     if max_repair_attempts < 0:
         _fail("runtime.max_repair_attempts must be zero or positive")
 
+    max_total_attempts_per_transition = raw.get("max_total_attempts_per_transition", 0)
+    if (
+        isinstance(max_total_attempts_per_transition, bool)
+        or not isinstance(max_total_attempts_per_transition, int)
+    ):
+        _fail("runtime.max_total_attempts_per_transition must be an integer")
+    if max_total_attempts_per_transition < 0:
+        _fail("runtime.max_total_attempts_per_transition must be zero or positive")
+    if (
+        max_total_attempts_per_transition > 0
+        and max_failed_attempts_per_transition > 0
+        and max_total_attempts_per_transition < max_failed_attempts_per_transition
+    ):
+        _fail(
+            "runtime.max_total_attempts_per_transition "
+            f"({max_total_attempts_per_transition}) is smaller than "
+            "runtime.max_failed_attempts_per_transition "
+            f"({max_failed_attempts_per_transition}); a total budget must be "
+            "large enough to admit the configured failed-attempt sublimit."
+        )
+
     shared_root = _runtime_optional_path(raw, "shared_workspace_root", config_dir, table="runtime")
 
     worker_images = _runtime_string_map(raw.get("worker_images", {}), "runtime.worker_images")
@@ -248,6 +269,7 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         failed_job_backoff_seconds=failed_job_backoff_seconds,
         max_failed_attempts_per_transition=max_failed_attempts_per_transition,
         max_repair_attempts=max_repair_attempts,
+        max_total_attempts_per_transition=max_total_attempts_per_transition,
         worker_images=worker_images,
         worker_args=worker_args,
         worker_resources=worker_resources,

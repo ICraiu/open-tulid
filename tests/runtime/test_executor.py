@@ -29,7 +29,15 @@ from open_tulid.domain import (
     WorkflowDefinition,
 )
 from open_tulid.models import ModelProxyConfig, ProjectConfig, ResourceConfig, RuntimeConfig
-from open_tulid.runtime import SessionStatus, FileExecutionJobStore, FileResourceLeaseStore, JobExecutor, JsonlEventStore
+from open_tulid.runtime import (
+    SessionStatus,
+    FileExecutionJobStore,
+    FileResourceLeaseStore,
+    JobExecutor,
+    JsonlEventStore,
+    attempt_records_from_metadata,
+    attempt_id_for,
+)
 from open_tulid.runtime.executor import (
     _append_completion_submission,
     _build_runtime_prompt,
@@ -453,6 +461,77 @@ def test_executor_retries_rejected_local_completion_with_feedback_until_accepted
     assert loaded.job.metadata["repair_attempts"] == 1
     assert loaded.job.metadata["repair_history"][0]["error_codes"] == ["completion.artifact_missing"]
     assert adapter.moved_to == "CodeReview"
+
+
+def test_executor_refuses_repair_when_total_attempt_account_exhausted(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """A repair is allowed only while the durable total account has room.
+
+    With ``max_total_attempts_per_transition=1`` the single admitted attempt
+    submits a rejected completion with a repair packet; the executor must not
+    start a second worker process and instead settles the job at the bound.
+    """
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+    runs: list[bool] = []
+
+    def fake_run_agent_container(request, *, docker_executable):
+        assert store.update_status(
+            JOB_ID,
+            "completion_rejected",
+            metadata={"repair_ready": True},
+        ).accepted is True
+        runs.append(True)
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=0,
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run_agent_container)
+
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(
+            completion_host="127.0.0.1",
+            completion_container_host="127.0.0.1",
+            worker_args={"codex": ("exec", "{prompt_packet}")},
+            max_total_attempts_per_transition=1,
+        ),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    assert len(runs) == 1
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    assert loaded.job.metadata["failure_reason"] == "total_attempt_limit_reached"
+    records = attempt_records_from_metadata(loaded.job.metadata)
+    assert len(records) == 1
+    assert records[0].attempt_id == attempt_id_for(JOB_ID, 1)
+    assert [event.event_type for event in events.iter_events()] == [
+        "ExecutionStarted",
+        "ExecutionFailed",
+    ]
 
 
 def test_executor_fails_successful_worker_without_explicit_completion_evidence(

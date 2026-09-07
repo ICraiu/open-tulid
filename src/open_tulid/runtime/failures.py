@@ -121,6 +121,35 @@ _REJECTION_REASON_TO_FAILURE = {
 }
 
 
+def failure_from_metadata(metadata: Mapping[str, object]) -> ExecutionFailure | None:
+    """Reconstruct a classification persisted on a job for bounded recovery.
+
+    The executor persists the small generic result (``failure_code``,
+    ``failure_category``, ``retryable``, ``retry_action``, sanitized evidence,
+    and evidence path) before the scheduler decides a retry. This reads that
+    record without re-scanning logs. A missing code means the failure was never
+    classified — that unknown is left ambiguous and recovery is allowed rather
+    than inventing a cause.
+    """
+    code = metadata.get("failure_code")
+    if not isinstance(code, str) or not code:
+        return None
+    retryable = metadata.get("retryable")
+    if isinstance(retryable, bool):
+        retryable_value = retryable
+    else:
+        retryable_value = True
+    evidence_path = metadata.get("failure_evidence_path")
+    return ExecutionFailure(
+        code=code,
+        category=str(metadata.get("failure_category", "")),
+        retryable=retryable_value,
+        retry_action=str(metadata.get("retry_action", "")),
+        evidence=str(metadata.get("failure_evidence", "")),
+        evidence_path=str(evidence_path) if isinstance(evidence_path, str) and evidence_path else None,
+    )
+
+
 def classify_worker_failure(
     *,
     returncode: int | None,
@@ -374,4 +403,5 @@ __all__ = [
     "ExecutionFailure",
     "FailureCategory",
     "classify_worker_failure",
+    "failure_from_metadata",
 ]

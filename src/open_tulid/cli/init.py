@@ -36,6 +36,9 @@ runtime:
   max_failed_attempts_per_transition: 2
   # Targeted retries after a deterministic implementation failure.
   max_repair_attempts: 2
+  # Durable total worker attempts for one task revision + transition (fresh and
+  # repair, across jobs and daemon restarts). 0 disables the total account.
+  max_total_attempts_per_transition: 0
   completion_host: 0.0.0.0
   completion_port: 0
   completion_container_host: host.docker.internal

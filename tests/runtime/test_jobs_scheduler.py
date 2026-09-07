@@ -25,13 +25,17 @@ from open_tulid.domain import (
 )
 from open_tulid.models import ProjectConfig, ResourceConfig, RuntimeConfig
 from open_tulid.runtime import (
+    AttemptRecord,
     FileExecutionJobStore,
     FileResourceLeaseStore,
     JobExecutor,
     JsonlEventStore,
     Scheduler,
     TransactionJournalStore,
+    attempt_id_for,
+    attempt_record_to_dict,
     recover_job_creation_transactions,
+    task_semantic_revision,
 )
 from open_tulid.runtime.observability import WorkerObservability
 from open_tulid.runtime.execution_contracts import (
@@ -1160,6 +1164,189 @@ def test_scheduler_counts_retry_limit_failures_in_runtime_session(tmp_path: Path
     assert result.accepted is True
     assert result.scheduled is False
     assert result.skipped[0].code == "job.retry_limit_reached"
+
+
+def _failed_job_with_attempts(
+    store: FileExecutionJobStore,
+    *,
+    job_id: str,
+    revision: str,
+    attempt_numbers: tuple[int, ...],
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    assert store.create(ExecutionJob(
+        job_id=job_id,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(Path(job_id)),
+        status="failed",
+        attempts=max(attempt_numbers, default=0),
+        metadata=dict(metadata or {}),
+    )).accepted is True
+    for number in attempt_numbers:
+        assert store.record_attempt(job_id, attempt_record_to_dict(AttemptRecord(
+            schema="tulid.attempt/v1",
+            attempt_id=attempt_id_for(job_id, number),
+            job_id=job_id,
+            attempt_number=number,
+            task_revision=revision,
+            transition_id="implement",
+            worker_id="codex",
+            status="ended",
+        ))).accepted is True
+
+
+def test_scheduler_stops_mixed_fresh_and_repair_attempts_at_total_bound_and_survives_restart(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    revision = task_semantic_revision(_snapshot().tasks[TASK_ID])
+    now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    # Job A consumed one fresh attempt; Job B consumed one fresh + one repair
+    # (attempts 2..N) before failing. Combined durable account = 3.
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000A00", revision=revision,
+        attempt_numbers=(1,), metadata={"updated_at": now},
+    )
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000B00", revision=revision,
+        attempt_numbers=(1, 2), metadata={"updated_at": now},
+    )
+
+    def scheduler() -> Scheduler:
+        return Scheduler(
+            workflow=_workflow(),
+            adapter=FakeAdapter(_snapshot()),
+            job_store=store,
+            workspace_root=tmp_path / "workspaces",
+            failed_job_backoff_seconds=0,
+            max_total_attempts_per_transition=3,
+        )
+
+    first = scheduler().schedule_one("Agent")
+    assert first.accepted is True
+    assert first.scheduled is False
+    assert first.skipped[0].code == "job.total_attempt_limit_reached"
+
+    # A fresh daemon/instance sharing the same store must not renew the account.
+    second = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+        max_total_attempts_per_transition=3,
+    ).schedule_one("Agent")
+    assert second.accepted is True
+    assert second.scheduled is False
+    assert second.skipped[0].code == "job.total_attempt_limit_reached"
+
+
+def test_scheduler_allows_schedule_below_total_bound(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    revision = task_semantic_revision(_snapshot().tasks[TASK_ID])
+    now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    # Job A consumed one attempt; two remain within a total of three.
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000A00", revision=revision,
+        attempt_numbers=(1,), metadata={"updated_at": now},
+    )
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+        max_total_attempts_per_transition=3,
+        max_failed_attempts_per_transition=0,
+    )
+    result = scheduler.schedule_one("Agent")
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.job is not None
+
+
+def test_scheduler_stops_on_non_retryable_classified_failure(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    revision = task_semantic_revision(_snapshot().tasks[TASK_ID])
+    now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000A00", revision=revision,
+        attempt_numbers=(1,),
+        metadata={
+            "updated_at": now,
+            "failure_code": "worker.environment",
+            "failure_category": "environment",
+            "retryable": False,
+            "retry_action": "stop; report the missing tool/dependency blocker",
+            "failure_evidence": "command not found: python",
+        },
+    )
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+    )
+    result = scheduler.schedule_one("Agent")
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "job.non_retryable_failure"
+    assert "non-retryable cause (environment)" in result.skipped[0].message
+
+
+def test_scheduler_retries_retryable_classified_failure(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    revision = task_semantic_revision(_snapshot().tasks[TASK_ID])
+    now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000A00", revision=revision,
+        attempt_numbers=(1,),
+        metadata={
+            "updated_at": now,
+            "failure_code": "provider.upstream",
+            "failure_category": "provider",
+            "retryable": True,
+            "retry_action": "retry within the total attempt budget",
+        },
+    )
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+    )
+    result = scheduler.schedule_one("Agent")
+    assert result.accepted is True
+    assert result.scheduled is True
+
+
+def test_scheduler_ignores_legacy_failed_job_without_attempt_records_for_cause_gate(tmp_path: Path):
+    # A legacy failed job with no attempt records must not be mistaken for a
+    # non-retryable cause: read history without inventing a blocked retry.
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000A00",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="failed",
+        metadata={"updated_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot()),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        failed_job_backoff_seconds=0,
+    )
+    result = scheduler.schedule_one("Agent")
+    assert result.accepted is True
+    assert result.scheduled is True
 
 
 def test_scheduler_ignores_recent_failures_before_runtime_session(tmp_path: Path):

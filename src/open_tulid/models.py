@@ -24,6 +24,12 @@ class RuntimeConfig:
     failed_job_backoff_seconds: int = 60
     max_failed_attempts_per_transition: int = 0
     max_repair_attempts: int = 2
+    # Durable total worker attempt budget for one task revision and transition.
+    # Counts every admitted worker process (fresh and repair) across jobs and
+    # survives a daemon restart because it is derived from persisted attempt
+    # records. The existing failed/repair sublimits remain valid sublimits that
+    # must never exceed this total. 0 disables the total account (unbounded).
+    max_total_attempts_per_transition: int = 0
     worker_images: dict[str, str] = field(default_factory=dict)
     worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
     worker_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)

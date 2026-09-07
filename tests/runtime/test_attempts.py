@@ -33,6 +33,7 @@ from open_tulid.runtime import (
     attempt_records_from_metadata,
     baseline_to_dict,
     capture_runtime_baseline,
+    count_consumed_attempts,
     task_semantic_revision,
     workflow_sha256,
     write_runtime_baseline,
@@ -216,6 +217,79 @@ def test_job_attempts_counter_unchanged_by_record_attempt(tmp_path: Path):
     assert store.record_attempt(JOB_ID, attempt_record_to_dict(_record(1))).accepted is True
     # Recording an attempt must never mutate the budget counter (job.attempts).
     assert store.get(JOB_ID).job.attempts == 0
+
+
+def _attempt_for(job_id: str, number: int, *, revision: str, status: str = "ended") -> AttemptRecord:
+    return AttemptRecord(
+        schema="tulid.attempt/v1",
+        attempt_id=attempt_id_for(job_id, number),
+        job_id=job_id,
+        attempt_number=number,
+        task_revision=revision,
+        transition_id="code",
+        worker_id="codex",
+        predecessor=attempt_id_for(job_id, number - 1) if number > 1 else None,
+        status=status,
+    )
+
+
+def test_count_consumed_attempts_survives_restart_and_is_revision_scoped(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    job_a = ExecutionJob(
+        job_id="01J00000000000000000000A00",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "a"),
+        status="failed",
+    )
+    job_b = ExecutionJob(
+        job_id="01J00000000000000000000B00",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "b"),
+        status="failed",
+    )
+    assert store.create(job_a).accepted is True
+    assert store.create(job_b).accepted is True
+    # job_a consumed three attempts, two for rev-1 and one for rev-2; job_b one
+    # more for rev-1.
+    for number, revision in ((1, "rev-1"), (2, "rev-1"), (3, "rev-2")):
+        assert store.record_attempt(job_a.job_id, attempt_record_to_dict(
+            _attempt_for(job_a.job_id, number, revision=revision)
+        )).accepted is True
+    assert store.record_attempt(job_b.job_id, attempt_record_to_dict(
+        _attempt_for(job_b.job_id, 1, revision="rev-1")
+    )).accepted is True
+
+    listed = store.list().jobs
+    assert count_consumed_attempts(
+        jobs=listed, task_id=TASK_ID, transition_id="code", task_revision="rev-1"
+    ) == 3
+    assert count_consumed_attempts(
+        jobs=listed, task_id=TASK_ID, transition_id="code", task_revision="rev-2"
+    ) == 1
+    assert count_consumed_attempts(
+        jobs=listed, task_id=TASK_ID, transition_id="code", task_revision="unknown"
+    ) == 0
+
+    # A daemon restart reconstructs the same store and counts, never renewing.
+    reloaded = FileExecutionJobStore(tmp_path / "jobs").list().jobs
+    assert count_consumed_attempts(
+        jobs=reloaded, task_id=TASK_ID, transition_id="code", task_revision="rev-1"
+    ) == 3
+
+
+def test_count_consumed_attempts_ignores_legacy_jobs_without_records(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(_job()).accepted is True
+    listed = store.list().jobs
+    assert count_consumed_attempts(
+        jobs=listed, task_id=TASK_ID, transition_id="code", task_revision="rev-1"
+    ) == 0
 
 
 def _workflow() -> WorkflowDefinition:

@@ -32,7 +32,7 @@ from open_tulid.domain import (
     TransitionDefinition,
     WorkflowDefinition,
 )
-from open_tulid.models import Config, ProjectConfig, ValidationReport
+from open_tulid.models import Config, ProjectConfig, RuntimeConfig, ValidationReport
 from open_tulid.runtime import (
     ArtifactSubmission,
     standard_contract_configured,
@@ -64,6 +64,7 @@ from open_tulid.runtime import (
     recover_job_creation_transactions,
     recover_completion_transactions,
     render_execution_prompt,
+    resolve_recovery_policy,
     select_scheduler_transition,
     serve_completion_endpoint,
     serve_model_proxy,
@@ -441,12 +442,14 @@ def schedule_job(
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+        max_total_attempts_per_transition=ctx["config"].runtime.max_total_attempts_per_transition,
         runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         project_root=ctx.get("project_path"),
         repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )
+    _print_recovery_policy(ctx["config"].runtime)
     result = scheduler.schedule_one(project)
     if not result.accepted:
         _print_domain_errors(result.errors)
@@ -486,6 +489,7 @@ def create_job(
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+        max_total_attempts_per_transition=ctx["config"].runtime.max_total_attempts_per_transition,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
         project_root=ctx.get("project_path"),
@@ -694,6 +698,7 @@ def run_one_job(
         serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
         failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
         max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+        max_total_attempts_per_transition=ctx["config"].runtime.max_total_attempts_per_transition,
         runtime_session_started_at=runtime_session_started_at,
         event_store=ctx["event_store"],
         journal_store=ctx["journal_store"],
@@ -725,6 +730,8 @@ def jobs_daemon(
     while True:
         _require_project_dockerfile(_load_cli_config(), project, stop_runtime=True)
         ctx = _runtime_project_context(project)
+        if completed == 0:
+            _print_recovery_policy(ctx["config"].runtime)
         scheduler = Scheduler(
             workflow=ctx["workflow"],
             adapter=ctx["adapter"],
@@ -735,6 +742,7 @@ def jobs_daemon(
             serial_repo_execution=ctx["config"].runtime.repo_execution_mode == "serial",
             failed_job_backoff_seconds=ctx["config"].runtime.failed_job_backoff_seconds,
             max_failed_attempts_per_transition=ctx["config"].runtime.max_failed_attempts_per_transition,
+            max_total_attempts_per_transition=ctx["config"].runtime.max_total_attempts_per_transition,
             runtime_session_started_at=runtime_session_started_at,
             event_store=ctx["event_store"],
             journal_store=ctx["journal_store"],
@@ -2145,6 +2153,25 @@ def _load_runtime_state(path: Path) -> dict[str, object] | None:
 def _runtime_log_line(event_type: str, detail: str) -> str:
     timestamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     return f">>> {timestamp} {event_type} {detail}"
+
+
+def _print_recovery_policy(runtime: RuntimeConfig) -> None:
+    """Surface the resolved bounded-recovery policy so legacy settings are not
+    silently misread: the total attempt account is the durable bound, while the
+    historical failed/repair keys remain sublimits."""
+    policy = resolve_recovery_policy(
+        max_total_attempts_per_transition=runtime.max_total_attempts_per_transition,
+        max_failed_attempts_per_transition=runtime.max_failed_attempts_per_transition,
+        max_repair_attempts=runtime.max_repair_attempts,
+    )
+    console.print(_runtime_log_line(
+        "RECOVERY_POLICY",
+        (
+            f"total_attempts={policy.total_attempts or 'unbounded'} "
+            f"failed_sublimit={policy.failed_attempts_sub or 'unbounded'} "
+            f"repair_sublimit={policy.repair_sub or 'unbounded'}"
+        ),
+    ))
 
 
 def _runtime_log_root(config: Config) -> Path:

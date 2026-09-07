@@ -16,9 +16,9 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
-from open_tulid.domain import Task
+from open_tulid.domain import ExecutionJob, Task
 
 SEMANTIC_TASK_REVISION_SCHEMA = "tulid.task-revision/v1"
 ATTEMPT_RECORD_SCHEMA = "tulid.attempt/v1"
@@ -176,6 +176,41 @@ def attempt_records_from_metadata(metadata: Mapping[str, Any]) -> tuple[AttemptR
         raise ValueError("job metadata attempt_records must be a list")
     records = tuple(attempt_record_from_dict(item) for item in raw)
     return tuple(sorted(records, key=lambda record: record.attempt_number))
+
+
+def count_consumed_attempts(
+    *,
+    jobs: Iterable[ExecutionJob],
+    task_id: str,
+    transition_id: str,
+    task_revision: str,
+    project_id: str | None = None,
+) -> int:
+    """Durable count of worker attempts already consumed for a task revision.
+
+    Every admitted worker process — a fresh scheduler job or an in-place
+    repair — persists a versioned attempt record under the store/lease
+    coordination. This counts those records across all jobs for the same task
+    and transition whose semantic task revision matches ``task_revision``.
+
+    It deliberately ignores job creation times and the current runtime session,
+    so a daemon restart cannot renew the total account. Jobs with no attempt
+    records (legacy jobs, or a task that has since been re-authored) contribute
+    nothing: the plan reads legacy history without inventing precise attempt
+    counts.
+    """
+    total = 0
+    for job in jobs:
+        if job.task_id != task_id or job.transition_id != transition_id:
+            continue
+        if project_id is not None and job.project_id != project_id:
+            continue
+        try:
+            records = attempt_records_from_metadata(job.metadata)
+        except ValueError:
+            continue
+        total += sum(1 for record in records if record.task_revision == task_revision)
+    return total
 
 
 def _semantic_body_sections(body: str) -> dict[str, str]:

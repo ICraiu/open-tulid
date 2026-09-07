@@ -24,9 +24,52 @@ from .jobs import FileExecutionJobStore, JobStoreResult
 from .resources import FileResourceLeaseStore
 from .task_manager import CreateExecutionJob, TaskManager
 from .transactions import FileTransactionRuntime
+from .attempts import attempt_records_from_metadata, count_consumed_attempts, task_semantic_revision
+from .failures import failure_from_metadata
 
 
 RECENT_FAILURE_BACKOFF_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    """The resolved bounded-recovery policy for a runtime.
+
+    ``total_attempts`` is the durable account for one task revision and
+    transition; the historical failed-attempt and repair limits are preserved
+    sublimits that must not be read as the whole story. Each field is
+    ``0``/``None`` when unbounded.
+    """
+
+    total_attempts: int
+    failed_attempts_sub: int
+    repair_sub: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "total_attempts": self.total_attempts,
+            "failed_attempts_sub": self.failed_attempts_sub,
+            "repair_sub": self.repair_sub,
+        }
+
+
+def resolve_recovery_policy(
+    *,
+    max_total_attempts_per_transition: int = 0,
+    max_failed_attempts_per_transition: int = 0,
+    max_repair_attempts: int = 2,
+) -> RecoveryPolicy:
+    """Expose the effective retry policy so a total account is not misread.
+
+    The total account is the durable bound; the old keys remain sublimits until
+    migration is complete. A configured sublimit that exceeds the total is a
+    configuration defect, not a silent override.
+    """
+    return RecoveryPolicy(
+        total_attempts=max_total_attempts_per_transition,
+        failed_attempts_sub=max_failed_attempts_per_transition,
+        repair_sub=max_repair_attempts,
+    )
 
 
 @dataclass(frozen=True)
@@ -58,6 +101,7 @@ class Scheduler:
         serial_repo_execution: bool = True,
         failed_job_backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
         max_failed_attempts_per_transition: int = 0,
+        max_total_attempts_per_transition: int = 0,
         runtime_session_started_at: datetime | None = None,
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
@@ -73,6 +117,7 @@ class Scheduler:
         self.serial_repo_execution = serial_repo_execution
         self.failed_job_backoff_seconds = failed_job_backoff_seconds
         self.max_failed_attempts_per_transition = max_failed_attempts_per_transition
+        self.max_total_attempts_per_transition = max_total_attempts_per_transition
         self.runtime_session_started_at = (
             runtime_session_started_at.astimezone(timezone.utc)
             if runtime_session_started_at is not None
@@ -167,6 +212,29 @@ class Scheduler:
                     f"Task {task.id!r} already has an active job for transition {transition.id!r}.",
                     task.id,
                 ))
+                continue
+
+            revision = task_semantic_revision(task)
+            cause_error = _retry_blocked_by_cause(
+                self.job_store,
+                project_id,
+                task,
+                transition,
+                revision=revision,
+            )
+            if cause_error is not None:
+                skipped.append(cause_error)
+                continue
+            total_error = _total_attempt_exhausted(
+                self.job_store,
+                project_id,
+                task,
+                transition,
+                revision=revision,
+                total_limit=self.max_total_attempts_per_transition,
+            )
+            if total_error is not None:
+                skipped.append(total_error)
                 continue
 
             if self.max_failed_attempts_per_transition > 0:
@@ -503,6 +571,101 @@ def _find_failed_jobs(
         )
     )
     return JobStoreResult(jobs=failed)
+
+
+def _retry_blocked_by_cause(
+    job_store: FileExecutionJobStore,
+    project_id: str,
+    task: Task,
+    transition: TransitionDefinition,
+    *,
+    revision: str,
+) -> DomainError | None:
+    """Stop recovery when the latest classified failure is demonstrably
+    non-retryable (permission, environment, missing tool/decision, ...).
+
+    Only an explicitly persisted non-retryable classification stops the task;
+    an unknown or ambiguous failure never invents a retry block, and subtle
+    authentication/implementation failures remain recoverable. The check is
+    scoped to persisted attempt records matching the current semantic revision
+    so a re-authored task does not inherit an old permanent cause.
+    """
+    listed = job_store.list()
+    if not listed.accepted:
+        return None
+    candidates: list[ExecutionJob] = []
+    for job in listed.jobs:
+        if (
+            job.project_id != project_id
+            or job.task_id != task.id
+            or job.transition_id != transition.id
+            or _status_value(job.status) != ExecutionJobStatus.FAILED.value
+        ):
+            continue
+        try:
+            records = attempt_records_from_metadata(job.metadata)
+        except ValueError:
+            continue
+        if not any(record.task_revision == revision for record in records):
+            continue
+        candidates.append(job)
+    if not candidates:
+        return None
+    latest = max(
+        candidates,
+        key=lambda job: _job_timestamp(job) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    failure = failure_from_metadata(latest.metadata)
+    if failure is None or failure.retryable:
+        return None
+    return _error(
+        "job.non_retryable_failure",
+        (
+            f"Task {task.id!r} failed transition {transition.id!r} with a "
+            f"non-retryable cause ({failure.category or failure.code}); "
+            f"stopping rather than consuming another worker attempt. "
+            f"{failure.retry_action}"
+        ),
+        task.id,
+    )
+
+
+def _total_attempt_exhausted(
+    job_store: FileExecutionJobStore,
+    project_id: str,
+    task: Task,
+    transition: TransitionDefinition,
+    *,
+    revision: str,
+    total_limit: int,
+) -> DomainError | None:
+    """Stop when the durable total attempt account is exhausted.
+
+    The account counts every persisted admission (fresh and repair) across jobs
+    for the task revision and transition, so a daemon restart cannot renew it.
+    """
+    if total_limit <= 0:
+        return None
+    listed = job_store.list()
+    if not listed.accepted:
+        return None
+    consumed = count_consumed_attempts(
+        jobs=listed.jobs,
+        project_id=project_id,
+        task_id=task.id,
+        transition_id=transition.id,
+        task_revision=revision,
+    )
+    if consumed < total_limit:
+        return None
+    return _error(
+        "job.total_attempt_limit_reached",
+        (
+            f"Task {task.id!r} has consumed {consumed} worker attempt(s) for "
+            f"transition {transition.id!r}; total account {total_limit} reached."
+        ),
+        task.id,
+    )
 
 
 def _job_timestamp(job: ExecutionJob) -> datetime | None:

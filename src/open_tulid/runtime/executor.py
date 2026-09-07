@@ -56,6 +56,7 @@ from open_tulid.runtime.attempts import (
     attempt_id_for,
     attempt_record_to_dict,
     attempt_records_from_metadata,
+    count_consumed_attempts,
     task_semantic_revision,
 )
 from open_tulid.runtime.baseline import (
@@ -512,11 +513,16 @@ class JobExecutor:
                     and repaired.job is not None
                     and repaired.job.metadata.get("repair_ready") is True
                 ):
-                    # A rejected completion is feedback, not task completion.
-                    # Restart the same frozen job in its preserved workspace so
-                    # the worker receives the structured repair packet and can
-                    # submit a new completion without a daemon tick/manual run.
-                    return self.run(job.job_id)
+                    if self._repair_within_total_account(job, execution_task):
+                        # A rejected completion is feedback, not task completion.
+                        # Restart the same frozen job in its preserved workspace so
+                        # the worker receives the structured repair packet and can
+                        # submit a new completion without a daemon tick/manual run.
+                        return self.run(job.job_id)
+                    # The durable total attempt account is exhausted; a repair
+                    # would exceed the bounded budget, so settle the job instead
+                    # of starting another worker process.
+                    self._fail_at_total_attempt_bound(job, revision=task_semantic_revision(execution_task))
                 return ExecutorRunResult(True, run=result)
             if status_after_run in {
                 ExecutionJobStatus.FAILED.value,
@@ -706,6 +712,65 @@ class JobExecutor:
             return
         updated = _updated_attempt_record(target, status=status, ended_at=ended_at, failure_reference=failure_reference)
         self.job_store.record_attempt(job_id, attempt_record_to_dict(updated))
+
+    def total_attempt_limit(self) -> int:
+        return int(getattr(self.runtime, "max_total_attempts_per_transition", 0))
+
+    def _consumed_attempts(self, job, task) -> int:
+        listed = self.job_store.list()
+        if not listed.accepted:
+            return 0
+        return count_consumed_attempts(
+            jobs=listed.jobs,
+            project_id=job.project_id,
+            task_id=job.task_id,
+            transition_id=job.transition_id,
+            task_revision=task_semantic_revision(task),
+        )
+
+    def _repair_within_total_account(self, job, task) -> bool:
+        """A repair may start only while the durable total account has room.
+
+        The account counts every persisted admission across jobs for the task
+        revision and transition, so a fresh scheduler job and an in-place repair
+        share one bounded budget that survives a daemon restart.
+        """
+        total = self.total_attempt_limit()
+        if total <= 0:
+            return True
+        return self._consumed_attempts(job, task) < total
+
+    def _fail_at_total_attempt_bound(self, job, *, revision: str) -> None:
+        total = self.total_attempt_limit()
+        self.job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.FAILED,
+            metadata={
+                "failure_reason": "total_attempt_limit_reached",
+                "failure_detail": (
+                    f"Task {job.task_id!r} consumed all {total} worker "
+                    f"attempt(s) for transition {job.transition_id!r}; "
+                    "the durable total account is exhausted."
+                ),
+                "task_revision": revision,
+            },
+        )
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="executor"),
+            event_type=EventType.ExecutionFailed,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            data={
+                "reason": "total_attempt_limit_reached",
+                "task_revision": revision,
+                "total_attempts": total,
+            },
+        ))
+        # Leave the workspace intact so the failed work and evidence remain
+        # readable; the exhausted durable account prevents any re-admission.
 
     def _wait_for_completion_settlement(self, job_id: str) -> None:
         deadline = time.monotonic() + max(0.0, self.completion_settle_timeout_seconds)
