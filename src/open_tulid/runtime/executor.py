@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import threading
 import time
 from dataclasses import dataclass, replace as _replace_request
@@ -483,8 +482,9 @@ class JobExecutor:
             if result is None:
                 # The worker vanished before it had an accepted completion. The
                 # failure flow already failed the job, stopped/cleaned the
-                # worker, scrubbed its workspace, and released its lease. The
-                # task itself remains in its existing state for a fresh attempt.
+                # worker, preserved its workspace and evidence, and released its
+                # lease. The task itself remains in its existing state for a
+                # fresh attempt.
                 return ExecutorRunResult(True, run=None)
             _write_run_logs_with_metadata(
                 Path(job.workspace_path),
@@ -529,12 +529,13 @@ class JobExecutor:
                 ExecutionJobStatus.STALE.value,
                 ExecutionJobStatus.CANCELLED.value,
             }:
-                # A terminal outcome was already recorded; reconcile the
-                # workspace that can no longer be completed.
-                _scrub_workspace_for_job(job)
+                # A terminal outcome was already recorded; preserve the failed
+                # workspace and its evidence so recoverable work never
+                # disappears before recovery evidence is retained.
+                self._preserve_failure_evidence(job)
                 return ExecutorRunResult(True, run=result)
             # The worker exited without an accepted completion. That is a faulty
-            # worker: fail the job, scrub its workspace, and release its lease
+            # worker: fail the job, preserve its evidence, and release its lease
             # so a fresh scheduler attempt can reuse the same task.
             return self._fail_completed_worker_without_completion(job, result)
         except Exception as exc:
@@ -992,7 +993,7 @@ class JobExecutor:
             returncode=event.returncode,
             request=request,
             stop_container=True,
-            scrub=True,
+            preserve_evidence=True,
             failure=self._classify_vanished_failure(job),
         )
 
@@ -1006,6 +1007,7 @@ class JobExecutor:
                 returncode=result.returncode,
                 request=None,
                 stop_container=False,
+                preserve_evidence=True,
                 failure=failure,
             )
         else:
@@ -1016,6 +1018,7 @@ class JobExecutor:
                 returncode=result.returncode,
                 request=None,
                 stop_container=False,
+                preserve_evidence=True,
                 failure=failure,
             )
         return ExecutorRunResult(True, run=result)
@@ -1063,7 +1066,7 @@ class JobExecutor:
         returncode: int | None,
         request,
         stop_container: bool,
-        scrub: bool = False,
+        preserve_evidence: bool = False,
         failure: ExecutionFailure | None = None,
     ) -> None:
         """Atomically fail an orphaned/faulty worker. Idempotent and race-safe.
@@ -1071,6 +1074,11 @@ class JobExecutor:
         Does nothing if the job already reached an accepted/terminal outcome so
         a duplicate health notification can never create duplicate retries,
         cleanup races, or clobber an accepted completion.
+
+        When ``preserve_evidence`` is set, the failed workspace and its logs are
+        retained (never scrubbed) and a durable failure-evidence record is
+        persisted, so a failed worker's recoverable work and evidence outlive
+        the attempt.
         """
         loaded = self.job_store.get(job.job_id)
         if not loaded.accepted or loaded.job is None:
@@ -1120,10 +1128,69 @@ class JobExecutor:
         ))
         if stop_container:
             self._stop_worker(job.job_id, request=request)
-        if scrub:
-            _scrub_workspace_for_job(job)
+        if preserve_evidence:
+            self._preserve_failure_evidence(job, failure=failure, reason=reason)
         if self.lease_store is not None:
             self.lease_store.release_job(job.job_id)
+
+    def _preserve_failure_evidence(
+        self,
+        job,
+        *,
+        failure: ExecutionFailure | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Persist readable evidence and preserve a failed worker workspace.
+
+        Before any destructive cleanup could discard a failed attempt, this
+        retains the workspace itself (until plan 5 ships a durable
+        candidate/change-set manifest, preserving the workspace beats pretending
+        an incomplete patch is enough) and writes a failure-evidence record that
+        ties the logs, the task/context identity, and the classified failure to
+        the job. It is idempotent and never deletes recoverable work.
+        """
+        workspace = Path(job.workspace_path)
+        if not workspace.is_dir():
+            return
+        evidence_dir = workspace / ".open-tulid" / "evidence"
+        try:
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "schema": "tulid.failure-evidence/v1",
+                "created_at": _utc_now().isoformat(),
+                "job_id": job.job_id,
+                "project_id": job.project_id,
+                "task_id": job.task_id,
+                "transition_id": job.transition_id,
+                "worker_id": job.worker_id,
+                "preserved_workspace": True,
+                "workspace_path": str(workspace),
+                "logs_path": str(_agent_log_dir(workspace)),
+                "context_path": str(workspace / ".open-tulid" / "job-context.json"),
+                "prompt_path": str(workspace / ".open-tulid" / "prompt-packet.md"),
+                "failure_reason": reason,
+                "failure": failure.to_dict() if failure is not None else None,
+            }
+            evidence_record_path = evidence_dir / "failure-evidence.json"
+            evidence_record_path.write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+        loaded = self.job_store.get(job.job_id)
+        if not loaded.accepted or loaded.job is None:
+            return
+        self.job_store.update_status(
+            job.job_id,
+            loaded.job.status,
+            metadata={
+                "failure_evidence_persisted": True,
+                "failure_record_path": str(evidence_record_path),
+                "preserved_workspace": True,
+                "failure_evidence_recorded_at": _utc_now().isoformat(),
+            },
+        )
 
     def _stop_worker(self, job_id: str, *, request) -> None:
         stop = getattr(self.containers, "stop_worker_container", None)
@@ -1894,21 +1961,6 @@ def _job_status_str(result) -> str:
         return ""
     status = result.job.status
     return status.value if hasattr(status, "value") else str(status)
-
-
-def _scrub_workspace_for_job(job: ExecutionJob) -> None:
-    """Idempotently remove the current job workspace (including generated files).
-
-    Durable task history/events are preserved; only the transient worker
-    workspace is scrubbed. Missing or already-cleared workspaces are no-ops.
-    """
-    workspace = Path(job.workspace_path)
-    if not workspace.is_dir():
-        return
-    try:
-        shutil.rmtree(workspace)
-    except OSError:
-        return
 
 
 def _adapter_project_root(adapter: StorageAdapter) -> Path | None:

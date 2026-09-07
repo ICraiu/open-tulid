@@ -2333,6 +2333,13 @@ def _reconcile_active_runtime_jobs(
         )
         if not updated.accepted:
             continue
+        # Reconcile persisted attempt state: settle any admitted/running attempt
+        # that was interrupted by the restart so its durable admission is
+        # counted and recovery starts a bounded fresh attempt, not a new budget.
+        job_store.settle_interrupted_attempts(
+            job.job_id,
+            failure_reference=job.job_id,
+        )
         lease_store.release_job(job.job_id)
         model_proxy_sessions.revoke_job(job.job_id)
         event_store.append(build_event(

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _replace_record
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping
@@ -176,6 +176,40 @@ def attempt_records_from_metadata(metadata: Mapping[str, Any]) -> tuple[AttemptR
         raise ValueError("job metadata attempt_records must be a list")
     records = tuple(attempt_record_from_dict(item) for item in raw)
     return tuple(sorted(records, key=lambda record: record.attempt_number))
+
+
+def reconcile_attempt_records(
+    records: Iterable[AttemptRecord],
+    *,
+    ended_at: str | None = None,
+    failure_reference: str | None = None,
+) -> tuple[AttemptRecord, ...]:
+    """Mark incomplete attempt records ended for restart reconciliation.
+
+    On a restart, an attempt that was only admitted (launch interrupted) or was
+    running (worker orphaned) never reached an explicit ``ended`` state. This
+    settles each such record while preserving its durable admission, so restart
+    recovery starts a bounded fresh attempt without renewing the total budget or
+    pretending the worker ran to completion.
+
+    Already-ended records are returned unchanged.
+    """
+    incomplete = {
+        AttemptStatus.ADMITTED.value,
+        AttemptStatus.RUNNING.value,
+    }
+    reconciled: list[AttemptRecord] = []
+    for record in records:
+        if record.status_value not in incomplete:
+            reconciled.append(record)
+            continue
+        reconciled.append(_replace_record(
+            record,
+            status=AttemptStatus.ENDED,
+            ended_at=ended_at or record.ended_at,
+            failure_reference=failure_reference or record.failure_reference,
+        ))
+    return tuple(reconciled)
 
 
 def count_consumed_attempts(

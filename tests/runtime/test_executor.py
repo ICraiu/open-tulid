@@ -581,6 +581,15 @@ def test_executor_fails_successful_worker_without_explicit_completion_evidence(
     assert loaded.job is not None
     assert loaded.job.status == "failed"
     assert loaded.job.metadata["failure_reason"] == "completion_not_accepted"
+    # The worker's partial changes and logs are preserved as failure evidence.
+    assert workspace.is_dir()
+    assert (workspace / "src" / "app.py").is_file()
+    evidence_path = workspace / ".open-tulid" / "evidence" / "failure-evidence.json"
+    assert loaded.job.metadata["failure_evidence_persisted"] is True
+    assert str(evidence_path) == loaded.job.metadata["failure_record_path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["preserved_workspace"] is True
+    assert evidence["failure_reason"] == "completion_not_accepted"
 
 
 def test_executor_preserves_terminal_failed_status_set_during_worker_run(
@@ -2073,7 +2082,7 @@ def _wait_status(store: FileExecutionJobStore, status: str, timeout: float = 5.0
     return False
 
 
-def test_executor_unexpected_worker_exit_fails_job_and_scrubs_and_releases_lease(tmp_path, monkeypatch):
+def test_executor_unexpected_worker_exit_fails_job_and_preserves_evidence_and_releases_lease(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     store = FileExecutionJobStore(tmp_path / "jobs")
     leases = FileResourceLeaseStore(
@@ -2094,6 +2103,8 @@ def test_executor_unexpected_worker_exit_fails_job_and_scrubs_and_releases_lease
 
     def fake_run_agent_container(request, *, docker_executable):
         worker_started.set()
+        (Path(request.workspace) / "src").mkdir(parents=True, exist_ok=True)
+        (Path(request.workspace) / "src" / "app.py").write_text("print('partial')\n", encoding="utf-8")
         # The worker vanished mid-run without any accepted completion: it never
         # returns, so the executor's liveness probe is the only signal left.
         threading.Event().wait()
@@ -2135,7 +2146,18 @@ def test_executor_unexpected_worker_exit_fails_job_and_scrubs_and_releases_lease
     assert loaded.job is not None
     assert loaded.job.status == "failed"
     assert loaded.job.metadata["failure_reason"] == "worker_unexpected_exit"
-    assert not workspace.exists()
+    # Step 1E: a failed workspace is preserved (never scrubbed) and a durable
+    # failure-evidence record ties the recoverable partial work to the job.
+    assert workspace.is_dir()
+    assert (workspace / "src" / "app.py").is_file()
+    evidence_path = workspace / ".open-tulid" / "evidence" / "failure-evidence.json"
+    assert loaded.job.metadata["failure_evidence_persisted"] is True
+    assert str(evidence_path) == loaded.job.metadata["failure_record_path"]
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["preserved_workspace"] is True
+    assert evidence["job_id"] == JOB_ID
+    assert evidence["task_id"] == TASK_ID
+    assert evidence["failure_reason"] == "worker_unexpected_exit"
     assert not leases.job_holds(("gpu",), JOB_ID)
     accepted = [event for event in events.iter_events() if event.event_type == "ExecutionAccepted"]
     assert accepted == []

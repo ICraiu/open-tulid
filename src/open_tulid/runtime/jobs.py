@@ -13,8 +13,11 @@ from typing import Any, Mapping
 from open_tulid.domain import DomainError, ExecutionJob, ExecutionJobStatus
 from open_tulid.runtime.attempts import (
     ATTEMPT_RECORD_METADATA_KEY,
+    AttemptStatus,
     attempt_record_from_dict,
     attempt_record_to_dict,
+    attempt_records_from_metadata,
+    reconcile_attempt_records,
 )
 from open_tulid.runtime.events import utc_now
 
@@ -249,6 +252,53 @@ class FileExecutionJobStore:
             job.status,
             metadata={ATTEMPT_RECORD_METADATA_KEY: surviving},
         )
+
+    def settle_interrupted_attempts(
+        self,
+        job_id: str,
+        *,
+        ended_at: str | None = None,
+        failure_reference: str | None = None,
+    ) -> JobStoreResult:
+        """Settle attempts interrupted by a restart/stop.
+
+        On restart reconciliation, an attempt that was only admitted (its launch
+        was interrupted) or was running (the worker/process is gone) never
+        reached an explicit end. This marks each such record ``ended`` while
+        keeping its durable admission counted, so recovery starts a bounded
+        fresh attempt instead of creating a new budget identity. It is a no-op
+        when no attempt is incomplete.
+        """
+        loaded = self.get(job_id)
+        if not loaded.accepted or loaded.job is None:
+            return loaded
+        job = loaded.job
+        try:
+            records = attempt_records_from_metadata(job.metadata)
+        except ValueError:
+            return JobStoreResult(job=job)
+        incomplete = {
+            AttemptStatus.ADMITTED.value,
+            AttemptStatus.RUNNING.value,
+        }
+        if not any(record.status_value in incomplete for record in records):
+            return JobStoreResult(job=job)
+        endpoint = ended_at or utc_now()
+        reference = failure_reference or job_id
+        reconciled = reconcile_attempt_records(
+            records,
+            ended_at=endpoint,
+            failure_reference=reference,
+        )
+        by_id = {record.attempt_id: record for record in reconciled}
+        for record in records:
+            if record.status_value not in incomplete:
+                continue
+            settled = by_id.get(record.attempt_id)
+            if settled is None:
+                continue
+            self.record_attempt(job_id, attempt_record_to_dict(settled))
+        return JobStoreResult(job=job)
 
     def _path_for(self, job_id: str) -> Path:
         return self.root / job_id / "job.json"

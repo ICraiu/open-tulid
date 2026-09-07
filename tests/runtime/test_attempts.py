@@ -219,6 +219,54 @@ def test_job_attempts_counter_unchanged_by_record_attempt(tmp_path: Path):
     assert store.get(JOB_ID).job.attempts == 0
 
 
+def test_settle_interrupted_attempts_marks_incomplete_ended_and_survives_restart(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(_job()).accepted is True
+    # Attempt 1 was running and attempt 2 was admitted but its launch was
+    # interrupted; attempt 1 is deliberately out of order to prove status,
+    # not recency, drives settlement.
+    running = _record(1, status="running")
+    admitted = _record(2, status="admitted")
+    assert store.record_attempt(JOB_ID, attempt_record_to_dict(running)).accepted is True
+    assert store.record_attempt(JOB_ID, attempt_record_to_dict(admitted)).accepted is True
+
+    settled_at = "2026-09-07T13:00:00+00:00"
+    assert store.settle_interrupted_attempts(
+        JOB_ID,
+        ended_at=settled_at,
+        failure_reference=JOB_ID,
+    ).accepted is True
+
+    records = attempt_records_from_metadata(store.get(JOB_ID).job.metadata)
+    assert all(record.status_value == "ended" for record in records)
+    assert all(record.failure_reference == JOB_ID for record in records)
+    assert all(record.ended_at == settled_at for record in records)
+
+    # A daemon restart reconstructs the store; the settled ending persists and
+    # the durable admissions remain counted.
+    reloaded = FileExecutionJobStore(tmp_path / "jobs").get(JOB_ID)
+    assert reloaded.job is not None
+    records = attempt_records_from_metadata(reloaded.job.metadata)
+    assert [record.attempt_number for record in records] == [1, 2]
+    assert all(record.status_value == "ended" for record in records)
+    assert count_consumed_attempts(
+        jobs=store.list().jobs,
+        task_id=TASK_ID,
+        transition_id="code",
+        task_revision="rev-1",
+    ) == 2
+
+
+def test_settle_interrupted_attempts_is_idempotent_and_ignores_ended(tmp_path: Path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(_job()).accepted is True
+    assert store.record_attempt(JOB_ID, attempt_record_to_dict(_record(1, status="ended"))).accepted is True
+
+    assert store.settle_interrupted_attempts(JOB_ID).accepted is True
+    record = attempt_records_from_metadata(store.get(JOB_ID).job.metadata)[0]
+    assert record.status_value == "ended"
+
+
 def _attempt_for(job_id: str, number: int, *, revision: str, status: str = "ended") -> AttemptRecord:
     return AttemptRecord(
         schema="tulid.attempt/v1",
