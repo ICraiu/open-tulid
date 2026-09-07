@@ -91,6 +91,7 @@ from .prompts import (
     lint_compiled_prompt,
 )
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairPlan, build_repair_packet, plan_repair
+from .failures import ExecutionFailure, FailureCategory, classify_worker_failure
 from .scheduler import (
     ScheduleResult,
     Scheduler,
@@ -246,6 +247,9 @@ __all__ = [
     "RepairPlan",
     "build_repair_packet",
     "plan_repair",
+    "ExecutionFailure",
+    "FailureCategory",
+    "classify_worker_failure",
     "ScheduleResult",
     "Scheduler",
     "recover_job_creation_transactions",

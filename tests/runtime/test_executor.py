@@ -1385,11 +1385,12 @@ def _opencode_workflow() -> WorkflowDefinition:
 
 
 def test_executor_does_not_fail_completion_for_vanished_worker_when_completion_is_pending(tmp_path: Path, monkeypatch):
-    """Unexpected worker exits are treated uniformly, never classified.
+    """A bare auth-like/doom-loop signature without evidence is not classified.
 
-    A worker that stops with a doom-loop/Unauthorized signature and no accepted
-    completion is a faulty worker. The executor must fail it without parsing the
-    OpenCode log text, and must never emit `failure_code`/`retryable` metadata.
+    A worker that stops with an ambiguous Unauthorized signature and no accepted
+    completion is a faulty worker. Without structured proxy evidence or an
+    explicit doom-loop event/signature, log text alone must not emit
+    `failure_code`/`retryable` metadata.
     """
     workspace = tmp_path / "workspace"
     store = FileExecutionJobStore(tmp_path / "jobs")
@@ -1490,6 +1491,125 @@ def test_executor_leaves_non_opencode_worker_failure_unclassified(tmp_path: Path
     assert meta["worker_returncode"] == 1
     assert "failure_code" not in meta
     assert "retryable" not in meta
+
+
+def test_executor_attaches_classified_failure_to_job_and_event(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+
+    def fake_run(request, *, docker_executable):
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=1,
+            stderr="mkdir: permission denied\n",
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run)
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    meta = loaded.job.metadata
+    assert meta["failure_code"] == "worker.permission"
+    assert meta["failure_category"] == "permission"
+    assert meta["retryable"] is False
+    assert "do not relax" in meta["retry_action"]
+    assert "permission denied" in meta["failure_evidence"]
+    assert meta["failure_evidence_path"] == str(workspace / ".open-tulid" / "logs" / "agent.log")
+    failed = [e for e in events.iter_events() if e.event_type == "ExecutionFailed"]
+    assert failed
+    data = failed[-1].data
+    assert data["failure_code"] == "worker.permission"
+    assert data["failure_category"] == "permission"
+    assert data["retryable"] is False
+    assert data["returncode"] == 1
+
+
+def test_executor_classifies_expired_credential_from_proxy_rejections(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    proxy_logs = tmp_path / "proxy-logs"
+    proxy_logs.mkdir()
+    (proxy_logs / "rejections.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-07T00:00:00Z",
+            "job_id": JOB_ID,
+            "reason": "session_expired",
+            "http_status": 401,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id=JOB_ID,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        worker_id="codex",
+        workspace_path=str(workspace),
+        metadata={"completion_token": "secret"},
+    )).accepted is True
+    events = JsonlEventStore(tmp_path / "events")
+
+    def fake_run(request, *, docker_executable):
+        return AgentRunResult(
+            agent_id=request.agent_id,
+            image=request.image,
+            command=("fake",),
+            returncode=1,
+            stdout="generated output\n",
+            stderr="Error: Unauthorized: unauthorized\n",
+        )
+
+    monkeypatch.setattr("open_tulid.runtime.executor.run_agent_container", fake_run)
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=store,
+        event_store=events,
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        proxy_evidence_root=proxy_logs,
+    )
+
+    result = executor.run(JOB_ID)
+
+    assert result.accepted is True
+    loaded = store.get(JOB_ID)
+    assert loaded.job is not None
+    assert loaded.job.status == "failed"
+    meta = loaded.job.metadata
+    assert meta["failure_code"] == "session.expired"
+    assert meta["failure_category"] == "authentication"
+    assert meta["retryable"] is True
+    assert "correctly bounded" in meta["retry_action"]
+    assert meta["failure_evidence_path"] == str(proxy_logs / "rejections.jsonl")
+    failed = [e for e in events.iter_events() if e.event_type == "ExecutionFailed"]
+    data = failed[-1].data
+    assert data["failure_code"] == "session.expired"
+    assert data["failure_category"] == "authentication"
 
 
 def test_executor_successful_completion_is_not_classified(tmp_path: Path, monkeypatch):

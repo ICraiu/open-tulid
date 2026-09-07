@@ -660,6 +660,7 @@ def run_job(
         model_proxies=ctx["config"].model_proxy,
         model_proxy_sessions=ctx["model_proxy_sessions"],
         model_proxy_endpoint_base=_model_proxy_endpoint_base(ctx["config"]),
+        proxy_evidence_root=_model_proxy_log_root(ctx["config"]),
         validation_implementations=VALIDATION_IMPLEMENTATIONS,
         validation_context_factory=_validation_context,
         containers=ctx["containers"],
@@ -1020,9 +1021,7 @@ def model_proxy_serve() -> None:
             adapters[proxy_id] = LocalModelAdapter(proxy)
         elif proxy.kind == "openai":
             adapters[proxy_id] = OpenAIAdapter(proxy, os.environ)
-    transcript_root = config.model_proxy_server.log_root or (
-        (config.config_dir or Path.cwd()) / "model-proxy-logs"
-    )
+    transcript_root = _model_proxy_log_root(config)
     service = ModelProxyService(
         sessions=sessions,
         adapters=adapters,
@@ -1965,6 +1964,12 @@ def _print_domain_errors(errors) -> None:
 
 def _model_proxy_session_root(config: Config) -> Path:
     return (config.config_dir or Path.cwd()) / "model-proxy-sessions"
+
+
+def _model_proxy_log_root(config: Config) -> Path:
+    return config.model_proxy_server.log_root or (
+        (config.config_dir or Path.cwd()) / "model-proxy-logs"
+    )
 
 
 def _model_proxy_endpoint_base(config: Config) -> str:

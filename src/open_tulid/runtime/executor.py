@@ -43,6 +43,7 @@ from open_tulid.runtime.prompts import (
 from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
+from open_tulid.runtime.failures import ExecutionFailure, classify_worker_failure
 from open_tulid.runtime.observability import (
     WorkerExited,
     WorkerLivenessProbe,
@@ -220,6 +221,7 @@ class JobExecutor:
         model_proxies: dict[str, ModelProxyConfig] | None = None,
         model_proxy_sessions: ModelProxySessionStore | FileModelProxySessionStore | None = None,
         model_proxy_endpoint_base: str | None = None,
+        proxy_evidence_root: Path | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
         completion_settle_timeout_seconds: float = DEFAULT_COMPLETION_SETTLE_TIMEOUT_SECONDS,
@@ -241,6 +243,7 @@ class JobExecutor:
         self.model_proxies = model_proxies or {}
         self.model_proxy_sessions = model_proxy_sessions
         self.model_proxy_endpoint_base = model_proxy_endpoint_base
+        self.proxy_evidence_root = proxy_evidence_root
         self.validation_implementations = validation_implementations
         self.validation_context_factory = validation_context_factory
         self.completion_settle_timeout_seconds = completion_settle_timeout_seconds
@@ -925,9 +928,11 @@ class JobExecutor:
             request=request,
             stop_container=True,
             scrub=True,
+            failure=self._classify_vanished_failure(job),
         )
 
     def _fail_completed_worker_without_completion(self, job, result) -> ExecutorRunResult:
+        failure = self._classify_result_failure(job, result)
         if result.succeeded:
             self._fail_worker(
                 job,
@@ -936,6 +941,7 @@ class JobExecutor:
                 returncode=result.returncode,
                 request=None,
                 stop_container=False,
+                failure=failure,
             )
         else:
             self._fail_worker(
@@ -945,8 +951,43 @@ class JobExecutor:
                 returncode=result.returncode,
                 request=None,
                 stop_container=False,
+                failure=failure,
             )
         return ExecutorRunResult(True, run=result)
+
+    def _evidence_path(self, job) -> str | None:
+        return str(Path(job.workspace_path) / ".open-tulid" / "logs" / "agent.log")
+
+    def _classify_result_failure(
+        self,
+        job,
+        result,
+    ) -> ExecutionFailure | None:
+        return classify_worker_failure(
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            job_id=job.job_id,
+            proxy_evidence_root=self.proxy_evidence_root,
+            evidence_path=self._evidence_path(job),
+        )
+
+    def _classify_vanished_failure(self, job) -> ExecutionFailure | None:
+        agent_log = Path(self._evidence_path(job) or "")
+        text = ""
+        if agent_log.is_file():
+            try:
+                text = agent_log.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        return classify_worker_failure(
+            returncode=None,
+            stdout="",
+            stderr=text,
+            job_id=job.job_id,
+            proxy_evidence_root=self.proxy_evidence_root,
+            evidence_path=self._evidence_path(job),
+        )
 
     def _fail_worker(
         self,
@@ -958,6 +999,7 @@ class JobExecutor:
         request,
         stop_container: bool,
         scrub: bool = False,
+        failure: ExecutionFailure | None = None,
     ) -> None:
         """Atomically fail an orphaned/faulty worker. Idempotent and race-safe.
 
@@ -980,6 +1022,21 @@ class JobExecutor:
             return
         metadata: dict[str, object] = {"worker_returncode": returncode} if returncode is not None else {}
         event_data: dict[str, object] = {"returncode": returncode} if returncode is not None else {}
+        if failure is not None:
+            metadata.update({
+                "failure_code": failure.code,
+                "failure_category": failure.category,
+                "retryable": failure.retryable,
+                "retry_action": failure.retry_action,
+                "failure_evidence": failure.evidence,
+                "failure_evidence_path": failure.evidence_path,
+            })
+            event_data.update({
+                "failure_code": failure.code,
+                "failure_category": failure.category,
+                "retryable": failure.retryable,
+                "retry_action": failure.retry_action,
+            })
         if reason is not None:
             metadata["failure_reason"] = reason
             event_data["reason"] = reason
