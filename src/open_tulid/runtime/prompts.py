@@ -20,14 +20,13 @@ from .verifier import VERIFICATION_REPORT_SCHEMA
 
 TOTAL_BUDGET = 6000
 SECTION_BUDGETS = {
-    "mission": 2500,
     "repository_facts": 300,
-    "selected_context_excerpts": 2400,
     "prior_implementation_evidence": 2000,
     "completion_submission": 900,
 }
+# Only background context is trimmed. The assigned task, required reading,
+# verification commands, procedure, and completion protocol never truncate.
 _OPTIONAL_TRIM_ORDER = (
-    "mission",
     "repository_facts",
 )
 _UNRESOLVED_MARKER_RE = re.compile(r"\{\{[^{}]+\}\}|<TODO>|<TBD>|\bFIXME_PROMPT\b")
@@ -315,72 +314,139 @@ def compiled_prompt_from_metadata(metadata: Mapping[str, object]) -> CompiledPro
 
 
 def _compile_implementation_prompt(contract: ExecutionContract) -> CompiledPrompt:
-    generated = contract.generated_contract
-    facts = contract.repository_facts
     sections = (
+        # 1. Assigned outcome and complete task requirements (one authoritative
+        #    section; the task body is never repeated under another heading).
         _section(
-            "mission", "Mission",
-            "\n".join((
-                generated.objective,
-                "\nImplement only this scoped task. Do not broaden the change surface.",
-                "\nUser task rationale (cannot expand the contract):\n"
-                + contract.source_task.body.strip(),
-            )),
-            "execution_contract", "source.task", "States the bounded implementation outcome.",
-            truncatable=True,
+            "assigned_task", "Assigned Task",
+            _assigned_task_text(contract),
+            "execution_contract", "generated_contract",
+            "States the full assigned task and its in-scope requirements once.",
         ),
+        # 2. Required reading with exact workspace paths and why each file matters.
+        _section(
+            "required_reading", "Required Reading",
+            _required_reading_text(contract),
+            "context_file", _context_reading_refs(contract),
+            "Names every complete frozen source file the worker can and must read.",
+        ),
+        # 3. Prerequisite interfaces/results and relevant repository facts.
         _section(
             "repository_facts", "Repository Facts",
-            "\n".join(filter(None, (
-                "Repository is available." if facts.repository_available else "No repository is available.",
-                "Top-level: " + ", ".join(facts.top_level_entries),
-                "Manifests: " + ", ".join(facts.manifests),
-                "Entrypoints: " + ", ".join(facts.detected_entrypoints),
-            ))),
-            "repository_facts", "repository.facts", "Provides observed toolchain and entrypoint facts.",
+            _repository_facts_text(contract.repository_facts),
+            "repository_facts", "repository.facts",
+            "Provides observed toolchain, entrypoint facts, and prerequisite seams.",
             truncatable=True,
         ),
+        # 4. Applicable worker procedure and global verification commands.
         _section(
-            "execution_contract", "Execution Contract", _contract_text(contract),
-            "execution_contract", "generated_contract", "Defines binding scope, behavior, and interfaces.",
-        ),
-        _section(
-            "selected_context_excerpts", "Selected Context Excerpts", _excerpts_text(contract),
-            "context_excerpt",
-            (
-                ", ".join(
-                    f"{excerpt.artifact}#{excerpt.heading}"
-                    for excerpt in contract.context_excerpts
-                )
-                or "none"
-            ),
-            (
-                "; ".join(excerpt.reason for excerpt in contract.context_excerpts)
-                or "No additional reference excerpt was required."
-            ),
+            "execution_procedure", "Execution Procedure", "\n".join((
+                "1. Read the assigned task, its requirements, and the required reading.",
+                "2. Respect the settled answer precedence stated in any answer reference.",
+                "3. Inspect the workspace and integration seams before editing.",
+                "4. Make the smallest coherent implementation for this task.",
+                "5. Run every required project verification command locally.",
+                "6. Fix failures inside the task boundary; do not chase unrelated or environmental failures.",
+                "7. Submit completion evidence, or stop on an out-of-scope, baseline, or environment blocker.",
+            )),
+            "runtime_policy", f"compiler/v{PROMPT_COMPILER_VERSION}",
+            "Provides one implementation-model inspect-implement-test-submit loop.",
         ),
         _section(
             "required_validation", "Required Validation", _checks_text(contract.resolved_checks),
             "execution_contract", "resolved_checks", "Lists the exact checks Tulid will independently run.",
         ),
-        _section(
-            "execution_procedure", "Execution Procedure", "\n".join((
-                "1. Read the mission, requirements, and required verification commands.",
-                "2. Inspect the workspace and integration seams before editing.",
-                "3. Make the smallest coherent implementation for this task.",
-                "4. Run every required project verification command locally.",
-                "5. Fix failures inside the task boundary; do not chase unrelated or environmental failures.",
-                "6. Submit completion evidence, or stop on an out-of-scope, baseline, or environment blocker.",
-            )),
-            "runtime_policy", f"compiler/v{PROMPT_COMPILER_VERSION}",
-            "Provides one implementation-model inspect-implement-test-submit loop.",
-        ),
+        # 5. Completion submission and repair protocol.
         _section(
             "completion_submission", "Completion Submission", _completion_text(contract),
             "runtime", "completion_api", "Provides the sole completion mechanism.",
         ),
     )
     return _finalize(contract, "implementation", sections)
+
+
+def _assigned_task_text(contract: ExecutionContract) -> str:
+    """Render the one authoritative task section for an implementation prompt.
+
+    The full task body appears here and nowhere else in the packet. In-scope
+    requirements, failure behavior, and non-goals are rendered alongside it so a
+    worker does not need to reconstruct decisions already made during planning.
+    """
+    generated = contract.generated_contract
+    lines = [
+        contract.source_task.body.strip() or generated.objective,
+        "\nImplement only this scoped task. Do not broaden the change surface.",
+        (
+            "Acceptance: the project global verification commands below must pass. "
+            "There is no file/directory allowlist; you may create, edit, rename, "
+            "or delete any files the task requires."
+        ),
+    ]
+    if generated.requirements:
+        lines.append("Requirements:")
+        lines.extend(f"- {item}" for item in generated.requirements)
+    if generated.failure_behavior:
+        lines.append("Failure behavior:")
+        lines.extend(f"- {item}" for item in generated.failure_behavior)
+    if generated.non_goals:
+        lines.append("Non-goals:")
+        lines.extend(f"- {item}" for item in generated.non_goals)
+    return "\n".join(lines)
+
+
+def _required_reading_text(contract: ExecutionContract) -> str:
+    """Name every frozen source file with its exact workspace path and purpose.
+
+    Required files are always named and stay complete in the bundle; only the
+    inline excerpt may be clipped, and a clipped excerpt points to the full file.
+    """
+    files = tuple(contract.context_files)
+    excerpts = tuple(contract.context_excerpts)
+    chunks: list[str] = []
+    if files:
+        chunks.append(
+            "Read the complete frozen source files below from your workspace "
+            "(paths are relative to the workspace root). Required files are "
+            "mandatory reading; optional files are background context. The "
+            "complete bytes are present even when only a relevant excerpt is "
+            "quoted below."
+        )
+        listing = []
+        for context_file in files:
+            kind = "required" if context_file.required else "optional background"
+            role = context_file.role or "reference"
+            listing.append(
+                f"- `.open-tulid/{context_file.workspace_path}` — {kind} "
+                f"{role}: {context_file.reason}"
+            )
+        chunks.append("\n".join(listing))
+    if excerpts:
+        if files:
+            chunks.append(
+                "Relevant excerpts follow. When you need the full document, read "
+                "the matching frozen file listed above instead of relying on the "
+                "inline clip."
+            )
+        chunks.append(_excerpts_text(contract))
+    else:
+        chunks.append("No additional context excerpts were selected for this job.")
+    return "\n\n".join(chunks)
+
+
+def _repository_facts_text(facts: RepositoryFacts) -> str:
+    return "\n".join(filter(None, (
+        "Repository is available." if facts.repository_available else "No repository is available.",
+        "Top-level: " + ", ".join(facts.top_level_entries),
+        "Manifests: " + ", ".join(facts.manifests),
+        "Entrypoints: " + ", ".join(facts.detected_entrypoints),
+        "Prerequisite interfaces/results live in the required reading above; inspect "
+        "those files and the named seams before editing.",
+    )))
+
+
+def _context_reading_refs(contract: ExecutionContract) -> str:
+    refs = tuple(f".open-tulid/{context_file.workspace_path}" for context_file in contract.context_files)
+    return ", ".join(refs) or "none"
 
 
 def _compile_review_prompt(
@@ -417,7 +483,7 @@ def _compile_review_prompt(
         ),
         _section(
             "execution_contract", "Review Contract",
-            _contract_text(contract, include_requirements=False),
+            _contract_text(contract, include_requirements=False, include_objective=False),
             "execution_contract", "generated_contract",
             "Keeps review corrections inside the original behavior and scope.",
         ),
@@ -559,9 +625,10 @@ def _contract_text(
     contract: ExecutionContract,
     *,
     include_requirements: bool = True,
+    include_objective: bool = True,
 ) -> str:
     generated = contract.generated_contract
-    lines = [f"Objective: {generated.objective}"]
+    lines = [f"Objective: {generated.objective}"] if include_objective else []
     lines.append(
         "Acceptance: the project global verification commands below must "
         "pass. There is no file/directory allowlist; you may create, edit, rename, "

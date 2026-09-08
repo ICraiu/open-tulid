@@ -143,12 +143,11 @@ def test_runtime_start_drives_stt_style_workflow_end_to_end(
         implementation_prompt = (implementation_workspace / ".open-tulid" / "prompt-packet.md").read_text(
             encoding="utf-8",
         )
-        assert "## Mission" in implementation_prompt
+        assert "## Assigned Task" in implementation_prompt
+        assert "## Required Reading" in implementation_prompt
         assert "## Repository Facts" in implementation_prompt
-        assert "## Execution Contract" in implementation_prompt
-        assert "## Selected Context Excerpts" in implementation_prompt
-        assert "## Required Validation" in implementation_prompt
         assert "## Execution Procedure" in implementation_prompt
+        assert "## Required Validation" in implementation_prompt
         assert "## Completion Submission" in implementation_prompt
         assert "## Parent Context" not in implementation_prompt
         assert "## Derived tasks" not in implementation_prompt

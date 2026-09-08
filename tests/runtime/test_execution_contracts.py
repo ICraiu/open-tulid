@@ -16,6 +16,7 @@ from open_tulid.domain import (
 )
 from open_tulid.runtime.execution_contracts import (
     FrozenContextExcerpt,
+    FrozenContextFile,
     compile_task_execution_contract,
     execution_contract_to_dict,
     load_job_execution_contract,
@@ -350,8 +351,8 @@ def test_compiled_prompt_is_deterministic_compact_and_has_single_completion_exam
     assert first.text == second.text
     assert first.manifest.packet_sha256 == second.manifest.packet_sha256
     assert [section.heading for section in first.sections] == [
-        "Mission", "Repository Facts", "Execution Contract", "Selected Context Excerpts",
-        "Required Validation", "Execution Procedure", "Completion Submission",
+        "Assigned Task", "Required Reading", "Repository Facts",
+        "Execution Procedure", "Required Validation", "Completion Submission",
     ]
     assert len(first.text) <= TOTAL_BUDGET
     assert first.text.count("curl -sS -X POST") == 1
@@ -361,6 +362,64 @@ def test_compiled_prompt_is_deterministic_compact_and_has_single_completion_exam
     assert first.manifest.execution_contract_sha256 == compiled.contract.sha256
     assert first.manifest.packet_type == "implementation"
     assert lint_compiled_prompt(first, contract=compiled.contract) == ()
+
+
+def test_im2c_prompt_renders_one_authoritative_task_and_exact_reading_paths(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    spec_content = "# Spec\nRequired enum E {A, B}.\n" + ("x" * 20)
+    spec_sha = hashlib.sha256(spec_content.encode("utf-8")).hexdigest()
+    context_file = FrozenContextFile(
+        workspace_path=f"context/{spec_sha[:12]}.md",
+        content=spec_content,
+        sha256=spec_sha,
+        byte_count=len(spec_content.encode("utf-8")),
+        required=True,
+        reason="Defines the required enum and serialization rules.",
+        role="reference",
+        refs=("artifacts/task-1/spec.md",),
+    )
+    excerpt_text = "# Linked Reference Context: artifacts/task-1/spec.md\n\n" + spec_content
+    excerpt = FrozenContextExcerpt(
+        artifact="artifacts/task-1/spec.md",
+        heading="Linked Reference Context",
+        reason="Defines the required enum and serialization rules.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+        context_file_path=context_file.workspace_path,
+    )
+    contract = replace(
+        compiled_contract.contract,
+        context_files=(context_file,),
+        context_excerpts=(excerpt,),
+    )
+
+    prompt = compile_execution_prompt(contract)
+
+    assert [section.heading for section in prompt.sections] == [
+        "Assigned Task", "Required Reading", "Repository Facts",
+        "Execution Procedure", "Required Validation", "Completion Submission",
+    ]
+    # The task body appears exactly once, in the authoritative Assigned Task
+    # section, and never under a synthetic execution-contract objective.
+    task_body = contract.source_task.body.strip()
+    assert prompt.text.count(task_body) == 1
+    assert [s.id for s in prompt.sections].count("assigned_task") == 1
+    assert "## Execution Contract" not in prompt.text
+    reading = next(
+        section for section in prompt.sections if section.id == "required_reading"
+    )
+    assert f".open-tulid/{context_file.workspace_path}" in reading.text
+    assert "required reference: Defines the required enum and serialization rules." in reading.text
+    assert lint_compiled_prompt(prompt, contract=contract) == ()
 
 
 def test_historical_prompt_round_trips_and_rejects_section_tampering(tmp_path):
@@ -436,14 +495,14 @@ def test_historical_prompt_round_trip_treats_nested_markdown_headings_as_content
 
     selected = next(
         section for section in loaded.sections
-        if section.id == "selected_context_excerpts"
+        if section.id == "required_reading"
     )
     assert "## Nested Detail" in selected.text
     assert selected.truncated is False
     assert loaded.text == prompt.text
 
 
-def test_prompt_does_not_truncate_binding_objective_or_selected_context(tmp_path):
+def test_prompt_does_not_truncate_binding_task_then_requires_reading(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     task = _task_and_contract(project_root)
@@ -454,7 +513,8 @@ def test_prompt_does_not_truncate_binding_objective_or_selected_context(tmp_path
         transition=_transition(),
     )
     assert compiled_contract.contract is not None
-    objective = "Deliver exact behavior " + ("carefully " * 280)
+    body = "Deliver exact behavior " + ("carefully " * 119) + "exactly."
+    body_stripped = body.strip()
     excerpt_text = (
         "# Required Detail\n\n" + ("binding reference text " * 50)
     ).rstrip()
@@ -467,26 +527,25 @@ def test_prompt_does_not_truncate_binding_objective_or_selected_context(tmp_path
     )
     contract = replace(
         compiled_contract.contract,
-        generated_contract=replace(
-            compiled_contract.contract.generated_contract,
-            objective=objective,
+        source_task=replace(
+            compiled_contract.contract.source_task,
+            body=body,
         ),
         context_excerpts=(excerpt,),
     )
 
     prompt = compile_execution_prompt(contract)
 
-    contract_section = next(
-        section for section in prompt.sections if section.id == "execution_contract"
+    task_section = next(
+        section for section in prompt.sections if section.id == "assigned_task"
     )
-    context_section = next(
-        section for section in prompt.sections
-        if section.id == "selected_context_excerpts"
+    reading_section = next(
+        section for section in prompt.sections if section.id == "required_reading"
     )
-    assert f"Objective: {objective}" in contract_section.text
-    assert contract_section.truncated is False
-    assert excerpt_text in context_section.text
-    assert context_section.truncated is False
+    assert body_stripped in task_section.text
+    assert task_section.truncated is False
+    assert excerpt_text in reading_section.text
+    assert reading_section.truncated is False
 
 
 def test_prompt_allows_user_content_that_looks_like_an_unrelated_sha256(tmp_path):
