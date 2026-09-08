@@ -4,11 +4,11 @@ Break the injected implementation specification into a dependency-aware set of c
 
 Use the task body, injected linked context, and repository files present in the workspace as source material. Preserve the architecture defined in the implementation specification, maximize safe parallelism, and keep true prerequisites explicit.
 
-Choose the number, size, and Markdown structure of tasks based on the actual work; there is no fixed daily structure, task count, line count, or mandatory section list. Each task must still form one coherent local-model execution unit and carry the exact behavior, repository paths, interfaces, failure behavior, and product/technical reasoning relevant to it. Do not make the child choose architecture already owned by the direction or specification. Do not emit a task whose purpose is to obtain a missing product decision: the clarification loop must have settled every such decision before breakdown.
+Choose the number and size of tasks based on the actual work; there is no fixed daily structure, task count, or line count. Every generated task must still follow the shared five-part implementation body shape so it survives acceptance, tracker reload, and scheduling without reformatting. Each task must form one coherent local-model execution unit and carry the exact behavior, repository paths, interfaces, failure behavior, and product/technical reasoning relevant to it. Do not make the child choose architecture already owned by the direction or specification. Do not emit a task whose purpose is to obtain a missing product decision: the clarification loop must have settled every such decision before breakdown.
 
-Write every task as structured prose task context, not a validation contract: product reasoning, technical context, canonical answers, objective, scope, requirements, non-goals, and test expectations. Verification commands are global at the project level and are inherited by every task; do not emit a per-task `run:`/`accepts:` command list or any per-task check contract.
+Write every task as structured prose, not a validation contract: product reasoning, technical context, canonical answers, objective, scope, requirements, non-goals, and test expectations. Verification commands are global at the project level and are inherited by every task; do not emit a per-task `run:`/`accepts:`/`accepts_if:` command list or any per-task check contract.
 
-Emit one `ImplementationTaskFile` artifact per task under `output/`. The only storage-required shape is:
+Emit one `ImplementationTaskFile` artifact per task under `output/`. Use the five-part implementation body shape:
 
 ```markdown
 ---
@@ -17,10 +17,23 @@ dependencies: [other-local-name]
 ---
 # Concrete task title
 
-The freely structured task body.
+One or two sentences describing the observable outcome.
+
+## Why
+Product reasoning, settled decisions, required source references, and prerequisites.
+
+## What
+Required behavior, inputs/outputs, interfaces, scope, and non-goals.
+
+## How
+Existing seams, prerequisite assumptions, failure behavior, and technical guidance.
+
+## Acceptance
+Observable outcomes and test expectations as prose.
+The project global verification policy must pass.
 ```
 
-`dependencies` may be omitted when empty. Local IDs must be unique, and dependencies may reference only local IDs emitted in the same breakdown. Do not add an execution-contract schema or any command list to the child task: Tulid applies the project global verification commands automatically after the free-form task enters `Todo`.
+Every child must carry exactly one nonempty `## Why`, `## What`, `## How`, and `## Acceptance` section and unique `## ` headings. Do not add an execution-contract schema or any command list to the child task: Tulid applies the project global verification commands automatically after the task enters `Todo`. `dependencies` may be omitted when empty. Local IDs must be unique, and dependencies may reference only local IDs emitted in the same breakdown.
 
 A task may describe the tests it adds as ordinary prose requirements, and those tests become part of the project test suite. Do not turn them into a per-task command contract or list of validation commands.
 

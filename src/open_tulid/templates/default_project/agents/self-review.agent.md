@@ -4,7 +4,7 @@ Review the just-produced implementation as if it came from another engineer. Thi
 
 Use this review order:
 
-1. Re-read the task and its execution contract when present, then list the required behavior in your own working notes.
+1. Re-read the task body, then list the required behavior in your own working notes; verification commands come only from the project global contract (`contract.yaml`).
 2. Inspect only the changed files and the task's named modules/symbols unless a failure points elsewhere.
 3. Check every acceptance criterion against code and tests.
 4. Look for correctness gaps, missed edge cases, regressions, scope expansion, brittle tests, and confusing structure.

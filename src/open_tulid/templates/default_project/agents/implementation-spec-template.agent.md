@@ -19,3 +19,7 @@ Use this structure for `implementation-spec.md`:
 15. Acceptance criteria as prose test expectations (product reasoning and the tests a task adds; not per-task command lists)
 16. Implementation-blocking decision status
 17. Informational open questions
+
+Generated implementation tasks use the shared five-part body schema
+(`# title`, description, `## Why`, `## What`, `## How`, `## Acceptance`), carry
+prose-only acceptance criteria, and never declare per-task command selectors.

@@ -577,7 +577,7 @@ class TestTaskFileSchema:
 
         assert "task.acceptance_criteria_missing" in errors
 
-    def test_undeclared_accepts_reports_run_unknown(self, tmp_path: Path):
+    def test_machine_accepts_selector_rejected(self, tmp_path: Path):
         body = _SCHEMA_BODY.replace(
             "## Acceptance\n- the check is added\n",
             "## Acceptance\naccepts: [undeclared]\n",
@@ -585,9 +585,11 @@ class TestTaskFileSchema:
 
         errors = _repair_errors(tmp_path, body)
 
-        assert "task.acceptance_run_unknown" in errors
+        # Legacy machine `accepts:` command selection is forbidden, even when
+        # the referenced profile is declared: verification is global.
+        assert "task.acceptance_run_forbidden" in errors
 
-    def test_declared_accepts_resolves(self, tmp_path: Path):
+    def test_machine_accepts_if_selector_rejected(self, tmp_path: Path):
         body = _SCHEMA_BODY.replace(
             "## Acceptance\n- the check is added\n",
             "## Acceptance\naccepts: [unit]\naccepts_if:\n  - returns ok\n",
@@ -595,8 +597,10 @@ class TestTaskFileSchema:
 
         errors = _repair_errors(tmp_path, body, declared_profile="unit")
 
-        assert "task.acceptance_run_unknown" not in errors
-        assert errors == []
+        # A declarable machine block is still a per-task command selector and
+        # must be migrated to prose acceptance criteria.
+        assert "task.acceptance_run_forbidden" in errors
+        assert "task.acceptance_criteria_missing" not in errors
 
     def test_per_task_run_command_list_rejected(self, tmp_path: Path):
         body = _SCHEMA_BODY.replace(

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import AbstractSet
 
 from open_tulid.domain import DomainError
 
@@ -17,21 +15,15 @@ REQUIRED_SECTIONS = ("Why", "What", "How", "Acceptance")
 SECTION_MISSING = "task.section_missing"
 SECTION_EMPTY = "task.section_empty"
 ACCEPTANCE_CRITERIA_MISSING = "task.acceptance_criteria_missing"
-ACCEPTANCE_RUN_UNKNOWN = "task.acceptance_run_unknown"
-# Per-task verification command lists are forbidden: verification commands are
+# Per-task acceptance command selectors are forbidden: verification commands are
 # global at the project level (contract.yaml) and are inherited by every
 # implementation task. A task may add tests to the project suite, but it must
-# not declare its own `run:` command list.
+# not declare its own `accepts:`, `accepts_if:`, or `run:` command selection.
 ACCEPTANCE_RUN_FORBIDDEN = "task.acceptance_run_forbidden"
 
 # A task body must carry a Markdown H1 title and unique `## ` section headings.
 TITLE_MISSING = "task.title_missing"
 DUPLICATE_HEADING = "task.duplicate_heading"
-
-# Machine-checkable acceptance block markers. `accepts:` may reference only
-# declared project profiles/global command ids. `run:` is deliberately absent:
-# per-task command lists are rejected.
-MACHINE_KEYS = ("accepts:", "accepts_if:")
 
 
 @dataclass(frozen=True)
@@ -152,16 +144,18 @@ def validate_task_structure(
 
 def validate_task_schema(
     body: str,
-    declared_ids: AbstractSet[str],
     *,
     location: str | None = None,
 ) -> tuple[DomainError, ...]:
     """Validate the presence-only shape of one task file body.
 
     ``body`` is the full Markdown task body (including the leading ``# Title``).
-    ``declared_ids`` is the set of project-declared profile ids and check ids
-    that a machine `accepts:` block may reference. Unresolved references are
-    reported as ``task.acceptance_run_unknown``.
+
+    Every task follows the five-part implementation shape: a description, then
+    ``## Why``, ``## What``, ``## How``, and ``## Acceptance``. ``## Acceptance``
+    is prose-only: per-task command selectors (``accepts:``, ``accepts_if:``,
+    ``run:``) are forbidden. Verification commands are global at the project
+    level (contract.yaml) and inherited by every task.
 
     Tracker tasks may predate the five-part body shape and carry their title in
     a separate field, so the title is not required here; duplicate section
@@ -184,7 +178,7 @@ def validate_task_schema(
             continue
         content = sections[name]
         if name == "Acceptance":
-            errors.extend(_validate_acceptance(content, declared_ids, location))
+            errors.extend(_validate_acceptance(content, location))
         elif not _has_content(content):
             errors.append(_error(
                 SECTION_EMPTY,
@@ -196,98 +190,42 @@ def validate_task_schema(
 
 def _validate_acceptance(
     content: list[str],
-    declared_ids: AbstractSet[str],
     location: str | None,
 ) -> list[DomainError]:
     errors: list[DomainError] = []
-    has_accepts = False
-    accepts: list[str] = []
-    machine_key_seen = False
+    selector_seen = False
     free_prose = False
     for line in content:
         stripped = line.strip()
         if not stripped or stripped.startswith("# "):
             continue
-        if stripped.startswith("accepts:"):
-            machine_key_seen = True
-            has_accepts = True
-            accepts = _parse_list(stripped)
-        elif stripped.startswith("accepts_if"):
-            machine_key_seen = True
-        elif stripped.startswith("run:"):
-            # A per-task command list is forbidden. Verification commands are
-            # global (contract.yaml) and inherited by every task.
-            machine_key_seen = True
+        if stripped.startswith(("accepts:", "accepts_if:")) or stripped.startswith("run:"):
+            # Per-task command selectors are forbidden: verification commands
+            # are global (contract.yaml) and inherited by every task.
+            selector_seen = True
             errors.append(_error(
                 ACCEPTANCE_RUN_FORBIDDEN,
-                "Per-task `run:` command lists are not allowed; verification "
-                "commands are global at the project level and apply to every "
+                "Per-task acceptance command selectors (`accepts:`, "
+                "`accepts_if:`, `run:`) are not allowed; verification commands "
+                "are global at the project level and apply to every "
                 "implementation task.",
                 location,
             ))
-        elif not _is_machine_line(stripped):
+        else:
             free_prose = True
 
-    if not machine_key_seen and not free_prose:
+    if not selector_seen and not free_prose:
         errors.append(_error(
             ACCEPTANCE_CRITERIA_MISSING,
             "The ## Acceptance section has no per-task acceptance criteria "
-            "(no machine-checkable block and no free-prose list).",
+            "as prose.",
             location,
         ))
-    if machine_key_seen:
-        if not has_accepts:
-            errors.append(_error(
-                ACCEPTANCE_RUN_UNKNOWN,
-                "The machine acceptance block must declare accepts: [<declared "
-                "profile id or check id>].",
-                location,
-            ))
-        for identifier in accepts:
-            if identifier not in declared_ids:
-                errors.append(_error(
-                    ACCEPTANCE_RUN_UNKNOWN,
-                    f"The machine block references undeclared check or profile "
-                    f"id {identifier!r}.",
-                    location,
-                ))
     return errors
-
-
-def _parse_list(line: str) -> list[str]:
-    """Parse ``key: [item, item]`` into a list of trimmed string items."""
-    _, _, value = line.partition(":")
-    value = value.strip()
-    if value.startswith("[") and value.endswith("]"):
-        value = value[1:-1]
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
-def _is_machine_line(line: str) -> bool:
-    return line.startswith(("accepts:", "accepts_if:"))
 
 
 def _has_content(lines: list[str]) -> bool:
     return any(line.strip() for line in lines)
-
-
-def declared_ids_for_project(project_root: Path) -> frozenset[str]:
-    """Collect the declared profile ids and check ids for a project.
-
-    `accepts:` references must resolve against these. Profile ids come from
-    ``acceptance.yaml``; check ids from the declared project contract commands.
-    """
-    from open_tulid.runtime.acceptance_profiles import load_acceptance_profiles
-    from open_tulid.runtime.standard_contracts import load_standard_contract
-
-    declared: set[str] = set()
-    profile_result = load_acceptance_profiles(project_root)
-    if profile_result.accepted and profile_result.profiles is not None:
-        declared.update(profile_result.profiles)
-    contract_result = load_standard_contract(project_root)
-    if contract_result.accepted and contract_result.contract is not None:
-        declared.update(command.name for command in contract_result.contract.commands)
-    return frozenset(declared)
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

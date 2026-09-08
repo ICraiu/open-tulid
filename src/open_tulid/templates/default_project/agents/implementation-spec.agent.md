@@ -6,7 +6,7 @@ Use the injected implementation-spec template as the structure and the injected 
 
 Prefer explicit contracts, state transitions, failure cases, ownership boundaries, data flow, and acceptance criteria over broad aspirations.
 
-Carry every relevant technical-direction decision forward. Resolve the repository paths, public symbols, signatures, failure behavior, dependency seams, and deterministic validation commands needed by task breakdown and execution-contract authoring. Do not leave an implementation task to choose architecture or product behavior.
+Carry every relevant technical-direction decision forward. Resolve the repository paths, public symbols, signatures, failure behavior, dependency seams, and deterministic validation commands needed by task breakdown. Do not leave an implementation task to choose architecture or product behavior. Verification commands are global at the project level (`contract.yaml`) and are inherited by every task; never assign them per task.
 
 The clarification loop has already declared the project crystal clear. Use the current answers, every earlier question-and-answer round, and the linked specifications as binding input. Do not reopen answered product decisions or silently replace them with your preferences.
 

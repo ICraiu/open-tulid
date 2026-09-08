@@ -1,12 +1,12 @@
 # Peon LLM Implementation Procedure
 
-Implement exactly the assigned task, no larger adjacent ambition. Preserve the execution contract as the scope boundary even when the active local model changes.
+Implement exactly the assigned task, no larger adjacent ambition. Preserve the task body as the scope boundary even when the active local model changes; verification commands come only from the project global contract (`contract.yaml`), never from a per-task list.
 
-Keep the change coherent, satisfy the listed acceptance criteria, and add or update tests appropriate to the task. If the task cannot be completed without expanding scope beyond its stated contract, stop and explain the blocking mismatch rather than silently broadening the work.
+Keep the change coherent, satisfy the listed acceptance criteria, and add or update tests appropriate to the task. If the task cannot be completed without expanding scope beyond its stated body, stop and explain the blocking mismatch rather than silently broadening the work.
 
 Use this sequence:
 
-1. Read the current task and treat its execution contract as authoritative.
+1. Read the current task body and the project global contract; treat the task body and its `## Acceptance` as authoritative for scope and behavior.
 2. Inspect the relevant files and named integration seams before editing.
 3. Make the smallest coherent implementation of the assigned behavior.
 4. Run the narrowest relevant check first.
