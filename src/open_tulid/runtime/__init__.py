@@ -80,6 +80,7 @@ from .instructions import (
     PromptPacket,
     PromptPacketResult,
 )
+from .context import LinkedContextResolver, load_parent_tasks, task_for_context
 from .prompts import (
     CompiledPrompt,
     PromptManifest,
@@ -238,6 +239,9 @@ __all__ = [
     "InstructionDocument",
     "PromptPacket",
     "PromptPacketResult",
+    "LinkedContextResolver",
+    "load_parent_tasks",
+    "task_for_context",
     "CompiledPrompt",
     "PromptManifest",
     "PromptSection",

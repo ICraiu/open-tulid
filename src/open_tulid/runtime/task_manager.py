@@ -17,6 +17,7 @@ from open_tulid.domain import (
 )
 
 from .events import build_event, new_ulid
+from .context import load_parent_tasks
 from .execution_contracts import (
     compile_standard_execution_contract,
     compile_task_execution_contract,
@@ -245,6 +246,7 @@ class TaskManager:
                 repo_root=self.repo_root,
                 task=task,
                 transition=transition,
+                parent_tasks=load_parent_tasks(self.adapter, task),
             )
             if not compiled.accepted or compiled.contract is None:
                 return CommandResult(accepted=False, errors=compiled.errors)

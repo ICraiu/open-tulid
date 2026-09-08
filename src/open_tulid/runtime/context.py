@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from open_tulid.domain import DomainError, Task
+from open_tulid.domain import DomainError, Task, TransitionDefinition
 
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#/\\]+(?:/[^\]|#\\]+)*)\]\]")
@@ -150,7 +150,7 @@ class LinkedContextResolver:
 
         if errors:
             return ContextPacketResult(errors=tuple(errors))
-        text = "\n\n".join(_render_context_document(doc) for doc in docs)
+        text = "\n\n".join(render_context_document(doc) for doc in docs)
         return ContextPacketResult(packet=ContextPacket(
             documents=tuple(docs),
             text=text,
@@ -246,6 +246,15 @@ def _active_artifact_links(links: tuple[str, ...]) -> tuple[str, ...]:
     )
 
 
+def render_context_document(document: ContextDocument) -> str:
+    """Render one resolved context document with its role label and policy.
+
+    Shared by the legacy render path and the frozen contract path so both
+    routes describe the same canonical answer precedence and reference policy.
+    """
+    return _render_context_document(document)
+
+
 def _render_context_document(document: ContextDocument) -> str:
     if document.is_canonical_question_round_answers:
         label = "Canonical QuestionRound Answers" if document.is_current_question_round_answers else "Canonical QuestionRound Answer History"
@@ -287,6 +296,64 @@ def _render_context_document(document: ContextDocument) -> str:
         f"SHA256: {document.sha256}\n\n"
         f"{document.content.strip()}"
     )
+
+
+def load_parent_tasks(adapter, task: Task) -> tuple[Task, ...]:
+    """Load the task's ancestor lineage, original idea first.
+
+    Shared by the legacy render path and the frozen contract path so both
+    resolve the same parent lineage and canonical answer history at job creation.
+    """
+    parents: list[Task] = []
+    seen = {task.id}
+    parent_id = task.parent_id
+    while parent_id and parent_id not in seen and len(parents) < 64:
+        seen.add(parent_id)
+        loaded = adapter.read_task(parent_id)
+        if not loaded.accepted or loaded.task is None:
+            break
+        parent = loaded.task
+        parents.append(parent)
+        parent_id = parent.parent_id
+    return tuple(reversed(parents))
+
+
+def task_for_context(task: Task, transition: TransitionDefinition) -> Task:
+    """Exclude artifacts the transition itself is about to require or derive.
+
+    A worker must produce the required artifact, not read the transition's own
+    deliverable as already-settled reference context. Shared by both prompt routes.
+    """
+    excluded_artifact_types = set(transition.requires.artifacts)
+    if transition.derives is not None and transition.derives.task_type != task.task_type:
+        excluded_artifact_types.add(transition.derives.artifact_type)
+    artifact_links = tuple(
+        link for link in task.artifact_links
+        if _artifact_type_from_link(link) not in excluded_artifact_types
+    )
+    return Task(
+        id=task.id,
+        title=task.title,
+        path=task.path,
+        current_state=task.current_state,
+        task_type=task.task_type,
+        dependencies=task.dependencies,
+        artifact_links=artifact_links,
+        parent_id=task.parent_id,
+        metadata=task.metadata,
+        body=task.body,
+    )
+
+
+def _artifact_type_from_link(link: str) -> str | None:
+    parts = Path(link).parts
+    try:
+        index = parts.index("artifacts")
+    except ValueError:
+        return None
+    if index + 2 >= len(parts):
+        return None
+    return parts[index + 2]
 
 
 def sanitize_task_body_for_runtime(text: str) -> str:

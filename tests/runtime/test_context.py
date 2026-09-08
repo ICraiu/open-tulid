@@ -2,8 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from open_tulid.domain import Task
-from open_tulid.runtime.context import LinkedContextResolver
+from open_tulid.domain import (
+    DerivesDefinition,
+    RequirementDefinition,
+    Task,
+    TransitionDefinition,
+)
+from open_tulid.runtime.context import (
+    LinkedContextResolver,
+    load_parent_tasks,
+    task_for_context,
+)
 
 
 def _task(*, body: str = "", artifact_links: tuple[str, ...] = (), task_id: str = "01J00000000000000000000001") -> Task:
@@ -205,3 +214,94 @@ def test_linked_context_includes_only_latest_generated_contract_version(tmp_path
     assert [document.ref for document in result.packet.documents] == [current_ref]
     assert "Current intent" in result.packet.text
     assert "Old intent" not in result.packet.text
+
+
+class _Adapter:
+    def __init__(self, tasks: dict[str, Task]):
+        self._tasks = tasks
+
+    def read_task(self, task_id):
+        from open_tulid.adapters.base import ReadTaskResult
+        from open_tulid.domain import DomainError
+
+        task = self._tasks.get(task_id)
+        if task is None:
+            return ReadTaskResult(errors=(DomainError("task.not_found", "missing"),))
+        return ReadTaskResult(task=task)
+
+
+def test_load_parent_tasks_stops_cleanly_at_a_missing_ancestor():
+    root_id = "01J00000000000000000000000001"
+    idea = Task(id=root_id, title="Idea", path="tasks/idea.md", current_state="Done", body="Original idea.")
+    round_parent = Task(
+        id="01J00000000000000000000000002",
+        title="Clarify",
+        path="tasks/clarify.md",
+        current_state="Done",
+        parent_id=root_id,
+        body="A question round.",
+    )
+    child = Task(
+        id="01J00000000000000000000000003",
+        title="Implement",
+        path="tasks/implement.md",
+        current_state="Todo",
+        parent_id=round_parent.id,
+        body="Implement it.",
+    )
+    # The root idea is absent, so the walk returns the resolved portion only.
+    adapter = _Adapter({round_parent.id: round_parent})
+    parents = load_parent_tasks(adapter, child)
+    assert [task.id for task in parents] == [round_parent.id]
+
+
+def test_load_parent_tasks_presents_original_idea_first_then_rounds():
+    root_id = "01J00000000000000000000000001"
+    idea = Task(id=root_id, title="Idea", path="tasks/idea.md", current_state="Done", body="Original idea.")
+    round_parent = Task(
+        id="01J00000000000000000000000002",
+        title="Clarify",
+        path="tasks/clarify.md",
+        current_state="Done",
+        parent_id=root_id,
+        body="A question round.",
+    )
+    child = Task(
+        id="01J00000000000000000000000003",
+        title="Implement",
+        path="tasks/implement.md",
+        current_state="Todo",
+        parent_id=round_parent.id,
+        body="Implement it.",
+    )
+    adapter = _Adapter({root_id: idea, round_parent.id: round_parent})
+    parents = load_parent_tasks(adapter, child)
+    assert [task.id for task in parents] == [root_id, round_parent.id]
+
+
+def test_task_for_context_excludes_artifacts_the_transition_requires_or_derives():
+    required_link = "artifacts/task-1/ImplementationTaskFile/deliverable.md"
+    derived_link = "artifacts/task-1/PlanningTaskFile/plan.md"
+    task = _task(artifact_links=(required_link, derived_link, "docs/spec.md"))
+    transition = TransitionDefinition(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        to_state="SelfReview",
+        worker="qwen",
+        requires=RequirementDefinition(
+            changed_files_required=True,
+            artifacts=("ImplementationTaskFile",),
+        ),
+        derives=DerivesDefinition(
+            task_type="PlanningTask",
+            state="Todo",
+            artifact_type="PlanningTaskFile",
+            required=True,
+        ),
+        transaction=None,
+    )
+    filtered = task_for_context(task, transition)
+    assert required_link not in filtered.artifact_links
+    assert derived_link not in filtered.artifact_links
+    assert "docs/spec.md" in filtered.artifact_links

@@ -71,6 +71,7 @@ from open_tulid.runtime import (
     TransactionJournalStore,
     human_event_type,
     new_ulid,
+    load_parent_tasks,
 )
 from open_tulid.runtime.task_contracts import (
     find_implementation_contract_path,
@@ -1312,6 +1313,7 @@ def _render_prompt_preview(
             repo_root=_project_config(config, project).repo_root,
             task=task,
             transition=transition,
+            parent_tasks=load_parent_tasks(adapter, task),
         )
         if not compiled.accepted or compiled.contract is None:
             _print_domain_errors(compiled.errors)

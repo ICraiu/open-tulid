@@ -39,7 +39,12 @@ from open_tulid.runtime.prompts import (
     compile_execution_prompt,
     compiled_prompt_from_metadata,
 )
-from open_tulid.runtime.context import LinkedContextResolver, sanitize_task_body_for_runtime
+from open_tulid.runtime.context import (
+    LinkedContextResolver,
+    load_parent_tasks,
+    sanitize_task_body_for_runtime,
+    task_for_context,
+)
 from open_tulid.runtime.resources import FileResourceLeaseStore
 from open_tulid.runtime.model_proxy import FileModelProxySessionStore, ModelProxySessionStore
 from open_tulid.runtime.failures import ExecutionFailure, classify_worker_failure
@@ -151,8 +156,8 @@ def render_execution_prompt(
     context_packet = None
     project_root = _adapter_project_root(adapter)
     if project_root is not None:
-        parent_tasks = _load_parent_tasks(adapter, task)
-        task_for_context = _task_for_prompt_context(task, transition)
+        parent_tasks = load_parent_tasks(adapter, task)
+        context_task = task_for_context(task, transition)
         prompt_result = AgentInstructionResolver(project_root).build_prompt_packet(
             worker=worker,
             task_type=task_type,
@@ -167,7 +172,7 @@ def render_execution_prompt(
         if prompt_packet is not None:
             prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
         context_result = LinkedContextResolver(project_root).build_context_packet(
-            task_for_context,
+            context_task,
             parent_tasks=parent_tasks,
         )
         if not context_result.accepted:
@@ -1994,22 +1999,6 @@ class _StandardRuntimeDiscovery:
         self.opencode_config_home = opencode_config_home
 
 
-def _load_parent_tasks(adapter: StorageAdapter, task: Task) -> tuple[Task, ...]:
-    parents: list[Task] = []
-    seen = {task.id}
-    parent_id = task.parent_id
-    while parent_id and parent_id not in seen and len(parents) < 64:
-        seen.add(parent_id)
-        loaded = adapter.read_task(parent_id)
-        if not loaded.accepted or loaded.task is None:
-            break
-        parent = loaded.task
-        parents.append(parent)
-        parent_id = parent.parent_id
-    # Present the original idea first, followed by each question/answer round.
-    return tuple(reversed(parents))
-
-
 def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> str:
     if not parent_tasks:
         return prompt_text
@@ -2026,39 +2015,6 @@ def _append_parent_tasks(prompt_text: str, parent_tasks: tuple[Task, ...]) -> st
             ))
         )
     return f"{prompt_text}\n\n" + "\n\n".join(sections)
-
-
-def _task_for_prompt_context(task: Task, transition: TransitionDefinition) -> Task:
-    excluded_artifact_types = set(transition.requires.artifacts)
-    if transition.derives is not None and transition.derives.task_type != task.task_type:
-        excluded_artifact_types.add(transition.derives.artifact_type)
-    artifact_links = tuple(
-        link for link in task.artifact_links
-        if _artifact_type_from_link(link) not in excluded_artifact_types
-    )
-    return Task(
-        id=task.id,
-        title=task.title,
-        path=task.path,
-        current_state=task.current_state,
-        task_type=task.task_type,
-        dependencies=task.dependencies,
-        artifact_links=artifact_links,
-        parent_id=task.parent_id,
-        metadata=task.metadata,
-        body=task.body,
-    )
-
-
-def _artifact_type_from_link(link: str) -> str | None:
-    parts = Path(link).parts
-    try:
-        index = parts.index("artifacts")
-    except ValueError:
-        return None
-    if index + 2 >= len(parts):
-        return None
-    return parts[index + 2]
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

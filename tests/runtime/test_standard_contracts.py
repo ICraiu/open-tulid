@@ -9,6 +9,7 @@ from open_tulid.runtime.executor import (
     _project_standard_runtime,
     _write_opencode_model_config_if_needed,
 )
+from open_tulid.runtime.prompts import compile_execution_prompt
 from open_tulid.runtime.standard_contracts import (
     STANDARD_CONTRACT_FILENAME,
     load_standard_contract,
@@ -514,3 +515,174 @@ retry:
 
     assert report.passed is True
     assert not any("contract" in error.message for error in report.errors)
+
+
+def _implementation_task(*, spec_relative: str | None = None, body: str = "Add a deterministic health endpoint."):
+    return Task(
+        id="task-impl",
+        title="Add health",
+        path="tasks/task-impl.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body=body,
+        artifact_links=(spec_relative, ) if spec_relative else (),
+    )
+
+
+def test_global_contract_freezes_linked_specification_into_context(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    spec = project_root / "docs" / "specification.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(
+        "# Specification\n\nThe required enum is `HealthStatus`: `ok`, `degraded`.\n",
+        encoding="utf-8",
+    )
+    task = _implementation_task(spec_relative="docs/specification.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    assert compiled.contract is not None
+    assert compiled.contract.context_excerpts, "global contract must not drop the specification"
+    assert "HealthStatus" in compiled.contract.context_excerpts[0].text
+    assert compiled.contract.context_excerpts[0].sha256
+
+    # The resolved context is part of the frozen prompt, not a mutable vault ref.
+    compiled_prompt = compile_execution_prompt(compiled.contract)
+    assert "HealthStatus" in compiled_prompt.text
+    assert "docs/specification.md" in compiled_prompt.text
+
+
+def test_global_contract_freezes_canonical_answer_history_from_parent_lineage(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    answers = project_root / "artifacts" / "task-round" / "QuestionRoundFile" / "answers.md"
+    answers.parent.mkdir(parents=True)
+    answers.write_text(
+        "**Answer:**\nUse the `ok` status for a healthy dependency.\n",
+        encoding="utf-8",
+    )
+    parent_round = Task(
+        id="task-round",
+        title="Clarify status meanings",
+        path="tasks/task-round.md",
+        current_state="Done",
+        task_type="QuestionRound",
+        body="How should dependent service status be modeled?",
+        artifact_links=(
+            "artifacts/task-round/QuestionRoundFile/answers.md",
+        ),
+    )
+    task = _implementation_task(body="Implement status using the settled answer.")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+        parent_tasks=(parent_round,),
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    assert compiled.contract is not None
+    excerpts = compiled.contract.context_excerpts
+    assert any("Canonical QuestionRound" in excerpt.heading for excerpt in excerpts)
+    answer_excerpt = next(excerpt for excerpt in excerpts if excerpt.heading.startswith("Canonical"))
+    assert "`ok` status" in answer_excerpt.text
+    assert "Later explicit answers override earlier conflicting answers." in answer_excerpt.text
+
+    # Silence an unused-variable guard in older linters; the hash still proves
+    # the excerpt is frozen content, not a live vault reference.
+    assert answer_excerpt.sha256
+
+
+def test_global_contract_passes_parent_and_required_artifact_to_resolver(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    # A required artifact the transition is about to produce must be excluded
+    # from context so the worker authors it instead of reading it as settled.
+    required = project_root / "artifacts" / "task-impl" / "ImplementationTaskFile" / "output.md"
+    required.parent.mkdir(parents=True)
+    required.write_text("# Already-produced deliverable\n", encoding="utf-8")
+    task = Task(
+        id="task-impl",
+        title="Add health",
+        path="tasks/task-impl.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Author the deliverable.",
+        artifact_links=(
+            "artifacts/task-impl/ImplementationTaskFile/output.md",
+        ),
+    )
+    transition = TransitionDefinition(
+        id="ImplementTask",
+        task_type="ImplementationTask",
+        from_state="Todo",
+        to_state="SelfReview",
+        worker="qwen",
+        requires=RequirementDefinition(
+            changed_files_required=True,
+            artifacts=("ImplementationTaskFile",),
+        ),
+        transaction=None,
+    )
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=transition,
+    )
+    assert compiled.accepted is True
+    assert compiled.contract is not None
+    assert all("output.md" not in excerpt.text for excerpt in compiled.contract.context_excerpts)
+
+
+def test_global_contract_rejects_missing_required_linked_context_before_admission(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    task = _implementation_task(spec_relative="docs/missing-specification.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is False
+    assert any(error.code == "context.link_not_found" for error in compiled.errors)
+
+
+def test_global_contract_clips_oversized_resolved_context_without_dropping_it(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    spec = project_root / "docs" / "big-spec.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text(
+        "# Specification\n\n" + ("Dependency rule content. " * 400) + "\n",
+        encoding="utf-8",
+    )
+    task = _implementation_task(spec_relative="docs/big-spec.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    # Job creation still succeeds and the reference is preserved, marked clipped.
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    assert compiled.contract is not None
+    assert compiled.contract.context_excerpts
+    assert "clipped at resolution budget" in compiled.contract.context_excerpts[0].text
+    assert "Dependency rule content" in compiled.contract.context_excerpts[0].text

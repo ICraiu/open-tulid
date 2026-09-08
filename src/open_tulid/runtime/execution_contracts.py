@@ -39,6 +39,11 @@ from .standard_contracts import (
     StandardContract,
     load_standard_contract,
 )
+from .context import (
+    LinkedContextResolver,
+    render_context_document,
+    task_for_context,
+)
 from .task_contracts import (
     ChangeSurface,
     CheckExpectation,
@@ -128,6 +133,7 @@ def compile_standard_execution_contract(
     repo_root: Path | None,
     task: Task,
     transition: TransitionDefinition,
+    parent_tasks: tuple[Task, ...] = (),
 ) -> ExecutionContractResult:
     """Compile an execution contract from the project's single global command
     contract (``contract.yaml``).
@@ -135,6 +141,11 @@ def compile_standard_execution_contract(
     This is the live implementation/self-review path. The global contract is the
     only source of verification commands; there is no per-task LLM-authored
     ImplementationContract and no file allowlist.
+
+    The task's linked context — its specification/answer lineage and relevant
+    linked references — is resolved here at job creation and frozen into the
+    contract, so the assigned worker never rebuilds planning decisions from a
+    mutable vault after scheduling.
     """
     standard = load_standard_contract(project_root)
     if not standard.accepted or standard.contract is None:
@@ -161,6 +172,14 @@ def compile_standard_execution_contract(
             key=lambda check: check.id,
         )
     )
+    context_excerpts, context_errors = _freeze_linked_context(
+        project_root,
+        task,
+        transition,
+        parent_tasks=parent_tasks,
+    )
+    if context_errors:
+        return ExecutionContractResult(errors=context_errors)
     draft = _global_contract_draft(task, standard_contract)
     provisional = ExecutionContract(
         source_task=task,
@@ -171,7 +190,7 @@ def compile_standard_execution_contract(
         repository_facts=repository.snapshot.facts,
         baseline_manifest=repository.snapshot.baseline,
         resolved_checks=checks,
-        context_excerpts=(),
+        context_excerpts=context_excerpts,
         sha256="",
     )
     contract_hash = canonical_sha256(_execution_contract_body(provisional))
@@ -508,6 +527,80 @@ def _focused_check(check: ContractCheck) -> ResolvedCheck:
 
 CONTEXT_EXCERPT_CHARACTER_LIMIT = 1_200
 CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT = 2_000
+
+
+def _freeze_linked_context(
+    project_root: Path,
+    task: Task,
+    transition: TransitionDefinition,
+    *,
+    parent_tasks: tuple[Task, ...] = (),
+) -> tuple[tuple[FrozenContextExcerpt, ...], tuple[DomainError, ...]]:
+    """Resolve and freeze the task's linked reference context at job creation.
+
+    Uses the same resolver and role rendering as the legacy render route so both
+    paths consume one shared resolution output: the source idea/specification,
+    its canonical answer lineage, and relevant linked references. Required links,
+    answer conflicts, and containment are verified before a worker is admitted.
+
+    Oversized references are clipped with an explicit marker rather than dropped
+    silently; exact budget/truncation semantics are refined in a later step.
+    """
+    resolver = LinkedContextResolver(project_root)
+    result = resolver.build_context_packet(
+        task_for_context(task, transition),
+        parent_tasks=parent_tasks,
+    )
+    if not result.accepted:
+        return (), result.errors
+    documents = result.packet.documents
+    frozen: list[FrozenContextExcerpt] = []
+    total_characters = 0
+    for document in documents:
+        text = render_context_document(document)
+        if len(text) > CONTEXT_EXCERPT_CHARACTER_LIMIT:
+            text = _clip_context_document(text, CONTEXT_EXCERPT_CHARACTER_LIMIT)
+        remaining = CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT - total_characters
+        if len(text) > remaining:
+            text = _clip_context_document(text, max(0, remaining))
+            if not text:
+                break
+        total_characters += len(text)
+        frozen.append(FrozenContextExcerpt(
+            artifact=document.ref,
+            heading=_context_role_heading(document),
+            reason=_context_role_reason(document),
+            text=text,
+            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        ))
+    return tuple(frozen), ()
+
+
+def _clip_context_document(text: str, limit: int) -> str:
+    marker = "\n[reference clipped at resolution budget; see the source file in the workspace]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return text[: limit - len(marker)].rstrip() + marker
+
+
+def _context_role_heading(document) -> str:
+    if document.is_canonical_question_round_answers:
+        return (
+            "Canonical QuestionRound Answers"
+            if document.is_current_question_round_answers
+            else "Canonical QuestionRound Answer History"
+        )
+    if document.is_execution_contract:
+        return "Generated Execution Contract"
+    return "Linked Reference Context"
+
+
+def _context_role_reason(document) -> str:
+    if document.is_canonical_question_round_answers:
+        return "Settled authoritative answers the task must not re-ask or contradict."
+    if document.is_execution_contract:
+        return "Boundary and interface reference the task must satisfy."
+    return "Specific linked reference material applicable to this task."
 
 
 def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple, tuple[DomainError, ...]]:
