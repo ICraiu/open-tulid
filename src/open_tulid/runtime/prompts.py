@@ -42,6 +42,16 @@ _READING_PATH_RE = re.compile(r"\.open-tulid/(context/[0-9a-f]{12}\.md)")
 # block is a forbidden task-local command block that must not be emitted.
 _SHELL_FENCE_RE = re.compile(r"```(?:sh|bash)\s*\n", re.IGNORECASE)
 
+# Preview renders through the same resolver/compiler as scheduling but under a
+# synthetic job identity and without mutating scheduler state. Its substantive
+# sections must match a real scheduled packet byte-for-byte from identical
+# inputs. The only literal ephemeral field that still varies between a preview
+# and a scheduled packet is the legacy ``Job: <id>`` header; the completion
+# endpoint and token are already emitted as ``$OPEN_TULID_COMPLETION_ENDPOINT``
+# and ``$OPEN_TULID_COMPLETION_TOKEN`` placeholders in every route.
+PREVIEW_JOB_ID = "PROMPT_PREVIEW"
+_EPHEMERAL_JOB_HEADER_RE = re.compile(r"(?m)^Job:\s+\S+$")
+
 
 class PromptBudgetError(ValueError):
     """Raised when the full task or a mandatory instruction block cannot fit.
@@ -170,6 +180,24 @@ def find_review_evidence(
         verification_report=dict(source.metadata["verification_report"]),
         repair_history=history,
     )
+
+
+def normalize_ephemeral_completion_fields(
+    packet: str,
+    *,
+    job_id: str = PREVIEW_JOB_ID,
+) -> str:
+    """Canonicalize the only ephemeral fields that differ preview vs. a packet.
+
+    A preview compiles the same frozen inputs as a scheduled job with a
+    synthetic job identity and no scheduler mutation, so comparing the two
+    requires normalizing only the fields that legitimately vary per instance.
+    The completion endpoint and token are already emitted as env placeholders,
+    so the single remaining literal is the legacy ``Job: <id>`` header. All
+    other sections must be byte-for-byte identical or the packet is not a
+    faithful preview of scheduling.
+    """
+    return _EPHEMERAL_JOB_HEADER_RE.sub(f"Job: {job_id}", packet)
 
 
 def lint_compiled_prompt(

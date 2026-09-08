@@ -983,6 +983,118 @@ def test_prompts_render_uses_scheduler_transition_and_prints_raw_packet(tmp_path
     assert seen["completion_endpoint"] == "http://preview.invalid/jobs/PROMPT_PREVIEW/complete"
 
 
+def test_prompts_render_compare_job_matches_scheduled_packet_without_mutating_scheduler(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    task = SimpleNamespace(
+        id="1", current_state="Todo", task_type="ImplementationTask",
+    )
+    transition = SimpleNamespace(
+        id="ImplementTask", task_type="ImplementationTask", from_state="Todo", worker="qwen_27b",
+    )
+    workflow = SimpleNamespace(transitions={"ImplementTask": transition})
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=task_id == "1", task=task if task_id == "1" else None, errors=(),
+    ))
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path", lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter", lambda request: adapter,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.select_scheduler_transition", lambda selected_task, selected_workflow: transition,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_config",
+        lambda: SimpleNamespace(config_dir=tmp_path / CONFIG_DIRNAME),
+    )
+    packet = "# exact prompt\n\nTask packet."
+    monkeypatch.setattr(
+        "open_tulid.cli.main.render_execution_prompt",
+        lambda **kwargs: PromptRenderResult(text=packet),
+    )
+    store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="1",
+        transition_id="ImplementTask",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "workspace"),
+        status="pending",
+        metadata={"prompt_packet": packet},
+    )).accepted is True
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(
+            app,
+            ["prompts", "render", "Agent", "1", "--compare-job", "01J00000000000000000000JOB"],
+        )
+
+    assert result.exit_code == 0
+    assert "Preview matches scheduled job" in result.output
+    assert "prompt preview vs job" in result.output.casefold()
+    # Preview never schedules an extra job.
+    assert [job.job_id for job in store.list().jobs] == ["01J00000000000000000000JOB"]
+
+
+def test_prompts_render_compare_job_reports_mismatch(tmp_path: Path, monkeypatch):
+    _write_config(tmp_path)
+    task = SimpleNamespace(id="1", current_state="Todo", task_type="ImplementationTask")
+    transition = SimpleNamespace(
+        id="ImplementTask", task_type="ImplementationTask", from_state="Todo", worker="qwen_27b",
+    )
+    workflow = SimpleNamespace(transitions={"ImplementTask": transition})
+    adapter = SimpleNamespace(read_task=lambda task_id: SimpleNamespace(
+        accepted=task_id == "1", task=task if task_id == "1" else None, errors=(),
+    ))
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_context",
+        lambda project: (SimpleNamespace(tracker_type="obsidian"), workflow),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._project_path", lambda config, project: tmp_path / "Agent",
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.build_storage_adapter", lambda request: adapter,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.select_scheduler_transition", lambda selected_task, selected_workflow: transition,
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main._load_cli_config",
+        lambda: SimpleNamespace(config_dir=tmp_path / CONFIG_DIRNAME),
+    )
+    monkeypatch.setattr(
+        "open_tulid.cli.main.render_execution_prompt",
+        lambda **kwargs: PromptRenderResult(text="# preview packet"),
+    )
+    store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="1",
+        transition_id="ImplementTask",
+        worker_id="qwen_27b",
+        workspace_path=str(tmp_path / "workspace"),
+        status="pending",
+        metadata={"prompt_packet": "# scheduled packet"},
+    )).accepted is True
+
+    with _with_cwd(tmp_path):
+        result = runner.invoke(
+            app,
+            ["prompts", "render", "Agent", "1", "--compare-job", "01J00000000000000000000JOB"],
+        )
+
+    assert result.exit_code == 1
+    assert "Preview does not match scheduled job" in result.output
+
+
 def test_prompts_show_job_reads_immutable_packet_and_explains_manifest(tmp_path: Path):
     _write_config(tmp_path)
     text = "## Completion Submission\n\ncurl -sS -X POST"

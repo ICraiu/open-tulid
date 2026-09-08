@@ -30,11 +30,13 @@ from open_tulid.runtime import (
     FileResourceLeaseStore,
     JobExecutor,
     JsonlEventStore,
+    PREVIEW_JOB_ID,
     Scheduler,
     TransactionJournalStore,
     attempt_id_for,
     attempt_record_to_dict,
     recover_job_creation_transactions,
+    render_execution_prompt,
     task_semantic_revision,
 )
 from open_tulid.runtime.observability import WorkerObservability
@@ -45,7 +47,7 @@ from open_tulid.runtime.execution_contracts import (
     execution_contract_to_dict,
     load_job_execution_contract,
 )
-from open_tulid.runtime.prompts import compile_execution_prompt
+from open_tulid.runtime.prompts import compile_execution_prompt, find_review_evidence
 from open_tulid.runtime.task_contracts import (
     parse_implementation_contract,
     task_source_intent_sha256,
@@ -577,6 +579,167 @@ def test_scheduler_compiles_self_review_from_prior_verification_evidence(tmp_pat
     assert result.job.metadata["prompt_manifest"]["packet_type"] == "self_review"
     assert "## Prior Implementation Evidence" in result.job.metadata["prompt_packet"]
     assert '"edited":["app.py"]' in result.job.metadata["prompt_packet"]
+
+
+def test_preview_matches_scheduled_implementation_packet_from_identical_inputs(tmp_path: Path):
+    """Preview must compile the same resolver/compiler as scheduling.
+
+    Preview uses a synthetic job identity and no scheduler mutation, so from
+    identical inputs its substantive packet and bundle identity must equal the
+    frozen scheduled packet exactly (the compiled route emits no ephemeral
+    completion fields).
+    """
+    project_root = tmp_path / "project"
+    _write_global_contract(project_root)
+    task = Task(
+        id=TASK_ID,
+        title="Add healthz endpoint",
+        path="tasks/request.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    workflow = _global_contract_workflow()
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=project_root,
+    )
+    scheduled = scheduler.schedule_one("Agent")
+    assert scheduled.accepted is True
+    assert scheduled.scheduled is True
+    assert scheduled.job is not None
+    frozen = scheduled.job
+    assert frozen.metadata["prompt_manifest"]["packet_type"] == "implementation"
+    frozen_packet = frozen.metadata["prompt_packet"]
+    frozen_contract_sha = frozen.metadata["execution_contract_sha256"]
+
+    compiled_contract = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=None,
+        task=task,
+        transition=workflow.transitions["implement"],
+    )
+    assert compiled_contract.contract is not None
+    contract = compiled_contract.contract
+    preview = render_execution_prompt(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        task=contract.source_task,
+        transition=contract.transition,
+        worker_id=contract.transition.worker,
+        job_id=PREVIEW_JOB_ID,
+        completion_endpoint=f"http://preview.invalid/jobs/{PREVIEW_JOB_ID}/complete",
+        execution_contract=contract,
+    )
+    assert preview.accepted is True
+    assert preview.compiled_prompt is not None
+    assert preview.execution_contract_sha256 == frozen_contract_sha
+    assert preview.text == frozen_packet
+    assert preview.compiled_prompt.manifest.packet_sha256 == frozen.metadata["prompt_manifest"]["packet_sha256"]
+    assert preview.text.count("curl -sS -X POST") == 1
+    # Preview must not mutate scheduler state: only the one scheduled job exists.
+    assert [job.job_id for job in store.list().jobs] == [frozen.job_id]
+
+
+def test_preview_matches_scheduled_review_packet_from_identical_evidence(tmp_path: Path):
+    project_root = tmp_path / "project"
+    _write_global_contract(project_root)
+    task = Task(
+        id=TASK_ID,
+        title="Free-form implementation request",
+        path="tasks/request.md",
+        current_state="SelfReview",
+        task_type="ImplementationTask",
+        body="Please add healthz in whatever structure is appropriate.",
+    )
+    workflow = _global_contract_workflow(review=True)
+    prior_contract = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=None,
+        task=task,
+        transition=workflow.transitions["implement"],
+    )
+    assert prior_contract.contract is not None
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J0000000000000000000IMPL",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "implementation-workspace"),
+        status="accepted",
+        metadata={
+            "execution_contract": execution_contract_to_dict(prior_contract.contract),
+            "execution_contract_sha256": prior_contract.contract.sha256,
+            "verification_report": {
+                "schema": "tulid.verification/v1",
+                "baseline_sha256": prior_contract.contract.baseline_manifest.sha256,
+                "changes": {
+                    "added": [],
+                    "edited": ["app.py"],
+                    "removed": [],
+                    "renamed": [],
+                    "changed_lines": 2,
+                },
+                "checks": [{"id": "health", "status": "passed", "exit_code": 0}],
+            },
+        },
+    )).accepted is True
+
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=project_root,
+    )
+    scheduled = scheduler.schedule_one("Agent")
+    assert scheduled.accepted is True
+    assert scheduled.scheduled is True
+    assert scheduled.job is not None
+    frozen = scheduled.job
+    assert frozen.metadata["prompt_manifest"]["packet_type"] == "self_review"
+    frozen_packet = frozen.metadata["prompt_packet"]
+    frozen_contract_sha = frozen.metadata["execution_contract_sha256"]
+
+    review_contract = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=None,
+        task=task,
+        transition=workflow.transitions["review"],
+    )
+    assert review_contract.contract is not None
+    evidence = find_review_evidence(
+        store.list().jobs,
+        project_id="Agent",
+        task_id=TASK_ID,
+        review_transition=workflow.transitions["review"],
+    )
+    assert evidence is not None
+    contract = review_contract.contract
+    preview = render_execution_prompt(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(task)),
+        task=contract.source_task,
+        transition=contract.transition,
+        worker_id=contract.transition.worker,
+        job_id=PREVIEW_JOB_ID,
+        completion_endpoint=f"http://preview.invalid/jobs/{PREVIEW_JOB_ID}/complete",
+        execution_contract=contract,
+        review_evidence=evidence,
+    )
+    assert preview.accepted is True
+    assert preview.execution_contract_sha256 == frozen_contract_sha
+    assert preview.text == frozen_packet
+    assert "## Prior Implementation Evidence" in preview.text
+    assert preview.text.count("curl -sS -X POST") == 1
+    # Preview never writes a new job.
+    assert [job.job_id for job in store.list().jobs] == ["01J0000000000000000000IMPL", frozen.job_id]
 
 
 def test_scheduler_rejects_scheduling_when_global_contract_is_missing(tmp_path: Path):

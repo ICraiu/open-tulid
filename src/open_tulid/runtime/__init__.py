@@ -91,7 +91,9 @@ from .prompts import (
     find_review_evidence,
     is_review_transition,
     lint_compiled_prompt,
+    normalize_ephemeral_completion_fields,
 )
+from .prompts import PREVIEW_JOB_ID
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairPlan, build_repair_packet, plan_repair
 from .failures import ExecutionFailure, FailureCategory, classify_worker_failure
 from .scheduler import (
@@ -251,6 +253,8 @@ __all__ = [
     "find_review_evidence",
     "is_review_transition",
     "lint_compiled_prompt",
+    "normalize_ephemeral_completion_fields",
+    "PREVIEW_JOB_ID",
     "DEFAULT_MAX_REPAIR_ATTEMPTS",
     "RepairPlan",
     "build_repair_packet",

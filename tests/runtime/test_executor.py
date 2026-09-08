@@ -44,6 +44,7 @@ from open_tulid.runtime.executor import (
     _frozen_prompt_packet,
     render_execution_prompt,
 )
+from open_tulid.runtime.prompts import normalize_ephemeral_completion_fields
 from open_tulid.runtime.observability import WorkerExited, WorkerObservability
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 from socket_utils import can_bind_localhost
@@ -280,6 +281,24 @@ def test_render_execution_prompt_builds_complete_packet_without_running_job():
     assert "$OPEN_TULID_COMPLETION_ENDPOINT" in rendered.text
     assert "## Completion Submission" in rendered.text
     assert rendered.text.count("curl -sS -X POST") == 1
+
+
+def test_normalize_ephemeral_completion_fields_only_rewrites_job_header():
+    norm = normalize_ephemeral_completion_fields
+    paste = (
+        "## Task Body\n"
+        "Implement healthz.\n"
+        "## Completion Submission\n"
+        "curl -sS -X POST \"$OPEN_TULID_COMPLETION_ENDPOINT\""
+    )
+    preview = paste.replace("## Task Body", "Job: PROMPT_PREVIEW\n\n## Task Body")
+    scheduled = paste.replace("## Task Body", f"Job: 01J{40 * '0'}\n\n## Task Body")
+    assert norm(preview) == norm(scheduled)
+    assert "Job: PROMPT_PREVIEW" in norm(preview)
+    assert "01J" not in norm(scheduled)
+    # The substantive task body is not an ephemeral field and must survive.
+    different = scheduled.replace("Implement healthz.", "Implement something else.")
+    assert norm(preview) != norm(different)
 
 
 def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(

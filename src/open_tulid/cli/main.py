@@ -61,6 +61,9 @@ from open_tulid.runtime import (
     find_review_evidence,
     is_review_transition,
     lint_compiled_prompt,
+    normalize_ephemeral_completion_fields,
+    PREVIEW_JOB_ID,
+    PromptRenderResult,
     recover_job_creation_transactions,
     recover_completion_transactions,
     render_execution_prompt,
@@ -1234,9 +1237,17 @@ def render_prompt(
         ),
     ),
     job_id: str = typer.Option(
-        "PROMPT_PREVIEW",
+        PREVIEW_JOB_ID,
         "--job-id",
         help="Job id rendered into the preview prompt.",
+    ),
+    compare_job: str | None = typer.Option(
+        None,
+        "--compare-job",
+        help=(
+            "Scheduled job id whose frozen packet should equal this preview after "
+            "normalizing ephemeral completion fields. Preview never mutates scheduler state."
+        ),
     ),
 ) -> None:
     """Render the exact prompt packet for a task without scheduling or running it."""
@@ -1246,7 +1257,57 @@ def render_prompt(
         transition_id=transition_id,
         job_id=job_id,
     )
+    if compare_job is not None:
+        _compare_preview_to_scheduled(project, compare_job, rendered)
     typer.echo(rendered.text)
+
+
+def _compare_preview_to_scheduled(project: str, job_id: str, rendered: PromptRenderResult) -> None:
+    """Compare a preview to a scheduled job's frozen packet after normalization.
+
+    Preview compiles the same resolver/compiler as scheduling with a synthetic
+    job identity and no scheduler mutation. Every substantive section must match
+    the frozen scheduled packet; only ephemeral completion fields are normalized
+    during the comparison. Saved-job inspection reads the historical bundle and
+    never reconstructs it from the current vault.
+    """
+    config = _load_cli_config()
+    app_state = getattr(config, "config_dir", None) or (Path.home() / CONFIG_DIRNAME)
+    loaded = FileExecutionJobStore(app_state / "jobs" / project).get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        _print_domain_errors((loaded.error,) if loaded.error is not None else ())
+        raise typer.Exit(1)
+    scheduled_packet = loaded.job.metadata.get("prompt_packet")
+    if not isinstance(scheduled_packet, str):
+        _print_domain_errors((DomainError(
+            "prompt.compare_frozen_packet_missing",
+            f"Job {job_id!r} has no frozen prompt packet to compare against.",
+            job_id,
+        ),))
+        raise typer.Exit(1)
+    preview_norm = normalize_ephemeral_completion_fields(rendered.text)
+    scheduled_norm = normalize_ephemeral_completion_fields(scheduled_packet)
+    packet_match = preview_norm == scheduled_norm
+    scheduled_contract_sha = loaded.job.metadata.get("execution_contract_sha256")
+    contract_match = None
+    if rendered.execution_contract is not None and isinstance(scheduled_contract_sha, str):
+        contract_match = rendered.execution_contract.sha256 == scheduled_contract_sha
+    preview_sha = rendered.execution_contract_sha256 or None
+    if packet_match and contract_match is not False:
+        status = "match"
+        line = (
+            f"Preview matches scheduled job {job_id!r} after normalizing "
+            "ephemeral completion fields."
+        )
+    else:
+        status = "mismatch"
+        line = f"Preview does not match scheduled job {job_id!r}."
+    console.print(Panel(f"{line}", title=f"prompt preview vs job {job_id} [{status}]"))
+    if preview_sha and scheduled_contract_sha and isinstance(scheduled_contract_sha, str):
+        console.print(f"preview_contract_sha256: {preview_sha}")
+        console.print(f"scheduled_contract_sha256: {scheduled_contract_sha}")
+    if not packet_match or contract_match is False:
+        raise typer.Exit(1)
 
 
 def _render_prompt_preview(
@@ -1397,7 +1458,7 @@ def explain_prompt(
         project=project,
         task_id=task_id,
         transition_id=transition_id,
-        job_id="PROMPT_PREVIEW",
+        job_id=PREVIEW_JOB_ID,
     )
     if rendered.compiled_prompt is None:
         typer.echo("mode: live legacy prompt\nstructured manifest: unavailable")
@@ -1416,7 +1477,7 @@ def lint_prompt(
         project=project,
         task_id=task_id,
         transition_id=transition_id,
-        job_id="PROMPT_PREVIEW",
+        job_id=PREVIEW_JOB_ID,
     )
     if rendered.compiled_prompt is None:
         typer.echo("No structured prompt manifest is available for this legacy transition.")
