@@ -1480,6 +1480,13 @@ def _echo_prompt_explanation(compiled, *, mode: str) -> None:
         )
         typer.echo(f"   sha256: {section_sha}")
         typer.echo(f"   reason: {section.selection_reason}")
+    omissions = tuple(manifest.optional_omissions)
+    if omissions:
+        typer.echo(f"optional omissions ({len(omissions)}):")
+        for reason in omissions:
+            typer.echo(f"  - {reason}")
+    else:
+        typer.echo("optional omissions: none")
 
 
 def _prompt_transition_error(

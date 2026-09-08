@@ -1010,6 +1010,7 @@ def test_prompts_show_job_reads_immutable_packet_and_explains_manifest(tmp_path:
                 "packet_sha256": packet_sha,
                 "characters": len(text),
                 "character_budget": 6000,
+                "optional_omissions": ["Inline context excerpts were omitted to fit the prompt budget."],
                 "sections": [{
                     "id": "completion_submission",
                     "heading": "Completion Submission",
@@ -1040,6 +1041,8 @@ def test_prompts_show_job_reads_immutable_packet_and_explains_manifest(tmp_path:
     assert "mode: historical job 01J00000000000000000000JOB" in explained.output
     assert "packet_type: implementation" in explained.output
     assert "runtime:completion_api" in explained.output
+    assert "optional omissions (1):" in explained.output
+    assert "Inline context excerpts were omitted to fit the prompt budget." in explained.output
 
 
 def test_prompts_render_allows_explicit_historical_transition_for_done_task(tmp_path: Path, monkeypatch):

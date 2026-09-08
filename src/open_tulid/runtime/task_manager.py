@@ -24,6 +24,7 @@ from .execution_contracts import (
     execution_contract_to_dict,
 )
 from .prompts import (
+    PromptBudgetError,
     compile_execution_prompt,
     find_review_evidence,
     is_review_transition,
@@ -300,6 +301,12 @@ class TaskManager:
                     frozen_contract,
                     review_evidence=review_evidence,
                 )
+            except PromptBudgetError as exc:
+                return CommandResult(accepted=False, errors=(_error(
+                    exc.code,
+                    str(exc),
+                    task.id,
+                ),))
             except ValueError as exc:
                 return CommandResult(accepted=False, errors=(_error(
                     "prompt.compile_failed",

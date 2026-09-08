@@ -35,6 +35,7 @@ from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
 from open_tulid.runtime.prompts import (
     CompiledPrompt,
+    PromptBudgetError,
     ReviewEvidence,
     compile_execution_prompt,
     compiled_prompt_from_metadata,
@@ -127,6 +128,12 @@ def render_execution_prompt(
                 execution_contract,
                 review_evidence=review_evidence,
             )
+        except PromptBudgetError as exc:
+            return PromptRenderResult(errors=(_error(
+                exc.code,
+                str(exc),
+                task.id,
+            ),))
         except ValueError as exc:
             return PromptRenderResult(errors=(_error(
                 "prompt.compile_failed",

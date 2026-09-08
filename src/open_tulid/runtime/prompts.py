@@ -18,18 +18,41 @@ from .execution_contracts import (
 from .prompt_versions import PROMPT_COMPILER_VERSION
 from .verifier import VERIFICATION_REPORT_SCHEMA
 
+# Inline prompt capacity is bounded in characters; workspace reference capacity
+# is bounded only by the frozen byte/bundle limits and is separate. Characters
+# are never labelled as tokens: an exact token count is not claimed unless a
+# provider advertises a usable token estimator.
 TOTAL_BUDGET = 6000
 SECTION_BUDGETS = {
     "repository_facts": 300,
     "prior_implementation_evidence": 2000,
     "completion_submission": 900,
 }
-# Only background context is trimmed. The assigned task, required reading,
-# verification commands, procedure, and completion protocol never truncate.
+# Only background context is trimmed before the mandatory sections. The
+# assigned task, verification commands, procedure, and completion protocol
+# never truncate. Required context files stay complete in the workspace bundle
+# even when only their reading instructions fit inline.
 _OPTIONAL_TRIM_ORDER = (
     "repository_facts",
 )
 _UNRESOLVED_MARKER_RE = re.compile(r"\{\{[^{}]+\}\}|<TODO>|<TBD>|\bFIXME_PROMPT\b")
+_READING_PATH_RE = re.compile(r"\.open-tulid/(context/[0-9a-f]{12}\.md)")
+
+# A fenced shell block is Tulid's single completion mechanism. Any second shell
+# block is a forbidden task-local command block that must not be emitted.
+_SHELL_FENCE_RE = re.compile(r"```(?:sh|bash)\s*\n", re.IGNORECASE)
+
+
+class PromptBudgetError(ValueError):
+    """Raised when the full task or a mandatory instruction block cannot fit.
+
+    ``code`` names the failure so callers can surface a precise, non-truncated
+    diagnostic instead of a generic compile failure.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 _COMPILER_OWNED_SOURCE_KINDS = frozenset({
     "repository_facts",
     "runtime",
@@ -58,6 +81,9 @@ class PromptManifest:
     packet_sha256: str
     characters: int
     character_budget: int
+    # Reasons for every optional context/tail truncated or dropped so the
+    # packet's serialization and preview explain what was omitted and why.
+    optional_omissions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -68,6 +94,7 @@ class PromptManifest:
             "packet_sha256": self.packet_sha256,
             "characters": self.characters,
             "character_budget": self.character_budget,
+            "optional_omissions": list(self.optional_omissions),
         }
 
 
@@ -241,6 +268,54 @@ def lint_compiled_prompt(
                 "prompt.audit_metadata_leak",
                 "Prompt model text contains frozen audit metadata.",
             ))
+        # The authoritative task body must appear exactly once and never be
+        # duplicated under another synthetic section.
+        body = contract.source_task.body.strip()
+        if body:
+            containing = [section.id for section in compiled.sections if body in section.text]
+            if len(containing) > 1:
+                errors.append(_lint_error(
+                    "prompt.duplicate_task_content",
+                    "Authoritative task body appears in more than one section: "
+                    f"{', '.join(dict.fromkeys(containing))}.",
+                    "assigned_task",
+                ))
+        # Every required source must be named in required reading, and every
+        # named reading path must resolve to a frozen workspace file.
+        reading = next(
+            (section.text for section in compiled.sections if section.id == "required_reading"),
+            "",
+        )
+        named_paths = set(_reading_context_paths(reading))
+        frozen_paths = {context_file.workspace_path for context_file in contract.context_files}
+        missing_paths = tuple(
+            context_file.workspace_path
+            for context_file in contract.context_files
+            if context_file.required and context_file.workspace_path not in named_paths
+        )
+        for path in missing_paths:
+            errors.append(_lint_error(
+                "prompt.missing_required_source",
+                f"Required reading omits frozen source file `{path}`.",
+                "required_reading",
+            ))
+        for ref in sorted(named_paths - frozen_paths):
+            errors.append(_lint_error(
+                "prompt.unresolved_reading_path",
+                f"Required reading names workspace file `{ref}` with no matching "
+                "frozen source.",
+                "required_reading",
+            ))
+        # Only the single completion shell block is permitted; any additional
+        # shell block is a forbidden task-local command block.
+        shell_blocks = len(tuple(_SHELL_FENCE_RE.finditer(compiled.text)))
+        if shell_blocks != 1:
+            errors.append(_lint_error(
+                "prompt.forbidden_command_block",
+                f"Expected exactly one shell command block (completion example); "
+                f"found {shell_blocks}.",
+                "completion_submission",
+            ))
     return tuple(errors)
 
 
@@ -304,6 +379,7 @@ def compiled_prompt_from_metadata(metadata: Mapping[str, object]) -> CompiledPro
             "character_budget",
             minimum=1,
         ),
+        optional_omissions=_manifest_omissions(manifest_raw.get("optional_omissions")),
     )
     compiled = CompiledPrompt(text=text, sections=tuple(sections), manifest=manifest)
     issues = lint_compiled_prompt(compiled)
@@ -394,11 +470,17 @@ def _assigned_task_text(contract: ExecutionContract) -> str:
     return "\n".join(lines)
 
 
-def _required_reading_text(contract: ExecutionContract) -> str:
+def _required_reading_text(
+    contract: ExecutionContract,
+    *,
+    max_chars: int | None = None,
+) -> str:
     """Name every frozen source file with its exact workspace path and purpose.
 
-    Required files are always named and stay complete in the bundle; only the
-    inline excerpt may be clipped, and a clipped excerpt points to the full file.
+    Required files are always named and stay complete in the frozen bundle; only
+    the inline excerpt is bounded by ``max_chars``. When a bounded excerpt set
+    cannot fit inline, the omitted excerpts are skipped with an explicit marker
+    and the reading instructions still point at the complete workspace files.
     """
     files = tuple(contract.context_files)
     excerpts = tuple(contract.context_excerpts)
@@ -420,17 +502,40 @@ def _required_reading_text(contract: ExecutionContract) -> str:
                 f"{role}: {context_file.reason}"
             )
         chunks.append("\n".join(listing))
-    if excerpts:
-        if files:
-            chunks.append(
-                "Relevant excerpts follow. When you need the full document, read "
-                "the matching frozen file listed above instead of relying on the "
-                "inline clip."
-            )
-        chunks.append(_excerpts_text(contract))
-    else:
+    if excerpts and files:
+        chunks.append(
+            "Relevant excerpts follow. When you need the full document, read "
+            "the matching frozen file listed above instead of relying on the "
+            "inline clip."
+        )
+    elif not excerpts:
         chunks.append("No additional context excerpts were selected for this job.")
-    return "\n\n".join(chunks)
+
+    marker = (
+        "\n\n[additional context excerpts omitted to fit the inline prompt "
+        "budget; the complete required sources remain at their workspace "
+        "files listed above]"
+    )
+
+    def _bounded() -> tuple[list[str], int]:
+        kept_parts = list(chunks)
+        dropped_count = 0
+        reserved = len(marker) if max_chars is not None else 0
+        for excerpt in excerpts:
+            block = f"### {excerpt.artifact}: {excerpt.heading}\n\n{excerpt.text}"
+            candidate = kept_parts + [block]
+            candidate_len = len("\n\n".join(candidate))
+            if max_chars is not None and candidate_len + reserved > max_chars:
+                dropped_count += 1
+                continue
+            kept_parts.append(block)
+        return kept_parts, dropped_count
+
+    parts, dropped = _bounded()
+    text = "\n\n".join(parts)
+    if dropped:
+        text = text + marker
+    return text
 
 
 def _repository_facts_text(facts: RepositoryFacts) -> str:
@@ -554,7 +659,7 @@ def _finalize(
     packet_type: str,
     sections: tuple[PromptSection, ...],
 ) -> CompiledPrompt:
-    sections = _fit_total_budget(sections)
+    sections, omissions = _fit_total_budget(sections, contract)
     rendered = _render_sections(sections)
     packet_sha = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
     manifest_sections = tuple({
@@ -579,6 +684,7 @@ def _finalize(
             packet_sha,
             len(rendered),
             TOTAL_BUDGET,
+            omissions,
         ),
     )
     lint = lint_compiled_prompt(compiled, contract=contract)
@@ -591,34 +697,92 @@ def _render_sections(sections: tuple[PromptSection, ...]) -> str:
     return "\n\n".join(f"## {section.heading}\n\n{section.text}" for section in sections)
 
 
-def _fit_total_budget(sections: tuple[PromptSection, ...]) -> tuple[PromptSection, ...]:
-    """Trim only background sections; binding scope, checks, and completion never truncate."""
+def _fit_total_budget(
+    sections: tuple[PromptSection, ...],
+    contract: ExecutionContract,
+) -> tuple[tuple[PromptSection, ...], tuple[str, ...]]:
+    """Fit the packet to the inline prompt budget without truncating mandatory work.
+
+    Optional background is trimmed first, then inline context excerpts are
+    dropped (their complete workspace files stay named) before a binding
+    overflow raises a named budget error. The assigned task, verification
+    commands, procedure, and completion protocol are never truncated.
+    """
     mutable = list(sections)
+    omissions: list[str] = []
+
+    def overflow() -> int:
+        return len(_render_sections(tuple(mutable))) - TOTAL_BUDGET
+
+    # 1. Trim optional background sections first; excerpts are higher priority.
     for section_id in _OPTIONAL_TRIM_ORDER:
-        overflow = len(_render_sections(tuple(mutable))) - TOTAL_BUDGET
-        if overflow <= 0:
+        count = overflow()
+        if count <= 0:
             break
         index = next((i for i, item in enumerate(mutable) if item.id == section_id), None)
         if index is None:
             continue
         item = mutable[index]
-        keep = max(80, len(item.text) - overflow)
+        keep = max(80, len(item.text) - count)
         if keep < len(item.text):
-            mutable[index] = PromptSection(
-                item.id,
-                item.heading,
+            mutable[index] = _revise_section(
+                item,
                 _truncate(item.text, keep),
-                item.source_kind,
-                item.source_ref,
-                item.selection_reason,
-                item.budget,
-                True,
+                truncated=True,
             )
-    if len(_render_sections(tuple(mutable))) > TOTAL_BUDGET:
-        raise ValueError(
-            "binding prompt sections exceed the total packet budget; split or refine the contract"
+            omissions.append(
+                f"Optional background section {section_id!r} was trimmed to fit "
+                "the inline prompt budget; its prerequisite seams remain named "
+                "below."
+            )
+
+    # 2. Drop inline context excerpts, never the required file listing.
+    count = overflow()
+    if count > 0:
+        index = next((i for i, item in enumerate(mutable) if item.id == "required_reading"), None)
+        if index is not None:
+            item = mutable[index]
+            target = max(1, len(item.text) - count)
+            bounded_text = _required_reading_text(contract, max_chars=target)
+            if len(bounded_text) < len(item.text):
+                mutable[index] = _revise_section(
+                    item,
+                    bounded_text,
+                    truncated=True,
+                )
+                omissions.append(
+                    "Inline context excerpts were omitted to fit the prompt "
+                    "budget; required reading file paths stay complete and the "
+                    "full sources remain in the frozen workspace bundle."
+                )
+
+    # 3. The full task and mandatory sections must fit inline on their own.
+    count = overflow()
+    if count > 0:
+        raise PromptBudgetError(
+            "prompt.budget_exceeded",
+            (
+                f"Binding prompt sections exceed the {TOTAL_BUDGET}-character inline "
+                f"budget by {count} characters even after trimming all optional "
+                "background and inline context excerpts. The full assigned task "
+                "and mandatory procedure/completion sections must fit inline; "
+                "split or refine the task before running a worker."
+            ),
         )
-    return tuple(mutable)
+    return tuple(mutable), tuple(omissions)
+
+
+def _revise_section(section: PromptSection, text: str, *, truncated: bool) -> PromptSection:
+    return PromptSection(
+        section.id,
+        section.heading,
+        text,
+        section.source_kind,
+        section.source_ref,
+        section.selection_reason,
+        section.budget,
+        truncated,
+    )
 
 
 def _contract_text(
@@ -786,6 +950,24 @@ def _duplicates(values: Iterable[str]) -> tuple[str, ...]:
 
 def _lint_error(code: str, message: str, location: str | None = None) -> DomainError:
     return DomainError(code=code, message=message, location=location)
+
+
+def _reading_context_paths(text: str) -> tuple[str, ...]:
+    return tuple(match.group(1) for match in _READING_PATH_RE.finditer(text))
+
+
+def _manifest_omissions(raw: object) -> tuple[str, ...]:
+    """Parse the optional_omissions manifest field, defaulting to empty."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+        raise ValueError("optional_omissions must be a list of strings")
+    values: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("optional_omissions entries must be strings")
+        values.append(item)
+    return tuple(values)
 
 
 def _manifest_string(raw: Mapping[str, object], key: str) -> str:

@@ -23,7 +23,12 @@ from open_tulid.runtime.execution_contracts import (
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.prompts import (
+    PROMPT_COMPILER_VERSION,
     TOTAL_BUDGET,
+    CompiledPrompt,
+    PromptBudgetError,
+    PromptManifest,
+    PromptSection,
     ReviewEvidence,
     compile_execution_prompt,
     compiled_prompt_from_metadata,
@@ -730,6 +735,269 @@ def test_verifier_allows_unknown_file_without_contract_rejection(tmp_path):
     assert result.accepted is True
     assert result.report is not None
     assert all(check.status == "passed" for check in result.report.checks)
+
+
+def test_full_task_exceeding_budget_fails_with_named_budget_error(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    oversized = replace(
+        compiled_contract.contract,
+        source_task=replace(
+            compiled_contract.contract.source_task,
+            body="A" * 8000,
+        ),
+    )
+
+    with pytest.raises(PromptBudgetError) as excinfo:
+        compile_execution_prompt(oversized)
+
+    assert excinfo.value.code == "prompt.budget_exceeded"
+    assert "exceed" in str(excinfo.value)
+
+
+def test_inline_excerpts_are_trimmed_before_binding_overflow(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    body = "Deliver exact behavior " + ("carefully " * 290) + "exactly."
+    excerpt_text = "# Required Detail\n\n" + ("binding reference text " * 60)
+    spec_sha = hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest()
+    context_file = FrozenContextFile(
+        workspace_path=f"context/{spec_sha[:12]}.md",
+        content=excerpt_text,
+        sha256=spec_sha,
+        byte_count=len(excerpt_text.encode("utf-8")),
+        required=True,
+        reason="Defines required behavior.",
+        role="reference",
+        refs=("artifacts/task-1/spec.md",),
+    )
+    excerpt = FrozenContextExcerpt(
+        artifact="artifacts/task-1/spec.md",
+        heading="Required Detail",
+        reason="Defines required behavior.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+        context_file_path=context_file.workspace_path,
+    )
+    contract = replace(
+        compiled_contract.contract,
+        source_task=replace(compiled_contract.contract.source_task, body=body),
+        context_files=(context_file,),
+        context_excerpts=(excerpt,),
+    )
+
+    prompt = compile_execution_prompt(contract)
+
+    assert len(prompt.text) <= TOTAL_BUDGET
+    assert body.strip() in prompt.text
+    task_section = next(
+        section for section in prompt.sections if section.id == "assigned_task"
+    )
+    assert task_section.truncated is False
+    reading = next(
+        section for section in prompt.sections if section.id == "required_reading"
+    )
+    assert f".open-tulid/{context_file.workspace_path}" in reading.text
+    assert "[additional context excerpts omitted" in reading.text
+    assert excerpt_text not in reading.text
+    assert prompt.manifest.optional_omissions
+    assert lint_compiled_prompt(prompt, contract=contract) == ()
+
+
+def test_prompt_lint_rejects_duplicate_authoritative_task_content(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    body = "Add a deterministic health endpoint."
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    excerpt = FrozenContextExcerpt(
+        artifact="spec.md",
+        heading="Spec",
+        reason="Duplicated task body.",
+        text=body,
+        sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+    contract = replace(compiled_contract.contract, context_excerpts=(excerpt,))
+
+    with pytest.raises(ValueError, match="prompt.duplicate_task_content"):
+        compile_execution_prompt(contract)
+
+
+def test_prompt_lint_rejects_forbidden_task_local_command_block(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    excerpt_text = (
+        "# Required Detail\n\n```sh\nrun my own command\n```\n"
+    )
+    excerpt = FrozenContextExcerpt(
+        artifact="design.md",
+        heading="Required Detail",
+        reason="Contains a forbidden command block.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+    )
+    contract = replace(compiled_contract.contract, context_excerpts=(excerpt,))
+
+    with pytest.raises(ValueError, match="prompt.forbidden_command_block"):
+        compile_execution_prompt(contract)
+
+
+def _manual_compiled(sections, contract):
+    rendered = "\n\n".join(f"## {section.heading}\n\n{section.text}" for section in sections)
+    packet_sha = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    manifest_sections = tuple({
+        "id": section.id,
+        "heading": section.heading,
+        "source_kind": section.source_kind,
+        "source_ref": section.source_ref,
+        "selection_reason": section.selection_reason,
+        "sha256": hashlib.sha256(section.text.encode("utf-8")).hexdigest(),
+        "characters": len(section.text),
+        "budget": section.budget,
+        "truncated": section.truncated,
+    } for section in sections)
+    manifest = PromptManifest(
+        PROMPT_COMPILER_VERSION,
+        "implementation",
+        contract.sha256,
+        manifest_sections,
+        packet_sha,
+        len(rendered),
+        TOTAL_BUDGET,
+        (),
+    )
+    return CompiledPrompt(rendered, tuple(sections), manifest)
+
+
+def test_prompt_lint_rejects_unresolved_and_missing_reading_paths(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    content = "Required enum E {A, B}.\n"
+    sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    context_file = FrozenContextFile(
+        workspace_path=f"context/{sha[:12]}.md",
+        content=content,
+        sha256=sha,
+        byte_count=len(content.encode("utf-8")),
+        required=True,
+        reason="Defines the required enum.",
+        role="reference",
+        refs=("artifacts/task-1/spec.md",),
+    )
+    contract = replace(compiled_contract.contract, context_files=(context_file,))
+    missing = next(f.workspace_path for f in contract.context_files)
+    unresolved = "context/deadbeefdead.md"
+    reading = "\n".join((
+        "Read the complete frozen source files below.",
+        f"- `.open-tulid/{unresolved}` — required reference: unresolved",
+    ))
+    compiled = _manual_compiled((
+        PromptSection(
+            "assigned_task", "Assigned Task", task.body,
+            "execution_contract", "generated_contract", "Assigned outcome.",
+        ),
+        PromptSection(
+            "required_reading", "Required Reading", reading,
+            "context_file", unresolved, "Required reading.",
+        ),
+        PromptSection(
+            "completion_submission", "Completion Submission",
+            "```sh\ncurl -sS -X POST\n```",
+            "runtime", "completion_api", "Completion mechanism.",
+        ),
+    ), contract)
+
+    issues = lint_compiled_prompt(compiled, contract=contract)
+    codes = {issue.code for issue in issues}
+    assert "prompt.missing_required_source" in codes
+    assert "prompt.unresolved_reading_path" in codes
+
+
+def test_prompt_manifest_optional_omissions_round_trip(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    excerpt_text = "# Required Detail\n\n" + ("binding reference text " * 60)
+    sha = hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest()
+    context_file = FrozenContextFile(
+        workspace_path=f"context/{sha[:12]}.md",
+        content=excerpt_text,
+        sha256=sha,
+        byte_count=len(excerpt_text.encode("utf-8")),
+        required=True,
+        reason="Defines required behavior.",
+        role="reference",
+        refs=("artifacts/task-1/spec.md",),
+    )
+    excerpt = FrozenContextExcerpt(
+        artifact="artifacts/task-1/spec.md",
+        heading="Required Detail",
+        reason="Defines required behavior.",
+        text=excerpt_text,
+        sha256=hashlib.sha256(excerpt_text.encode("utf-8")).hexdigest(),
+        context_file_path=context_file.workspace_path,
+    )
+    base = replace(compiled_contract.contract, context_files=(context_file,))
+    contract = replace(
+        base,
+        source_task=replace(base.source_task, body="Deliver exact behavior " + ("carefully " * 290) + "exactly."),
+        context_excerpts=(excerpt,),
+    )
+    prompt = compile_execution_prompt(contract)
+
+    assert prompt.manifest.optional_omissions
+    loaded = compiled_prompt_from_metadata({
+        "prompt_packet": prompt.text,
+        "prompt_packet_sha256": prompt.manifest.packet_sha256,
+        "prompt_manifest": prompt.manifest.to_dict(),
+    })
+
+    assert loaded.manifest.optional_omissions == prompt.manifest.optional_omissions
 
 
 def test_verifier_rejects_when_a_frozen_command_fails(tmp_path):
