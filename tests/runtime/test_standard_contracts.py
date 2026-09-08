@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import MappingProxyType
 
-from open_tulid.domain import RequirementDefinition, Task, TransitionDefinition
-from open_tulid.runtime.execution_contracts import compile_standard_execution_contract
+from open_tulid.domain import ExecutionJob, RequirementDefinition, Task, TransitionDefinition
+from open_tulid.runtime.execution_contracts import (
+    compile_standard_execution_contract,
+    execution_contract_to_dict,
+    load_job_execution_contract,
+)
 from open_tulid.runtime.executor import (
     _project_standard_runtime,
     _write_opencode_model_config_if_needed,
@@ -686,3 +691,137 @@ def test_global_contract_clips_oversized_resolved_context_without_dropping_it(tm
     assert compiled.contract.context_excerpts
     assert "clipped at resolution budget" in compiled.contract.context_excerpts[0].text
     assert "Dependency rule content" in compiled.contract.context_excerpts[0].text
+    # The complete required source is still frozen as full bytes, not dropped.
+    assert compiled.contract.context_files
+    full = compiled.contract.context_files[0]
+    assert "Dependency rule content. " * 40 in full.content
+    assert full.byte_count == len(full.content.encode("utf-8"))
+    assert len(full.content) > 5000
+    assert full.workspace_path == compiled.contract.context_excerpts[0].context_file_path
+
+
+def test_global_contract_freezes_full_source_bytes_with_provenance(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    spec = project_root / "docs" / "specification.md"
+    spec.parent.mkdir(parents=True)
+    spec_text = "# Specification\n\nThe required enum is `HealthStatus`: `ok`, `degraded`.\n"
+    spec.write_text(spec_text, encoding="utf-8")
+    task = _implementation_task(spec_relative="docs/specification.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    contract = compiled.contract
+    assert contract is not None
+    assert contract.context_files
+    frozen = contract.context_files[0]
+    assert frozen.content == spec_text
+    assert frozen.sha256 == hashlib.sha256(frozen.content.encode("utf-8")).hexdigest()
+    assert frozen.byte_count == len(frozen.content.encode("utf-8"))
+    assert frozen.workspace_path.startswith("context/")
+    assert frozen.workspace_path.endswith(".md")
+    assert "docs/specification.md" in frozen.refs
+    assert frozen.required is True
+    assert frozen.role == "reference"
+    assert contract.context_excerpts[0].context_file_path == frozen.workspace_path
+
+
+def test_global_contract_dedupes_identical_context_bytes_retaining_refs(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    (project_root / "docs").mkdir()
+    (project_root / "docs" / "a.md").write_text("Same shared rule.\n", encoding="utf-8")
+    (project_root / "docs" / "b.md").write_text("Same shared rule.\n", encoding="utf-8")
+    task = _implementation_task(body="Apply [[a]] and [[b]].")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is True, [error.code for error in compiled.errors]
+    contract = compiled.contract
+    assert contract is not None
+    assert len(contract.context_files) == 1
+    assert set(contract.context_files[0].refs) == {"a", "b"}
+
+
+def test_job_payload_round_trips_frozen_context_files(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    spec = project_root / "docs" / "specification.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# Specification\n\nRule A.\n", encoding="utf-8")
+    task = _implementation_task(spec_relative="docs/specification.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.contract is not None
+    job = ExecutionJob(
+        job_id="job-1",
+        project_id="Agent",
+        task_id=task.id,
+        transition_id="ImplementTask",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "workspace"),
+        metadata={
+            "execution_contract": execution_contract_to_dict(compiled.contract),
+            "execution_contract_sha256": compiled.contract.sha256,
+        },
+    )
+
+    loaded = load_job_execution_contract(job, required=True)
+
+    assert loaded.accepted is True
+    assert loaded.contract is not None
+    assert loaded.contract.context_files == compiled.contract.context_files
+
+
+def test_job_payload_rejects_tampered_frozen_context_file(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    spec = project_root / "docs" / "specification.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# Specification\n\nRule A.\n", encoding="utf-8")
+    task = _implementation_task(spec_relative="docs/specification.md")
+    repo = _repo(tmp_path)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.contract is not None
+    payload = execution_contract_to_dict(compiled.contract)
+    payload["context_files"][0]["content"] = "Tampered rule text.\n"
+    job = ExecutionJob(
+        job_id="job-1",
+        project_id="Agent",
+        task_id=task.id,
+        transition_id="ImplementTask",
+        worker_id="qwen",
+        workspace_path=str(tmp_path / "workspace"),
+        metadata={
+            "execution_contract": payload,
+            "execution_contract_sha256": compiled.contract.sha256,
+        },
+    )
+
+    loaded = load_job_execution_contract(job, required=True)
+
+    assert loaded.accepted is False
+    assert loaded.errors[0].code == "execution_contract.hash_mismatch"

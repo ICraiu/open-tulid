@@ -64,6 +64,62 @@ def test_linked_context_rejects_missing_required_artifact_link(tmp_path: Path):
     assert result.errors[0].code == "context.link_not_found"
 
 
+def test_linked_context_rejects_ambiguous_reference(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "docs" / "shared.md").write_text("docs copy.\n", encoding="utf-8")
+    (tmp_path / "tasks" / "shared.md").write_text("tasks copy.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(body="See [[shared]]."),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "context.link_ambiguous"
+
+
+def test_linked_context_retains_provenance_for_deduplicated_content(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "a.md").write_text("Same bytes.\n", encoding="utf-8")
+    (tmp_path / "docs" / "b.md").write_text("Same bytes.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(body="See [[a]] and [[b]]."),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert len(result.packet.documents) == 1
+    content_hash = result.packet.documents[0].sha256
+    assert set(result.packet.references[content_hash]) == {"a", "b"}
+
+
+def test_linked_context_marks_required_artifact_documents(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "spec.md").write_text("Spec body.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(artifact_links=("docs/spec.md",)),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert result.packet.documents[0].required is True
+
+
+def test_linked_context_marks_wiki_background_as_optional(tmp_path: Path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "background.md").write_text("Background.\n", encoding="utf-8")
+
+    result = LinkedContextResolver(tmp_path).build_context_packet(
+        _task(body="See [[background]]."),
+    )
+
+    assert result.accepted is True
+    assert result.packet is not None
+    assert result.packet.documents[0].required is False
+
+
 def test_linked_context_rejects_artifact_path_escape(tmp_path: Path):
     result = LinkedContextResolver(tmp_path).build_context_packet(
         _task(artifact_links=("../secret.md",)),

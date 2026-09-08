@@ -69,6 +69,30 @@ class FrozenContextExcerpt:
     reason: str
     text: str
     sha256: str
+    # Relative workspace path (under .open-tulid/context/) holding the complete
+    # frozen source bytes this excerpt is clipped from, if any.
+    context_file_path: str | None = None
+
+
+@dataclass(frozen=True)
+class FrozenContextFile:
+    """Complete frozen source bytes with provenance.
+
+    The full document is stored with the job's durable inputs and materialized
+    under the internal workspace area (``.open-tulid/context/``) so a worker can
+    always read the whole required source. ``refs`` retains every original
+    reference that resolved to these byte-identical contents after
+    deduplication.
+    """
+    workspace_path: str
+    content: str
+    sha256: str
+    byte_count: int
+    required: bool
+    reason: str
+    role: str = "reference"
+    refs: tuple[str, ...] = ()
+    source_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,6 +123,9 @@ class ExecutionContract:
     # file/directory diffs are recorded as evidence but are NOT acceptance
     # criteria; a worker may freely create/edit/rename/delete task files.
     context_excerpts: tuple = ()
+    # Complete frozen source bytes with provenance, materialized under
+    # .open-tulid/context/ in the prepared workspace. Excluded from promotion.
+    context_files: tuple = ()
     sha256: str = ""
 
     @property
@@ -172,7 +199,7 @@ def compile_standard_execution_contract(
             key=lambda check: check.id,
         )
     )
-    context_excerpts, context_errors = _freeze_linked_context(
+    context_excerpts, context_files, context_errors = _freeze_linked_context(
         project_root,
         task,
         transition,
@@ -191,6 +218,7 @@ def compile_standard_execution_contract(
         baseline_manifest=repository.snapshot.baseline,
         resolved_checks=checks,
         context_excerpts=context_excerpts,
+        context_files=context_files,
         sha256="",
     )
     contract_hash = canonical_sha256(_execution_contract_body(provisional))
@@ -392,6 +420,7 @@ def load_job_execution_contract(
             payload.get("context_excerpts", ()),
             legacy_missing_reason=prompt_compiler_version == 1,
         )
+        context_files = _context_files_from_list(payload.get("context_files", ()))
     except (TypeError, ValueError, KeyError) as exc:
         return ExecutionContractResult(errors=(_error(
             "execution_contract.corrupt",
@@ -419,6 +448,7 @@ def load_job_execution_contract(
         baseline_manifest=baseline,
         resolved_checks=resolved_checks,
         context_excerpts=context_excerpts,
+        context_files=context_files,
         sha256=expected_hash,
     ))
 
@@ -455,8 +485,23 @@ def _execution_contract_body(contract: ExecutionContract) -> dict[str, object]:
                 "reason": excerpt.reason,
                 "text": excerpt.text,
                 "sha256": excerpt.sha256,
+                "context_file_path": excerpt.context_file_path,
             }
             for excerpt in contract.context_excerpts
+        ],
+        "context_files": [
+            {
+                "workspace_path": context_file.workspace_path,
+                "content": context_file.content,
+                "sha256": context_file.sha256,
+                "byte_count": context_file.byte_count,
+                "required": context_file.required,
+                "reason": context_file.reason,
+                "role": context_file.role,
+                "refs": list(context_file.refs),
+                "source_paths": list(context_file.source_paths),
+            }
+            for context_file in contract.context_files
         ],
     }
 
@@ -535,16 +580,25 @@ def _freeze_linked_context(
     transition: TransitionDefinition,
     *,
     parent_tasks: tuple[Task, ...] = (),
-) -> tuple[tuple[FrozenContextExcerpt, ...], tuple[DomainError, ...]]:
+) -> tuple[
+    tuple[FrozenContextExcerpt, ...],
+    tuple[FrozenContextFile, ...],
+    tuple[DomainError, ...],
+]:
     """Resolve and freeze the task's linked reference context at job creation.
 
     Uses the same resolver and role rendering as the legacy render route so both
     paths consume one shared resolution output: the source idea/specification,
     its canonical answer lineage, and relevant linked references. Required links,
-    answer conflicts, and containment are verified before a worker is admitted.
+    ambiguous links, answer conflicts, and containment are verified before a
+    worker is admitted.
 
-    Oversized references are clipped with an explicit marker rather than dropped
-    silently; exact budget/truncation semantics are refined in a later step.
+    The complete source bytes are frozen with provenance so a worker can always
+    read the full required document from the workspace, not just a clipped
+    inline excerpt. Identical content is stored once while all logical
+    references are retained. Oversized references are clipped in the inline
+    excerpt with an explicit marker pointing at the full frozen workspace file,
+    never dropped silently.
     """
     resolver = LinkedContextResolver(project_root)
     result = resolver.build_context_packet(
@@ -552,32 +606,68 @@ def _freeze_linked_context(
         parent_tasks=parent_tasks,
     )
     if not result.accepted:
-        return (), result.errors
-    documents = result.packet.documents
-    frozen: list[FrozenContextExcerpt] = []
+        return (), (), result.errors
+    packet = result.packet
+    references = packet.references
+    documents = packet.documents
+    frozen_files: list[FrozenContextFile] = []
+    frozen_excerpts: list[FrozenContextExcerpt] = []
     total_characters = 0
+    seen_excerpt_hashes: set[str] = set()
     for document in documents:
+        workspace_path = _context_workspace_file_path(document.sha256)
+        refs = tuple(references.get(document.sha256, (document.ref,))) or (document.ref,)
+        required = _context_document_required(document)
+        reason = _context_role_reason(document)
+        role = _context_document_role(document)
+        frozen_files.append(FrozenContextFile(
+            workspace_path=workspace_path,
+            content=document.content,
+            sha256=document.sha256,
+            byte_count=len(document.content.encode("utf-8")),
+            required=required,
+            reason=reason,
+            role=role,
+            refs=refs,
+            source_paths=(str(document.path),),
+        ))
         text = render_context_document(document)
         if len(text) > CONTEXT_EXCERPT_CHARACTER_LIMIT:
-            text = _clip_context_document(text, CONTEXT_EXCERPT_CHARACTER_LIMIT)
+            text = _clip_context_document(
+                text,
+                CONTEXT_EXCERPT_CHARACTER_LIMIT,
+                workspace_path=workspace_path,
+            )
         remaining = CONTEXT_EXCERPTS_TOTAL_CHARACTER_LIMIT - total_characters
         if len(text) > remaining:
-            text = _clip_context_document(text, max(0, remaining))
+            text = _clip_context_document(
+                text,
+                max(0, remaining),
+                workspace_path=workspace_path,
+            )
             if not text:
                 break
+        excerpt_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if excerpt_hash in seen_excerpt_hashes:
+            continue
+        seen_excerpt_hashes.add(excerpt_hash)
         total_characters += len(text)
-        frozen.append(FrozenContextExcerpt(
+        frozen_excerpts.append(FrozenContextExcerpt(
             artifact=document.ref,
             heading=_context_role_heading(document),
-            reason=_context_role_reason(document),
+            reason=reason,
             text=text,
-            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            sha256=excerpt_hash,
+            context_file_path=workspace_path,
         ))
-    return tuple(frozen), ()
+    return tuple(frozen_excerpts), tuple(frozen_files), ()
 
 
-def _clip_context_document(text: str, limit: int) -> str:
-    marker = "\n[reference clipped at resolution budget; see the source file in the workspace]"
+def _clip_context_document(text: str, limit: int, *, workspace_path: str) -> str:
+    marker = (
+        "\n[reference clipped at resolution budget; full source is available "
+        f"at workspace file {workspace_path}]"
+    )
     if limit <= len(marker):
         return marker[:limit]
     return text[: limit - len(marker)].rstrip() + marker
@@ -601,6 +691,32 @@ def _context_role_reason(document) -> str:
     if document.is_execution_contract:
         return "Boundary and interface reference the task must satisfy."
     return "Specific linked reference material applicable to this task."
+
+
+def _context_document_required(document) -> bool:
+    if (
+        document.is_canonical_question_round_answers
+        or document.is_execution_contract
+    ):
+        return True
+    return bool(document.required)
+
+
+def _context_document_role(document) -> str:
+    if document.is_canonical_question_round_answers:
+        return "answer"
+    if document.is_execution_contract:
+        return "implementation_contract"
+    return "reference"
+
+
+def _context_workspace_file_path(sha256: str) -> str:
+    """Stable relative workspace path for one deduplicated frozen source file.
+
+    Paths always live under the internal ``.open-tulid/context/`` area so they
+    can never be promoted to the application repository.
+    """
+    return f"context/{sha256[:12]}.md"
 
 
 def _freeze_context_excerpts(project_root: Path, task: Task, selections) -> tuple[tuple, tuple[DomainError, ...]]:
@@ -1141,14 +1257,63 @@ def _context_excerpts_from_list(
             reason = "Required to implement the generated contract."
         if not isinstance(reason, str) or not reason:
             raise ValueError("reason must be a non-empty string")
+        context_file_path = payload.get("context_file_path")
+        if context_file_path is not None and (
+            not isinstance(context_file_path, str) or not context_file_path
+        ):
+            raise ValueError("context_file_path must be a non-empty string or null")
         excerpts.append(FrozenContextExcerpt(
             artifact=_required_string(payload, "artifact"),
             heading=_required_string(payload, "heading"),
             reason=reason,
             text=text,
             sha256=sha256,
+            context_file_path=context_file_path,
         ))
     return tuple(excerpts)
+
+
+def _context_files_from_list(raw: object) -> tuple:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("context_files must be a list")
+    files: list[FrozenContextFile] = []
+    for item in raw:
+        payload = _mapping(item, "context_files[]")
+        content = _required_string(payload, "content")
+        sha256 = _required_string(payload, "sha256")
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != sha256:
+            raise ValueError("context file hash mismatch")
+        byte_count = payload.get("byte_count", 0)
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int):
+            raise ValueError("context file byte_count must be an integer")
+        if byte_count != len(content.encode("utf-8")):
+            raise ValueError("context file byte_count mismatch")
+        required = payload.get("required", False)
+        if not isinstance(required, bool):
+            raise ValueError("context file required must be a boolean")
+        reason = _required_string(payload, "reason")
+        role = str(payload.get("role", "reference")) or "reference"
+        workspace_path = _required_string(payload, "workspace_path")
+        workspace = Path(workspace_path)
+        if (
+            workspace.is_absolute()
+            or ".." in workspace.parts
+            or not workspace.parts
+            or workspace.parts[0] != "context"
+        ):
+            raise ValueError("context file workspace_path must be a safe context path")
+        files.append(FrozenContextFile(
+            workspace_path=workspace_path,
+            content=content,
+            sha256=sha256,
+            byte_count=byte_count,
+            required=required,
+            reason=reason,
+            role=role,
+            refs=_string_tuple(payload.get("refs")),
+            source_paths=_string_tuple(payload.get("source_paths")),
+        ))
+    return tuple(files)
 
 
 def _mapping(raw: object, name: str) -> Mapping[str, object]:

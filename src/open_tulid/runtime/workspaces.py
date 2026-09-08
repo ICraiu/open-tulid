@@ -230,6 +230,7 @@ def _write_context(
             context_dir / "baseline-manifest.json",
             baseline_manifest_to_dict(execution_contract.baseline_manifest),
         )
+        _write_frozen_context_files(workspace, execution_contract)
 
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -237,3 +238,43 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
         json.dumps(payload, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_frozen_context_files(workspace: Path, contract: ExecutionContract) -> None:
+    """Materialize the complete frozen source bytes under .open-tulid/context/.
+
+    These internal files are excluded from application promotion (the whole
+    ``.open-tulid`` tree is never copied or diffed into the project). Any copy
+    failure raises so the caller can refuse to launch an incomplete bundle.
+    """
+    context_dir = workspace / ".open-tulid" / "context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    manifest_entries: list[dict[str, object]] = []
+    for context_file in contract.context_files:
+        workspace_file = _safe_context_target(workspace, context_file.workspace_path)
+        workspace_file.parent.mkdir(parents=True, exist_ok=True)
+        workspace_file.write_text(context_file.content, encoding="utf-8")
+        manifest_entries.append({
+            "workspace_path": context_file.workspace_path,
+            "sha256": context_file.sha256,
+            "byte_count": context_file.byte_count,
+            "required": context_file.required,
+            "role": context_file.role,
+            "refs": list(context_file.refs),
+            "reason": context_file.reason,
+        })
+    _write_json(context_dir / "context-files.json", {
+        "schema": "tulid.context-files/v1",
+        "files": manifest_entries,
+    })
+
+
+def _safe_context_target(workspace: Path, workspace_path: str) -> Path:
+    relative = Path(workspace_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"unsafe frozen context path: {workspace_path}")
+    target = (workspace / ".open-tulid" / "context" / relative.name).resolve()
+    root = workspace.resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(f"frozen context path escapes the workspace: {workspace_path}")
+    return target

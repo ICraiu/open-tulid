@@ -859,6 +859,8 @@ def _changed_file_plan(
         relative = Path(ref)
         if relative.is_absolute() or ".." in relative.parts:
             continue
+        if any(part == ".open-tulid" for part in relative.parts):
+            continue
         source = (workspace_root / relative).resolve()
         target = (repository_root / relative).resolve()
         if source != workspace_root and workspace_root not in source.parents:

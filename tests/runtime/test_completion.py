@@ -432,6 +432,39 @@ def test_completion_promotes_changed_files_into_repo_root(tmp_path: Path):
     assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
 
 
+def test_completion_never_promotes_internal_open_tulid_context(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    internal = workspace / ".open-tulid" / "context"
+    internal.mkdir(parents=True)
+    (workspace / ".open-tulid" / "context" / "abc.md").write_text("frozen bytes\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts", ".open-tulid/context/abc.md"),
+        ),
+    )
+
+    assert result.accepted is True
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
+    assert not (repo / ".open-tulid" / "context" / "abc.md").exists()
+
+
 def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path):
     store = _job_store(tmp_path)
     workspace = tmp_path / "workspace"

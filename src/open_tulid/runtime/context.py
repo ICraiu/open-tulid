@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from open_tulid.domain import DomainError, Task, TransitionDefinition
 
@@ -23,6 +24,10 @@ class ContextDocument:
     is_execution_contract: bool = False
     is_canonical_question_round_answers: bool = False
     is_current_question_round_answers: bool = False
+    # Whether the reference was explicitly required (artifact/parent links) or
+    # merely discoverable background (wiki links). Required sources must remain
+    # present and named; optional background may be budgeted out.
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,10 @@ class ContextPacket:
     documents: tuple[ContextDocument, ...]
     text: str
     sha256: str
+    # Maps a content digest to every original reference that resolved to that
+    # byte-identical content. Retains all logical provenance even when the
+    # resolver stores the content only once.
+    references: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,7 @@ class LinkedContextResolver:
         errors: list[DomainError] = []
         seen: set[Path] = set()
         seen_hashes: set[str] = set()
+        references: dict[str, list[str]] = {}
         total_bytes = 0
         canonical_answer_links = _canonical_question_round_answer_links(task)
         if len(canonical_answer_links) > 1:
@@ -95,8 +105,8 @@ class LinkedContextResolver:
                 continue
             if depth > self.max_depth:
                 continue
-            path = self._resolve(ref)
-            if path is None:
+            candidates = self._resolve_candidates(ref)
+            if not candidates:
                 if required:
                     errors.append(DomainError(
                         "context.link_not_found",
@@ -104,6 +114,17 @@ class LinkedContextResolver:
                         ref,
                     ))
                 continue
+            if len(candidates) > 1:
+                errors.append(DomainError(
+                    "context.link_ambiguous",
+                    (
+                        f"Linked context reference {ref!r} resolves to more than "
+                        "one file under the project roots; disambiguate it."
+                    ),
+                    ref,
+                ))
+                continue
+            path = candidates[0]
             if path in seen:
                 continue
             if len(docs) >= self.max_documents:
@@ -123,6 +144,7 @@ class LinkedContextResolver:
                 ))
                 continue
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            references.setdefault(content_hash, []).append(ref)
             if content_hash in seen_hashes:
                 seen.add(path)
                 continue
@@ -145,6 +167,7 @@ class LinkedContextResolver:
                 is_execution_contract=_is_implementation_contract_link(ref),
                 is_canonical_question_round_answers=_clean_ref(ref) in canonical_answer_refs,
                 is_current_question_round_answers=_clean_ref(ref) == _clean_ref(canonical_answer_link or ""),
+                required=required,
             ))
             queue.extend((link, depth + 1, False) for link in _wiki_links(content))
 
@@ -155,27 +178,34 @@ class LinkedContextResolver:
             documents=tuple(docs),
             text=text,
             sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            references={
+                content_hash: tuple(refs)
+                for content_hash, refs in references.items()
+            },
         ))
 
-    def _resolve(self, ref: str) -> Path | None:
+    def _resolve_candidates(self, ref: str) -> tuple[Path, ...]:
         clean = _clean_ref(ref)
         if not clean:
-            return None
+            return ()
         raw = Path(clean)
         if raw.is_absolute() or ".." in raw.parts:
-            return None
+            return ()
+        seen: set[Path] = set()
+        resolved: list[Path] = []
         candidates = (
             self.project_root / raw,
             self.project_root / "tasks" / f"{clean}.md",
             self.project_root / "docs" / f"{clean}.md",
         )
         for candidate in candidates:
-            resolved = candidate.resolve()
-            if self.project_root != resolved and self.project_root not in resolved.parents:
+            path = candidate.resolve()
+            if self.project_root != path and self.project_root not in path.parents:
                 continue
-            if resolved.is_file():
-                return resolved
-        return None
+            if path.is_file() and path not in seen:
+                seen.add(path)
+                resolved.append(path)
+        return tuple(resolved)
 
 
 def _clean_ref(ref: str) -> str:

@@ -241,6 +241,9 @@ class TaskManager:
         elif uses_global_contract:
             # Primary path: compile from the project global contract (contract.yaml)
             # plus acceptance.yaml. No per-task LLM-authored contract is needed.
+            lineage_errors = _validate_parent_lineage(self.adapter, task)
+            if lineage_errors:
+                return CommandResult(accepted=False, errors=tuple(lineage_errors))
             compiled = compile_standard_execution_contract(
                 project_root=self.project_root,
                 repo_root=self.repo_root,
@@ -452,6 +455,32 @@ def _event(
         job_id=job_id,
         data=data,
     )
+
+
+def _validate_parent_lineage(adapter: StorageAdapter, task: Task) -> list[DomainError]:
+    """Detect a parent cycle before a job is admitted.
+
+    ``load_parent_tasks`` bounds the walk defensively, but a genuine cycle must
+    be surfaced as a blocking diagnostic rather than silently truncated context.
+    """
+    seen: set[str] = set()
+    current_id = task.parent_id
+    while current_id:
+        if current_id in seen:
+            return [_error(
+                "task.parent_cycle",
+                (
+                    f"Task {task.id!r} has a cyclic parent lineage at "
+                    f"{current_id!r}; parent context cannot be resolved."
+                ),
+                task.id,
+            )]
+        seen.add(current_id)
+        loaded = adapter.read_task(current_id)
+        if not loaded.accepted or loaded.task is None:
+            break
+        current_id = loaded.task.parent_id
+    return []
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

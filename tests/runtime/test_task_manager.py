@@ -251,3 +251,34 @@ def _workflow_with_review_artifact_requirement() -> WorkflowDefinition:
         workers=workflow.workers,
         transitions=workflow.transitions,
     )
+
+
+def test_parent_lineage_detects_cycle_before_admission():
+    from open_tulid.runtime.task_manager import _validate_parent_lineage
+
+    a = Task(id="a", title="A", path="tasks/a.md", current_state="Todo", parent_id="b")
+    b = Task(id="b", title="B", path="tasks/b.md", current_state="Todo", parent_id="a")
+    adapter = FakeAdapter(ProjectSnapshot(
+        project_id="Agent",
+        tasks=MappingProxyType({"a": a, "b": b}),
+        board_positions=MappingProxyType({}),
+    ))
+
+    errors = _validate_parent_lineage(adapter, a)
+
+    assert errors
+    assert errors[0].code == "task.parent_cycle"
+
+
+def test_parent_lineage_accepts_non_cyclic_lineage_end_at_ancestor():
+    from open_tulid.runtime.task_manager import _validate_parent_lineage
+
+    root = Task(id="root", title="Root", path="tasks/root.md", current_state="Todo")
+    child = Task(id="child", title="Child", path="tasks/child.md", current_state="Todo", parent_id="root")
+    adapter = FakeAdapter(ProjectSnapshot(
+        project_id="Agent",
+        tasks=MappingProxyType({"root": root, "child": child}),
+        board_positions=MappingProxyType({}),
+    ))
+
+    assert _validate_parent_lineage(adapter, child) == []
