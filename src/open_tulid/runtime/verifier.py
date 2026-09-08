@@ -11,9 +11,34 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from open_tulid.domain import DomainError, TransitionDefinition
 from open_tulid.runtime.execution_contracts import ExecutionContract
-from open_tulid.runtime.repository_facts import BaselineManifest, capture_repository_snapshot
+from open_tulid.runtime.repository_facts import (
+    BaselineManifest,
+    canonical_sha256,
+    capture_repository_snapshot,
+)
 
+# Legacy schema name, retained so historical ``tulid.verification/v1`` reports
+# stay readable. New verification reports use v2 and keep every v1 field.
 VERIFICATION_REPORT_SCHEMA = "tulid.verification/v1"
+VERIFICATION_REPORT_SCHEMA_V2 = "tulid.verification/v2"
+VERIFICATION_REQUEST_SCHEMA = "tulid.verification_request/v1"
+
+# Granular classification recorded separately from pass/fail (plan 4A). A
+# command that was never run, or an empty report, is never equated with success.
+VERIFICATION_NOT_RUN_STATUS = "not_run"
+VERIFICATION_PASSED = "passed"
+VERIFICATION_CLASSIFICATION_PASSED = "passed"
+VERIFICATION_CLASSIFICATION_MALFORMED_POLICY = "malformed_policy"
+VERIFICATION_CLASSIFICATION_ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
+VERIFICATION_CLASSIFICATION_DEPENDENCY_PREPARATION = "dependency_preparation"
+VERIFICATION_CLASSIFICATION_COMMAND_TIMEOUT = "command_timeout"
+VERIFICATION_CLASSIFICATION_FAILED_BEHAVIOR = "failed_behavior"
+VERIFICATION_CLASSIFICATION_SOURCE_MUTATION = "source_mutation"
+VERIFICATION_CLASSIFICATION_INFRASTRUCTURE_INTERRUPTION = "infrastructure_interruption"
+
+# Inline stdout/stderr in a report is bounded; complete logs are retained as
+# referenced artifacts rather than embedded wholesale into the report.
+LOG_EXCERPT_CHARACTER_LIMIT = 2_000
 
 
 @dataclass(frozen=True)
@@ -48,22 +73,58 @@ class VerificationResult:
 
 @dataclass(frozen=True)
 class VerificationCheckResult:
+    """One configured global command and its verifier result.
+
+    ``status`` is one of ``passed``/``failed``/``timeout``/``environment_error``
+    or ``not_run``. A check marked ``not_run`` means the command never executed
+    (for example verification was interrupted), so it can never count as success.
+    Inline ``stdout``/``stderr`` excerpts are bounded; complete command logs are
+    referenced by ``log_refs`` rather than embedded wholesale.
+    """
+
     id: str
     status: str
     argv: tuple[str, ...]
     exit_code: int | None = None
     stdout: str = ""
     stderr: str = ""
+    working_directory: str = "."
+    timeout_seconds: int | None = None
+    expected_exit_code: int | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    duration_seconds: float | None = None
+    log_refs: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "id": self.id, "status": self.status, "argv": list(self.argv),
-            "exit_code": self.exit_code, "stdout": self.stdout, "stderr": self.stderr,
+            "id": self.id,
+            "status": self.status,
+            "argv": list(self.argv),
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "working_directory": self.working_directory,
+            "timeout_seconds": self.timeout_seconds,
+            "expected_exit_code": self.expected_exit_code,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_seconds": self.duration_seconds,
+            "log_refs": list(self.log_refs),
         }
 
 
 @dataclass(frozen=True)
 class VerificationReport:
+    """Tulid-controlled verification evidence binding checks to one candidate.
+
+    ``classification`` is the granular outcome recorded separately from the
+    accepted/passed boolean; it distinguishes a malformed policy, an unavailable
+    tool/runtime, a dependency preparation failure, a command timeout, a failed
+    behavior check, source mutation, or an infrastructure interruption. An empty
+    report or any ``not_run`` check is never equated with success.
+    """
+
     schema: str
     classification: str | None
     baseline_sha256: str
@@ -78,10 +139,32 @@ class VerificationReport:
     # A report is applicable only to its exact sealed candidate.
     candidate_id: str | None = None
     candidate_manifest_sha256: str | None = None
+    # Plan 4A: verifier request identity and frozen policy identity.
+    request_sha256: str | None = None
+    command_policy_sha256: str | None = None
+    project_image_identity: str | None = None
+    environment_identity: str | None = None
+    not_run_checks: int = 0
+    source_mutated: bool | None = None
+    # Granular outcome recorded separately from the coarse/legacy classification
+    # and from the acceptance boolean (plan 4A): malformed policy, unavailable
+    # tool/runtime, dependency preparation, command timeout, failed behavior,
+    # source mutation, or infrastructure interruption.
+    classification_detail: str | None = None
+
+    @property
+    def accepted_inline(self) -> bool:
+        """Inline sanity: an empty report or any never-run command is never success."""
+        if not self.checks:
+            return False
+        if self.not_run_checks:
+            return False
+        return all(check.status == VERIFICATION_PASSED for check in self.checks)
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": self.schema, "classification": self.classification,
+            "schema": self.schema,
+            "classification": self.classification,
             "baseline_sha256": self.baseline_sha256,
             "post_manifest_sha256": self.post_manifest_sha256,
             "changes": {"added": list(self.added), "edited": list(self.edited),
@@ -91,7 +174,156 @@ class VerificationReport:
             "checks": [check.to_dict() for check in self.checks],
             "candidate_id": self.candidate_id,
             "candidate_manifest_sha256": self.candidate_manifest_sha256,
+            "request_sha256": self.request_sha256,
+            "command_policy_sha256": self.command_policy_sha256,
+            "project_image_identity": self.project_image_identity,
+            "environment_identity": self.environment_identity,
+            "not_run_checks": self.not_run_checks,
+            "source_mutated": self.source_mutated,
+            "classification_detail": self.classification_detail,
         }
+
+
+@dataclass(frozen=True)
+class VerificationCommand:
+    """One ordered global command definition frozen into a verifier request."""
+
+    name: str
+    argv: tuple[str, ...]
+    working_directory: str = "."
+    timeout_seconds: int = 300
+    expected_exit_code: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "argv": list(self.argv),
+            "working_directory": self.working_directory,
+            "timeout_seconds": self.timeout_seconds,
+            "expected_exit_code": self.expected_exit_code,
+        }
+
+
+@dataclass(frozen=True)
+class VerificationRequest:
+    """What this verifier was asked to execute against which exact candidate.
+
+    The request freezes the ordered command policy (never re-sorted), the
+    command-policy digest, the candidate and baseline digests, the resolved
+    project image identity, and the runtime environment identity. The report is
+    bound to this request's digest.
+    """
+
+    schema: str = VERIFICATION_REQUEST_SCHEMA
+    candidate_id: str | None = None
+    candidate_manifest_sha256: str | None = None
+    baseline_sha256: str | None = None
+    command_policy_sha256: str | None = None
+    project_image_identity: str | None = None
+    environment_identity: str | None = None
+    commands: tuple[VerificationCommand, ...] = ()
+    sha256: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "candidate_id": self.candidate_id,
+            "candidate_manifest_sha256": self.candidate_manifest_sha256,
+            "baseline_sha256": self.baseline_sha256,
+            "command_policy_sha256": self.command_policy_sha256,
+            "project_image_identity": self.project_image_identity,
+            "environment_identity": self.environment_identity,
+            "commands": [command.to_dict() for command in self.commands],
+            "sha256": self.sha256,
+        }
+
+
+def command_policy_sha256(commands: Sequence[VerificationCommand]) -> str:
+    """Canonical digest of an ordered global command policy.
+
+    The order is part of the identity: relisting ``a_tests`` before
+    ``z_setup`` is a different policy from the reverse, so a verifier consumes
+    the exact declared order rather than silently sorting it.
+    """
+    body = {
+        "schema": "tulid.command_policy/v1",
+        "commands": [
+            {
+                "name": command.name,
+                "argv": list(command.argv),
+                "working_directory": command.working_directory,
+                "timeout_seconds": command.timeout_seconds,
+                "expected_exit_code": command.expected_exit_code,
+            }
+            for command in commands
+        ],
+    }
+    return canonical_sha256(body)
+
+
+def verification_request_from_execution_contract(
+    contract: ExecutionContract,
+    *,
+    candidate_id: str | None = None,
+    candidate_manifest_sha256: str | None = None,
+    project_image_identity: str | None = None,
+    environment_identity: str | None = None,
+) -> VerificationRequest:
+    """Freeze a verifier request from a compiled execution contract.
+
+    The ordered command list is taken from the resolved global checks in their
+    declared order, never re-sorted. ``project_image_identity`` and
+    ``environment_identity`` are resolved by the external execution environment
+    (plan 4B); callers that do not yet resolve them leave them ``None``.
+    """
+    commands: list[VerificationCommand] = []
+    for check in contract.resolved_checks:
+        if check.runner != "command":
+            continue
+        commands.append(VerificationCommand(
+            name=check.id,
+            argv=check.argv,
+            working_directory=check.working_directory,
+            timeout_seconds=check.timeout_seconds,
+            expected_exit_code=check.expect.exit_code,
+        ))
+    ordered = tuple(commands)
+    policy_digest = command_policy_sha256(ordered)
+    provisional = VerificationRequest(
+        schema=VERIFICATION_REQUEST_SCHEMA,
+        candidate_id=candidate_id,
+        candidate_manifest_sha256=candidate_manifest_sha256,
+        baseline_sha256=contract.baseline_manifest.sha256,
+        command_policy_sha256=policy_digest,
+        project_image_identity=project_image_identity,
+        environment_identity=environment_identity,
+        commands=ordered,
+        sha256="",
+    )
+    request_hash = canonical_sha256(_verification_request_body(provisional))
+    return VerificationRequest(
+        candidate_id=provisional.candidate_id,
+        candidate_manifest_sha256=provisional.candidate_manifest_sha256,
+        baseline_sha256=provisional.baseline_sha256,
+        command_policy_sha256=provisional.command_policy_sha256,
+        project_image_identity=provisional.project_image_identity,
+        environment_identity=provisional.environment_identity,
+        commands=provisional.commands,
+        sha256=request_hash,
+    )
+
+
+def _verification_request_body(request: VerificationRequest) -> dict[str, object]:
+    return {
+        "schema": request.schema,
+        "candidate_id": request.candidate_id,
+        "candidate_manifest_sha256": request.candidate_manifest_sha256,
+        "baseline_sha256": request.baseline_sha256,
+        "command_policy_sha256": request.command_policy_sha256,
+        "project_image_identity": request.project_image_identity,
+        "environment_identity": request.environment_identity,
+        "commands": [command.to_dict() for command in request.commands],
+    }
 
 
 class DeterministicVerifier:
@@ -129,13 +361,36 @@ class DeterministicVerifier:
                 transition.id,
             ))
         if execution_contract is not None:
-            report, enforcement_errors = self._enforce_execution_contract(
-                workspace=workspace,
+            request = verification_request_from_execution_contract(
                 contract=execution_contract,
                 candidate_id=candidate_id,
                 candidate_manifest_sha256=candidate_manifest_sha256,
             )
+            report, enforcement_errors = self._enforce_execution_contract(
+                workspace=workspace,
+                contract=execution_contract,
+                request=request,
+            )
             errors.extend(enforcement_errors)
+        if report is not None:
+            if not report.accepted_inline:
+                already_signaled = any(
+                    error.code.startswith("verification.")
+                    and error.code != "verification.incomplete"
+                    for error in errors
+                )
+                if not already_signaled:
+                    errors.append(_error(
+                        "verification.incomplete",
+                        _verification_incomplete_message(report),
+                        report.candidate_id,
+                    ))
+            if report.source_mutated:
+                errors.append(_error(
+                    "verification.source_mutation",
+                    "Verification mutated tracked source; the candidate is rejected.",
+                    report.candidate_id,
+                ))
         output_root = output_dir or workspace / "output"
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         duplicate_artifact_types = _duplicates(artifact.type for artifact in submitted_artifacts)
@@ -293,6 +548,13 @@ class DeterministicVerifier:
                 checks=report.checks,
                 candidate_id=report.candidate_id,
                 candidate_manifest_sha256=report.candidate_manifest_sha256,
+                request_sha256=report.request_sha256,
+                command_policy_sha256=report.command_policy_sha256,
+                project_image_identity=report.project_image_identity,
+                environment_identity=report.environment_identity,
+                not_run_checks=report.not_run_checks,
+                source_mutated=report.source_mutated,
+                classification_detail=_granular_classification(report, errors),
             )
         return VerificationResult(accepted=not errors, errors=tuple(errors), report=report)
 
@@ -301,18 +563,50 @@ class DeterministicVerifier:
         *,
         workspace: Path,
         contract: ExecutionContract,
+        request: VerificationRequest | None = None,
         candidate_id: str | None = None,
         candidate_manifest_sha256: str | None = None,
     ) -> tuple[VerificationReport, tuple[DomainError, ...]]:
         # The only acceptance criterion is the project's configured global
         # commands. A worker may freely create/edit/rename/delete files required
         # by its task; file diffs are never part of this acceptance decision.
+        if request is None:
+            request = verification_request_from_execution_contract(
+                contract=contract,
+                candidate_id=candidate_id,
+                candidate_manifest_sha256=candidate_manifest_sha256,
+            )
         baseline_sha = contract.baseline_manifest.sha256
+        pre_sha = _workspace_manifest_sha256(workspace)
         checks, check_errors = _run_contract_checks(workspace, contract)
+        # Measure the real source tree before and after the checks ran. Source
+        # mutation is a post-tree differing from the pre-verification tree;
+        # cache/build outputs excluded by snapshot rules are not tracked source.
+        # Plan 4A: never repeat the baseline digest as the candidate/post digest
+        # unless the actual source tree is unchanged by verification.
+        post_sha = _workspace_manifest_sha256(workspace)
+        not_run = sum(1 for check in checks if check.status == VERIFICATION_NOT_RUN_STATUS)
+        source_mutated = post_sha != pre_sha
         return VerificationReport(
-            VERIFICATION_REPORT_SCHEMA, None, baseline_sha,
-            baseline_sha, (), (), (), (), 0, checks,
-            candidate_id, candidate_manifest_sha256,
+            VERIFICATION_REPORT_SCHEMA_V2,
+            None,
+            baseline_sha,
+            post_sha,
+            (),
+            (),
+            (),
+            (),
+            0,
+            checks,
+            request.candidate_id,
+            request.candidate_manifest_sha256,
+            request.sha256,
+            request.command_policy_sha256,
+            request.project_image_identity,
+            request.environment_identity,
+            not_run,
+            source_mutated,
+            _granular_classification(None, check_errors, not_run=not_run, source_mutated=source_mutated),
         ), check_errors
 
     def _run_trusted_validations(
@@ -440,29 +734,109 @@ def _run_contract_checks(
             continue
         command = _as_command_line(check.argv)
         cwd = _contained_path(workspace, check.working_directory)
+        expected = check.expect.exit_code
+        started = _now_utc_iso()
         if cwd is None or not cwd.is_dir():
-            results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr="working directory unavailable"))
+            results.append(VerificationCheckResult(
+                check.id, "environment_error", check.argv,
+                stderr=_bounded_excerpt("working directory unavailable"),
+                working_directory=check.working_directory,
+                timeout_seconds=check.timeout_seconds,
+                expected_exit_code=expected,
+                started_at=started, ended_at=_now_utc_iso(),
+            ))
             errors.append(_error("verification.check_environment", f"Verification command {check.id!r} has no usable working directory: {check.working_directory!r}.", check.id))
             continue
         try:
+            started_ns = _monotonic_ns()
             completed = subprocess.run(check.argv, cwd=cwd, capture_output=True, text=True, timeout=check.timeout_seconds, check=False)
+            duration = _seconds_since(started_ns)
         except subprocess.TimeoutExpired as exc:
-            results.append(VerificationCheckResult(check.id, "timeout", check.argv, stdout=_as_text(exc.stdout), stderr=_as_text(exc.stderr)))
+            results.append(VerificationCheckResult(
+                check.id, "timeout", check.argv,
+                stdout=_bounded_excerpt(_as_text(exc.stdout)),
+                stderr=_bounded_excerpt(_as_text(exc.stderr)),
+                working_directory=check.working_directory,
+                timeout_seconds=check.timeout_seconds,
+                expected_exit_code=expected,
+                started_at=started, ended_at=_now_utc_iso(),
+                duration_seconds=_seconds_since(started_ns),
+            ))
             errors.append(_error("verification.check_timeout", f"Verification command {check.id!r} timed out after {check.timeout_seconds}s: {command}.", check.id))
             continue
         except OSError as exc:
-            results.append(VerificationCheckResult(check.id, "environment_error", check.argv, stderr=str(exc)))
+            results.append(VerificationCheckResult(
+                check.id, "environment_error", check.argv,
+                stderr=_bounded_excerpt(str(exc)),
+                working_directory=check.working_directory,
+                timeout_seconds=check.timeout_seconds,
+                expected_exit_code=expected,
+                started_at=started, ended_at=_now_utc_iso(),
+                duration_seconds=_seconds_since(started_ns),
+            ))
             errors.append(_error("verification.check_environment", f"Verification command {check.id!r} could not be found or run ({command}): {exc}", check.id))
             continue
-        expected = check.expect.exit_code
         stdout_ok = all(value in completed.stdout for value in check.expect.stdout_contains)
         stderr_ok = all(value in completed.stderr for value in check.expect.stderr_contains)
         passed = completed.returncode == expected and stdout_ok and stderr_ok
-        results.append(VerificationCheckResult(check.id, "passed" if passed else "failed", check.argv, completed.returncode, completed.stdout, completed.stderr))
+        results.append(VerificationCheckResult(
+            check.id, VERIFICATION_PASSED if passed else "failed", check.argv,
+            completed.returncode,
+            _bounded_excerpt(completed.stdout),
+            _bounded_excerpt(completed.stderr),
+            check.working_directory,
+            check.timeout_seconds,
+            expected,
+            started, _now_utc_iso(), duration,
+        ))
         if not passed:
             detail = _check_failure_detail(check.id, expected, completed, check.expect)
             errors.append(_error("verification.check_failed", detail, check.id))
     return tuple(results), tuple(errors)
+
+
+def _monotonic_ns() -> int:
+    import time
+    return time.monotonic_ns()
+
+
+def _seconds_since(started_ns: int) -> float:
+    import time
+    return max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000_000)
+
+
+def _now_utc_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _bounded_excerpt(value: str) -> str:
+    """Bound inline log excerpts; complete logs are retained as log artifacts."""
+    value = value or ""
+    if len(value) <= LOG_EXCERPT_CHARACTER_LIMIT:
+        return value
+    marker = f"\n[... {len(value) - LOG_EXCERPT_CHARACTER_LIMIT} characters omitted; full log retained as artifact]"
+    return value[: LOG_EXCERPT_CHARACTER_LIMIT - len(marker)] + marker
+
+
+def _workspace_manifest_sha256(workspace: Path) -> str:
+    """Real post-verification source digest of the workspace (or baseline-less "").
+
+    Used to stop a report from blindly repeating the baseline digest as the
+    candidate/post digest when the source tree actually changed.
+    """
+    snapshot = capture_repository_snapshot(workspace)
+    if snapshot.accepted and snapshot.snapshot is not None:
+        return snapshot.snapshot.baseline.sha256
+    return ""
+
+
+def _verification_incomplete_message(report: "VerificationReport") -> str:
+    if not report.checks:
+        return "Verification produced an empty report; an empty report is never success."
+    if report.not_run_checks:
+        return f"Verification left {report.not_run_checks} command(s) never run; never-run commands are not success."
+    return "Not every global command passed."
 
 
 def _as_command_line(argv: Sequence[str]) -> str:
@@ -508,6 +882,45 @@ def _failure_classification(errors: Sequence[DomainError]) -> str:
     if any(code.startswith("execution_contract") or code.startswith("verification.path") or code.startswith("verification.deletion") or code.startswith("verification.rename") or code.startswith("verification.max_files") or code.startswith("verification.changed_line_budget") for code in codes):
         return "contract_failure"
     return "implementation_failure"
+
+
+def _granular_classification(
+    report: "VerificationReport | None" = None,
+    errors: Sequence[DomainError] = (),
+    *,
+    not_run: int | None = None,
+    source_mutated: bool | None = None,
+) -> str | None:
+    """Granular outcome recorded separately from pass/fail (plan 4A).
+
+    Order of checks matters: source mutation and infrastructure interruption
+    dominate, then policy/environment/timeout, then failed behavior.
+    """
+    if report is not None and report.source_mutated:
+        return VERIFICATION_CLASSIFICATION_SOURCE_MUTATION
+    if source_mutated:
+        return VERIFICATION_CLASSIFICATION_SOURCE_MUTATION
+    not_run_count = report.not_run_checks if report is not None else not_run
+    if report is not None and not report.checks:
+        return VERIFICATION_CLASSIFICATION_INFRASTRUCTURE_INTERRUPTION
+    if not_run_count:
+        return VERIFICATION_CLASSIFICATION_INFRASTRUCTURE_INTERRUPTION
+    codes = {error.code for error in errors}
+    if "verification.source_mutation" in codes:
+        return VERIFICATION_CLASSIFICATION_SOURCE_MUTATION
+    if any(code.startswith("contract.") for code in codes):
+        return VERIFICATION_CLASSIFICATION_MALFORMED_POLICY
+    if any(code.startswith("verification.dependency") or code.startswith("verification.env_") or code in {"contract.check_environment"} for code in codes):
+        return VERIFICATION_CLASSIFICATION_DEPENDENCY_PREPARATION
+    if "verification.check_environment" in codes:
+        return VERIFICATION_CLASSIFICATION_ENVIRONMENT_UNAVAILABLE
+    if "verification.check_timeout" in codes:
+        return VERIFICATION_CLASSIFICATION_COMMAND_TIMEOUT
+    if "verification.incomplete" in codes:
+        return VERIFICATION_CLASSIFICATION_INFRASTRUCTURE_INTERRUPTION
+    if any(codes):
+        return VERIFICATION_CLASSIFICATION_FAILED_BEHAVIOR
+    return None
 
 
 def submission_from_mapping(payload: Mapping[str, object]) -> CompletionSubmission:

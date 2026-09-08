@@ -16,7 +16,7 @@ from .execution_contracts import (
     load_job_execution_contract,
 )
 from .prompt_versions import PROMPT_COMPILER_VERSION
-from .verifier import VERIFICATION_REPORT_SCHEMA
+from .verifier import VERIFICATION_REPORT_SCHEMA, VERIFICATION_REPORT_SCHEMA_V2
 
 # Inline prompt capacity is bounded in characters; workspace reference capacity
 # is bounded only by the frozen byte/bundle limits and is separate. Characters
@@ -159,7 +159,7 @@ def find_review_evidence(
             and frozen.contract is not None
             and frozen.contract.transition.to_state == from_state
             and isinstance(report, Mapping)
-            and report.get("schema") == VERIFICATION_REPORT_SCHEMA
+            and report.get("schema") in {VERIFICATION_REPORT_SCHEMA, VERIFICATION_REPORT_SCHEMA_V2}
             and report.get("baseline_sha256")
             == frozen.contract.baseline_manifest.sha256
         ):
