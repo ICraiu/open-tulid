@@ -74,6 +74,10 @@ class VerificationReport:
     renamed: tuple[tuple[str, str], ...] = ()
     changed_lines: int = 0
     checks: tuple[VerificationCheckResult, ...] = ()
+    # Identity of the sealed candidate this report verifies (plan 5, step 5B).
+    # A report is applicable only to its exact sealed candidate.
+    candidate_id: str | None = None
+    candidate_manifest_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -85,6 +89,8 @@ class VerificationReport:
                         "renamed": [{"from": old, "to": new} for old, new in self.renamed],
                         "changed_lines": self.changed_lines},
             "checks": [check.to_dict() for check in self.checks],
+            "candidate_id": self.candidate_id,
+            "candidate_manifest_sha256": self.candidate_manifest_sha256,
         }
 
 
@@ -108,6 +114,8 @@ class DeterministicVerifier:
         transition: TransitionDefinition,
         submission: CompletionSubmission,
         execution_contract: ExecutionContract | None = None,
+        candidate_id: str | None = None,
+        candidate_manifest_sha256: str | None = None,
     ) -> VerificationResult:
         errors: list[DomainError] = []
         report: VerificationReport | None = None
@@ -124,6 +132,8 @@ class DeterministicVerifier:
             report, enforcement_errors = self._enforce_execution_contract(
                 workspace=workspace,
                 contract=execution_contract,
+                candidate_id=candidate_id,
+                candidate_manifest_sha256=candidate_manifest_sha256,
             )
             errors.extend(enforcement_errors)
         output_root = output_dir or workspace / "output"
@@ -281,6 +291,8 @@ class DeterministicVerifier:
                 renamed=report.renamed,
                 changed_lines=report.changed_lines,
                 checks=report.checks,
+                candidate_id=report.candidate_id,
+                candidate_manifest_sha256=report.candidate_manifest_sha256,
             )
         return VerificationResult(accepted=not errors, errors=tuple(errors), report=report)
 
@@ -289,6 +301,8 @@ class DeterministicVerifier:
         *,
         workspace: Path,
         contract: ExecutionContract,
+        candidate_id: str | None = None,
+        candidate_manifest_sha256: str | None = None,
     ) -> tuple[VerificationReport, tuple[DomainError, ...]]:
         # The only acceptance criterion is the project's configured global
         # commands. A worker may freely create/edit/rename/delete files required
@@ -298,6 +312,7 @@ class DeterministicVerifier:
         return VerificationReport(
             VERIFICATION_REPORT_SCHEMA, None, baseline_sha,
             baseline_sha, (), (), (), (), 0, checks,
+            candidate_id, candidate_manifest_sha256,
         ), check_errors
 
     def _run_trusted_validations(

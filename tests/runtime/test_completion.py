@@ -398,6 +398,7 @@ def test_late_rejected_completion_does_not_resurrect_failed_job(tmp_path: Path):
     assert [event.event_type for event in events.iter_events()] == [
         EventType.ExecutionCompletionSubmitted,
         "ExecutionCompletionValidationStarted",
+        "ExecutionCompletionCandidateCaptured",
         "ExecutionCompletionValidationFinished",
         "ExecutionCompletionIgnored",
     ]

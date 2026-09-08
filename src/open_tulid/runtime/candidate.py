@@ -1,0 +1,378 @@
+"""Sealed candidate capture for a completion submission (plan 5, step 5B).
+
+When a completion submission passes authentication and deduplication, the
+submitted workspace is sealed into a Tulid-owned snapshot outside the active
+worker mount. The snapshot is checked for stability with before/after manifest
+comparisons before it becomes the verification target, so later workspace
+mutations cannot ride along with already-known-good bytes.
+
+The authoritative baseline-to-candidate delta is computed from the manifests,
+never from the worker's submitted ``changed_files`` list. A submitted list may
+explain intent and a stale/incomplete list produces a discrepancy note, but it
+cannot cause silent partial transport.
+
+Only 5B is implemented here: capture the stable candidate, seal it, compute the
+delta, support a genuine no-change candidate, and expose the candidate identity.
+Promotion, repository-lane acquisition, and acceptance transactions are owned by
+later steps (5C-5F).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
+
+from open_tulid.domain import DomainError
+from open_tulid.runtime.repository_facts import (
+    BASELINE_MANIFEST_SCHEMA,
+    FileManifestEntry,
+    BaselineManifest,
+    canonical_sha256,
+)
+
+
+CANDIDATE_SCHEMA = "tulid.candidate/v1"
+
+# Explicit snapshot rules: Tulid's own internal workspace files and known
+# ephemeral dependency/cache directories are never deliverables (plan 5A).
+# Intentional source under a name like `build`/`output`/`dist` is deliberately
+# NOT excluded by name, so a tracking of versioned source there is retained.
+CANDIDATE_EXCLUDED_DIRECTORY_NAMES = frozenset({
+    ".git",
+    ".open-tulid",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv",
+})
+
+# Change kinds modeled on the plan's change entry vocabulary. Renames are
+# represented safely as delete+add; rename detection is explanatory and never
+# determines whether bytes are transported.
+KIND_ADD = "add"
+KIND_EDIT = "edit"
+KIND_DELETE = "delete"
+
+
+@dataclass(frozen=True)
+class CandidateChange:
+    kind: str
+    path: str
+    before_sha256: str | None = None
+    after_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class Candidate:
+    schema: str
+    candidate_id: str
+    baseline_sha256: str | None
+    manifest_sha256: str
+    storage_path: str
+    changes: tuple[CandidateChange, ...]
+    submitted_changed_files: tuple[str, ...] = ()
+    submitted_discrepancy: str | None = None
+    sha256: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "candidate_id": self.candidate_id,
+            "baseline_sha256": self.baseline_sha256,
+            "manifest_sha256": self.manifest_sha256,
+            "storage_path": self.storage_path,
+            "changes": [
+                {
+                    "kind": change.kind,
+                    "path": change.path,
+                    "before_sha256": change.before_sha256,
+                    "after_sha256": change.after_sha256,
+                }
+                for change in self.changes
+            ],
+            "submitted_changed_files": list(self.submitted_changed_files),
+            "submitted_discrepancy": self.submitted_discrepancy,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class CapturedCandidate:
+    candidate: Candidate
+    storage_path: Path
+    manifest: BaselineManifest
+
+    @property
+    def identity(self) -> str:
+        return self.candidate.sha256
+
+
+@dataclass(frozen=True)
+class CaptureCandidateResult:
+    captured: CapturedCandidate | None = None
+    errors: tuple[DomainError, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return not self.errors
+
+
+def capture_candidate(
+    *,
+    workspace: Path,
+    storage_root: Path,
+    candidate_id: str,
+    baseline: BaselineManifest | None,
+    submitted_changed_files: tuple[str, ...] = (),
+) -> CaptureCandidateResult:
+    """Seal a stable snapshot of ``workspace`` into ``storage_root``.
+
+    A copy plus stable before/after manifest checks is used instead of assuming
+    copying a live directory is atomic. If the workspace changes while the copy
+    runs, or the stored copy does not match the workspace, the candidate is
+    rejected with a retriable error and the original workspace is preserved.
+    """
+    storage_root = Path(storage_root)
+    storage = storage_root / candidate_id
+    try:
+        pre = _deliverable_manifest(workspace)
+    except OSError as exc:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.capture_failed",
+            f"Cannot scan the workspace for candidate capture: {exc}",
+            location=str(workspace),
+        ),))
+    try:
+        if storage.exists():
+            shutil.rmtree(storage)
+        _copy_deliverables(workspace, storage)
+    except OSError as exc:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.capture_failed",
+            f"Cannot copy the candidate snapshot: {exc}",
+            location=str(storage),
+        ),))
+    try:
+        post = _deliverable_manifest(workspace)
+        stored = _deliverable_manifest(storage)
+    except OSError as exc:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.capture_failed",
+            f"Cannot re-scan the captured candidate: {exc}",
+            location=str(storage),
+        ),))
+
+    if post.sha256 != pre.sha256:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.unstable",
+            (
+                "The workspace changed while the candidate snapshot was being "
+                "captured. Retry the submission; the workspace is preserved."
+            ),
+            location=str(workspace),
+        ),))
+    if stored.sha256 != post.sha256:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.capture_failed",
+            (
+                "The stored candidate snapshot does not match the workspace. "
+                "Retry the submission; the workspace is preserved."
+            ),
+            location=str(storage),
+        ),))
+
+    changes = _compute_delta(baseline, post)
+    delta_paths = {change.path for change in changes}
+    submitted = tuple(sorted({Path(p).as_posix() for p in submitted_changed_files}))
+    discrepancy = _discrepancy_note(submitted, delta_paths)
+    candidate = Candidate(
+        schema=CANDIDATE_SCHEMA,
+        candidate_id=candidate_id,
+        baseline_sha256=baseline.sha256 if baseline is not None else None,
+        manifest_sha256=post.sha256,
+        storage_path=str(storage),
+        changes=changes,
+        submitted_changed_files=submitted,
+        submitted_discrepancy=discrepancy,
+    )
+    sealed = Candidate(
+        schema=candidate.schema,
+        candidate_id=candidate.candidate_id,
+        baseline_sha256=candidate.baseline_sha256,
+        manifest_sha256=candidate.manifest_sha256,
+        storage_path=candidate.storage_path,
+        changes=candidate.changes,
+        submitted_changed_files=candidate.submitted_changed_files,
+        submitted_discrepancy=candidate.submitted_discrepancy,
+        sha256=canonical_sha256(_candidate_body(candidate)),
+    )
+    try:
+        _write_json(storage_root / f"{candidate_id}.candidate.json", sealed.to_dict())
+    except OSError:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.capture_failed",
+            "Cannot persist the sealed candidate record.",
+            location=str(storage_root),
+        ),))
+    if post.sha256 != _deliverable_manifest(workspace).sha256:
+        # The workspace mutated after the sealed snapshot was confirmed but
+        # before the record was written; do not accept a now-stale seal.
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.unstable",
+            (
+                "The workspace changed while the candidate was being sealed. "
+                "Retry the submission; the workspace is preserved."
+            ),
+            location=str(workspace),
+        ),))
+    return CaptureCandidateResult(captured=CapturedCandidate(
+        candidate=sealed,
+        storage_path=storage,
+        manifest=post,
+    ))
+
+
+def _deliverable_manifest(root: Path) -> BaselineManifest:
+    entries: list[FileManifestEntry] = []
+    for path in _walk_deliverables(root):
+        relative = path.relative_to(root).as_posix()
+        entries.append(FileManifestEntry(
+            path=relative,
+            sha256=_file_sha256(path),
+            size=path.stat().st_size,
+        ))
+    ordered = tuple(sorted(entries, key=lambda entry: entry.path))
+    payload = {
+        "schema": BASELINE_MANIFEST_SCHEMA,
+        "entries": [
+            {"path": entry.path, "sha256": entry.sha256, "size": entry.size}
+            for entry in ordered
+        ],
+    }
+    return BaselineManifest(
+        schema=BASELINE_MANIFEST_SCHEMA,
+        entries=ordered,
+        sha256=canonical_sha256(payload),
+    )
+
+
+def _walk_deliverables(root: Path):
+    import os
+    for current, directory_names, file_names in os.walk(root):
+        directory_names[:] = sorted(
+            name for name in directory_names if name not in CANDIDATE_EXCLUDED_DIRECTORY_NAMES
+        )
+        current_path = Path(current)
+        for file_name in sorted(file_names):
+            path = current_path / file_name
+            if path.is_file() or path.is_symlink():
+                yield path
+
+
+def _copy_deliverables(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if child.name in CANDIDATE_EXCLUDED_DIRECTORY_NAMES:
+            continue
+        destination = target / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(
+                child,
+                destination,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(*CANDIDATE_EXCLUDED_DIRECTORY_NAMES),
+            )
+        else:
+            shutil.copy2(child, destination, follow_symlinks=True)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compute_delta(
+    baseline: BaselineManifest | None,
+    candidate: BaselineManifest,
+) -> tuple[CandidateChange, ...]:
+    before = {} if baseline is None else {entry.path: entry for entry in baseline.entries}
+    after = {entry.path: entry for entry in candidate.entries}
+    changes: list[CandidateChange] = []
+    for path in sorted(set(after) - set(before)):
+        entry = after[path]
+        changes.append(CandidateChange(KIND_ADD, path, None, entry.sha256))
+    for path in sorted(set(before) - set(after)):
+        entry = before[path]
+        changes.append(CandidateChange(KIND_DELETE, path, entry.sha256, None))
+    for path in sorted(set(before) & set(after)):
+        if before[path].sha256 != after[path].sha256:
+            changes.append(CandidateChange(
+                KIND_EDIT,
+                path,
+                before[path].sha256,
+                after[path].sha256,
+            ))
+    return tuple(changes)
+
+
+def _discrepancy_note(
+    submitted: tuple[str, ...],
+    delta_paths: set[str],
+) -> str | None:
+    submitted_set = set(submitted)
+    if submitted_set == delta_paths:
+        return None
+    missing = sorted(delta_paths - submitted_set)
+    extra = sorted(submitted_set - delta_paths)
+    parts = []
+    if missing:
+        parts.append("missing from the submitted list: " + ", ".join(missing))
+    if extra:
+        parts.append("submitted but not changed: " + ", ".join(extra))
+    return "Submitted changed-file list differs from the authoritative candidate delta (" + "; ".join(parts) + ")."
+
+
+def _candidate_body(candidate: Candidate) -> dict[str, object]:
+    return {
+        "schema": candidate.schema,
+        "candidate_id": candidate.candidate_id,
+        "baseline_sha256": candidate.baseline_sha256,
+        "manifest_sha256": candidate.manifest_sha256,
+        "changes": [
+            {
+                "kind": change.kind,
+                "path": change.path,
+                "before_sha256": change.before_sha256,
+                "after_sha256": change.after_sha256,
+            }
+            for change in candidate.changes
+        ],
+        "submitted_changed_files": list(candidate.submitted_changed_files),
+        "submitted_discrepancy": candidate.submitted_discrepancy,
+    }
+
+
+def _write_json(path: Path, payload: Mapping[str, object]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _candidate_error(code: str, message: str, location: str | None = None) -> DomainError:
+    return DomainError(code=code, message=message, location=location)

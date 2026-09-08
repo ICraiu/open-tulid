@@ -29,6 +29,7 @@ from .verifier import (
     normalize_artifacts,
 )
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
+from .candidate import capture_candidate
 
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -65,6 +66,7 @@ class CompletionService:
         artifact_root: Path | None = None,
         repo_root: Path | None = None,
         repo_command_runner: object | None = None,
+        candidate_root: Path | None = None,
         verifier: DeterministicVerifier | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
@@ -78,6 +80,7 @@ class CompletionService:
         self.artifact_root = artifact_root
         self.repo_root = repo_root
         self.repo_command_runner = repo_command_runner
+        self.candidate_root = candidate_root
         self.verifier = verifier or DeterministicVerifier(
             artifact_templates={
                 artifact_id: artifact.template
@@ -223,6 +226,37 @@ class CompletionService:
                 "artifact_count": len(submission.artifacts),
             },
         ))
+        captured = self._capture_completion_candidate(
+            job=job,
+            baseline=frozen.contract.baseline_manifest if frozen.contract is not None else None,
+            submission_id=submission_id,
+            submission=submission,
+        )
+        if not captured.accepted:
+            return self._reject_candidate_capture(
+                job=job,
+                submission_id=submission_id,
+                errors=captured.errors,
+            )
+        candidate = captured.captured.candidate
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="completion-verifier"),
+            event_type="ExecutionCompletionCandidateCaptured",
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            submission_id=submission_id,
+            data={
+                "candidate_id": candidate.candidate_id,
+                "candidate_sha256": candidate.sha256,
+                "manifest_sha256": candidate.manifest_sha256,
+                "change_count": len(candidate.changes),
+                "changed_files": [change.path for change in candidate.changes],
+                "submitted_discrepancy": candidate.submitted_discrepancy,
+            },
+        ))
         try:
             verification = self.verifier.verify(
                 workspace=Path(job.workspace_path),
@@ -230,6 +264,8 @@ class CompletionService:
                 transition=transition,
                 submission=submission,
                 execution_contract=frozen.contract,
+                candidate_id=candidate.candidate_id,
+                candidate_manifest_sha256=candidate.manifest_sha256,
             )
         except Exception as exc:
             duration_seconds = round(time.monotonic() - validation_started, 3)
@@ -611,6 +647,100 @@ class CompletionService:
                 **({"verification_report": dict(verification_report)} if verification_report is not None else {}),
             },
         )
+
+    def _capture_completion_candidate(
+        self,
+        *,
+        job,
+        baseline,
+        submission_id: str,
+        submission: CompletionSubmission,
+    ):
+        storage_root = self.candidate_root
+        if storage_root is None:
+            storage_root = Path(job.workspace_path).parent / ".candidates"
+        candidate_id = submission_id
+        result = capture_candidate(
+            workspace=Path(job.workspace_path),
+            storage_root=storage_root,
+            candidate_id=candidate_id,
+            baseline=baseline,
+            submitted_changed_files=submission.changed_files,
+        )
+        if not result.accepted or result.captured is None:
+            return result
+        candidate = result.captured.candidate
+        current = self.job_store.get(job.job_id)
+        current_status = current.job.status if current.accepted and current.job is not None else job.status
+        self.job_store.update_status(
+            job.job_id,
+            current_status,
+            metadata={
+                "active_candidate_id": candidate.candidate_id,
+                "active_candidate_sha256": candidate.sha256,
+                "active_candidate_manifest_sha256": candidate.manifest_sha256,
+                "active_candidate_storage_path": candidate.storage_path,
+                "active_candidate_changes": tuple(
+                    {
+                        "kind": change.kind,
+                        "path": change.path,
+                        "before_sha256": change.before_sha256,
+                        "after_sha256": change.after_sha256,
+                    }
+                    for change in candidate.changes
+                ),
+                "active_candidate_submitted_discrepancy": candidate.submitted_discrepancy,
+            },
+        )
+        return result
+
+    def _reject_candidate_capture(
+        self,
+        *,
+        job,
+        submission_id: str,
+        errors: tuple[DomainError, ...],
+    ) -> CompletionResult:
+        current = self.job_store.get(job.job_id)
+        metadata = current.job.metadata if current.accepted and current.job is not None else job.metadata
+        repair_history = list(metadata.get("repair_history", ()))
+        repair_history.append({
+            "submission_id": submission_id,
+            "classification": "candidate_capture",
+            "error_codes": [error.code for error in errors],
+            "repair_ready": True,
+            "retry_reason": "candidate_capture_failed",
+        })
+        self.job_store.update_status(
+            job.job_id,
+            ExecutionJobStatus.COMPLETION_REJECTED,
+            metadata={
+                "last_verification": "Candidate could not be captured stably.",
+                "repair_ready": True,
+                "repair_blocked_reason": None,
+                "retry_reason": "candidate_capture_failed",
+                "repair_history": tuple(repair_history),
+                "candidate_capture_errors": tuple(error.code for error in errors),
+                "completion_submissions": _record_submission(
+                    metadata,
+                    submission_id,
+                    accepted=False,
+                    feedback=tuple(_error_to_dict(error) for error in errors),
+                ),
+            },
+        )
+        self.event_store.append(build_event(
+            project_id=job.project_id,
+            actor=EventActor(type="system", id="completion-verifier"),
+            event_type=EventType.ExecutionCompletionRejected,
+            correlation_id=job.job_id,
+            task_id=job.task_id,
+            job_id=job.job_id,
+            transition_id=job.transition_id,
+            submission_id=submission_id,
+            data={"feedback": [_error_to_dict(error) for error in errors]},
+        ))
+        return CompletionResult(False, errors=errors)
 
     def _existing_task_ids(self, task_id: str) -> tuple[tuple[str, ...], tuple[DomainError, ...]]:
         loaded = self.adapter.load_project()
