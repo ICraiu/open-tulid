@@ -25,6 +25,7 @@ from .resources import FileResourceLeaseStore
 from .task_manager import CreateExecutionJob, TaskManager
 from .transactions import FileTransactionRuntime
 from .attempts import attempt_records_from_metadata, count_consumed_attempts, task_semantic_revision
+from .context import load_parent_tasks, resolve_source_content_identities
 from .failures import failure_from_metadata
 
 
@@ -214,7 +215,10 @@ class Scheduler:
                 ))
                 continue
 
-            revision = task_semantic_revision(task)
+            revision = task_semantic_revision(
+                task,
+                source_identities=self._source_identities_for(task, transition),
+            )
             cause_error = _retry_blocked_by_cause(
                 self.job_store,
                 project_id,
@@ -361,6 +365,25 @@ class Scheduler:
     @property
     def _transactional_creation_enabled(self) -> bool:
         return self.event_store is not None and self.journal_store is not None
+
+    def _source_identities_for(self, task, transition) -> tuple:
+        """Selected required source-content identities for the current task.
+
+        Resolves the same linked context a job would freeze at creation so the
+        semantic task revision reflects the task's required specification,
+        canonical answer lineage, and binding generated contract at scheduling
+        time. A resolution failure yields no identities; job creation still
+        surfaces that failure through its own validation.
+        """
+        if self.project_root is None or self.adapter is None:
+            return ()
+        parent_tasks = load_parent_tasks(self.adapter, task)
+        return resolve_source_content_identities(
+            project_root=self.project_root,
+            task=task,
+            transition=transition,
+            parent_tasks=parent_tasks,
+        )
 
     def _create_job(self, manager: TaskManager, command: CreateExecutionJob):
         created = manager.handle(command)

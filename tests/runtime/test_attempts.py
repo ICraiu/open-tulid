@@ -134,6 +134,38 @@ def test_semantic_revision_changes_on_dependency_change():
     assert task_semantic_revision(base) != task_semantic_revision(changed)
 
 
+def test_semantic_revision_changes_when_required_source_content_changes():
+    src = ("spec/implement.md", "abc".ljust(64, "0"))
+    changed_src = ("spec/implement.md", "def".ljust(64, "0"))
+    assert task_semantic_revision(_task(), source_identities=[src]) != task_semantic_revision(
+        _task(), source_identities=[changed_src]
+    )
+
+
+def test_semantic_revision_normalizes_source_identity_order_and_deduplication():
+    source_a = ("spec/a.md", "aaa".ljust(64, "0"))
+    source_b = ("spec/b.md", "bbb".ljust(64, "0"))
+    forward = task_semantic_revision(
+        _task(),
+        source_identities=[source_a, source_b],
+    )
+    reversed_back = task_semantic_revision(
+        _task(),
+        source_identities=[source_b, source_a],
+    )
+    deduped = task_semantic_revision(
+        _task(),
+        source_identities=[source_a, source_b, source_a],
+    )
+    assert forward == reversed_back == deduped
+
+
+def test_semantic_revision_empty_source_preserves_legacy_identity():
+    legacy = task_semantic_revision(_task())
+    assert task_semantic_revision(_task(), source_identities=[]) == legacy
+    assert task_semantic_revision(_task(), source_identities=["not-a-pair"]) == legacy
+
+
 def test_attempt_record_round_trips_through_dict():
     payload = attempt_record_to_dict(_record(status="ended"))
     payload["ended_at"] = "2026-09-07T12:00:00+00:00"

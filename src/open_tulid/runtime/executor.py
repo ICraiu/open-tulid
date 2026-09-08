@@ -30,6 +30,7 @@ from open_tulid.runtime.events import JsonlEventStore, TransactionJournalStore, 
 from open_tulid.runtime.execution_contracts import (
     ExecutionContract,
     load_job_execution_contract,
+    source_content_identities,
 )
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
@@ -391,6 +392,9 @@ class JobExecutor:
                 job,
                 execution_task,
                 workspace=prepared.workspace,
+                source_identities=source_content_identities(frozen.contract)
+                if frozen.contract is not None
+                else (),
             )
             settled_attempt_id = attempt_record.attempt_id
             self.job_store.update_status(
@@ -525,7 +529,15 @@ class JobExecutor:
                     and repaired.job is not None
                     and repaired.job.metadata.get("repair_ready") is True
                 ):
-                    if self._repair_within_total_account(job, execution_task):
+                    if self._repair_within_total_account(
+                        job,
+                        execution_task,
+                        source_identities=(
+                            source_content_identities(frozen.contract)
+                            if frozen.contract is not None
+                            else ()
+                        ),
+                    ):
                         # A rejected completion is feedback, not task completion.
                         # Restart the same frozen job in its preserved workspace so
                         # the worker receives the structured repair packet and can
@@ -534,7 +546,13 @@ class JobExecutor:
                     # The durable total attempt account is exhausted; a repair
                     # would exceed the bounded budget, so settle the job instead
                     # of starting another worker process.
-                    self._fail_at_total_attempt_bound(job, revision=task_semantic_revision(execution_task))
+                    self._fail_at_total_attempt_bound(
+                        job,
+                        revision=self._task_revision(
+                            execution_task,
+                            contract=frozen.contract,
+                        ),
+                    )
                 return ExecutorRunResult(True, run=result)
             if status_after_run in {
                 ExecutionJobStatus.FAILED.value,
@@ -582,7 +600,7 @@ class JobExecutor:
                 else:
                     self.model_proxy_sessions.revoke_job(job.job_id)
 
-    def _admit_attempt(self, job, task, *, workspace: Path) -> AttemptRecord:
+    def _admit_attempt(self, job, task, *, workspace: Path, source_identities=()) -> AttemptRecord:
         """Persist a versioned attempt admission before spawning the worker.
 
         The record is written under the already-held lease/store coordination
@@ -601,7 +619,7 @@ class JobExecutor:
             attempt_id=attempt_id,
             job_id=job.job_id,
             attempt_number=attempt_number,
-            task_revision=task_semantic_revision(task),
+            task_revision=self._task_revision(task, source_identities=source_identities),
             transition_id=job.transition_id,
             worker_id=job.worker_id,
             predecessor=predecessor,
@@ -729,7 +747,12 @@ class JobExecutor:
     def total_attempt_limit(self) -> int:
         return int(getattr(self.runtime, "max_total_attempts_per_transition", 0))
 
-    def _consumed_attempts(self, job, task) -> int:
+    def _task_revision(self, task, *, source_identities=(), contract=None) -> str:
+        if contract is not None:
+            source_identities = source_content_identities(contract)
+        return task_semantic_revision(task, source_identities=source_identities)
+
+    def _consumed_attempts(self, job, task, *, source_identities=()) -> int:
         listed = self.job_store.list()
         if not listed.accepted:
             return 0
@@ -738,10 +761,10 @@ class JobExecutor:
             project_id=job.project_id,
             task_id=job.task_id,
             transition_id=job.transition_id,
-            task_revision=task_semantic_revision(task),
+            task_revision=self._task_revision(task, source_identities=source_identities),
         )
 
-    def _repair_within_total_account(self, job, task) -> bool:
+    def _repair_within_total_account(self, job, task, *, source_identities=()) -> bool:
         """A repair may start only while the durable total account has room.
 
         The account counts every persisted admission across jobs for the task
@@ -751,7 +774,7 @@ class JobExecutor:
         total = self.total_attempt_limit()
         if total <= 0:
             return True
-        return self._consumed_attempts(job, task) < total
+        return self._consumed_attempts(job, task, source_identities=source_identities) < total
 
     def _fail_at_total_attempt_bound(self, job, *, revision: str) -> None:
         total = self.total_attempt_limit()

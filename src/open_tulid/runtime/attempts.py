@@ -76,12 +76,23 @@ class AttemptRecord:
         return self.status.value if isinstance(self.status, AttemptStatus) else str(self.status)
 
 
-def task_semantic_revision(task: Task) -> str:
+def task_semantic_revision(
+    task: Task,
+    *,
+    source_identities: Iterable[tuple[str, str]] = (),
+) -> str:
     """A stable semantic revision for a task's required work.
 
     The revision is derived from the task type, dependency identities, parent
-    identity, the concrete-outcome title, and the meaningful body sections. It
-    excludes the task ``id``/``path`` (board location), ``current_state``
+    identity, the concrete-outcome title, the meaningful body sections, and the
+    identities (original reference plus content digest) of the selected required
+    source content the task depends on: its specification, settled canonical
+    answers, and any binding generated contract. If that source content changes,
+    the revision is an explicit new identity, so old attempts keep their original
+    revision and remain inspectable while a re-authored task starts a fresh
+    attempt budget.
+
+    It excludes the task ``id``/``path`` (board location), ``current_state``
     (workflow state), ``artifact_links`` (generated audit links), and
     ``metadata`` (timestamps and machine bookkeeping), so those changes do not
     renew the retry budget.
@@ -95,6 +106,12 @@ def task_semantic_revision(task: Task) -> str:
         "dependencies": sorted(task.dependencies),
         "body": _semantic_body_sections(task.body),
     }
+    normalized = _normalized_source_identities(source_identities)
+    if normalized:
+        # Required source content influences the revision only when such content
+        # is selected. This also keeps the no-source path byte-identical with the
+        # pre-3B revision so legacy attempts keep their original identity.
+        payload["source_content"] = normalized
     return _canonical_sha256(payload)
 
 
@@ -287,6 +304,38 @@ def _clean_section(lines: list[str]) -> str:
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text
+
+
+def _normalized_source_identities(
+    source_identities: Iterable[tuple[str, str]],
+) -> tuple[tuple[str, str], ...]:
+    """Deduplicate and canonically order ``(ref, sha256)`` source identities.
+
+    Content stored once while referenced by several links is folded to a single
+    identity, and ordering is deterministic so a relisting of the same required
+    sources never changes the revision.
+    """
+    unique: dict[str, set[str]] = {}
+    for identity in source_identities:
+        if not _is_string_pair(identity):
+            continue
+        ref, sha256 = identity
+        ref = str(ref).strip()
+        sha256 = str(sha256).strip()
+        if not ref or not sha256:
+            continue
+        unique.setdefault(sha256, set()).add(ref)
+    ordered: list[tuple[str, str]] = []
+    for sha256 in sorted(unique):
+        for ref in sorted(unique[sha256]):
+            ordered.append((ref, sha256))
+    return tuple(ordered)
+
+
+def _is_string_pair(value: object) -> bool:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return False
+    return all(isinstance(part, str) for part in value)
 
 
 def _canonical_sha256(payload: object) -> str:

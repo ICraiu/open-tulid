@@ -328,6 +328,41 @@ def _render_context_document(document: ContextDocument) -> str:
     )
 
 
+def resolve_source_content_identities(
+    *,
+    project_root: Path,
+    task: Task,
+    transition: TransitionDefinition,
+    parent_tasks: tuple[Task, ...] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Original reference plus content digest for the task's required sources.
+
+    Resolves the same linked context a job freezes at creation — the source
+    specification, the canonical question-round answer lineage in precedence
+    order, and any binding generated contract — and returns ``(ref, sha256)``
+    identities for the required sources only. Required background discovered by
+    wiki links is excluded. Used at scheduling time to derive the current
+    semantic task revision so a change to the required source content produces
+    an explicit new revision.
+
+    A resolution failure yields no identities rather than blocking the scheduler
+    gate; such a failure still surfaces through job creation's own validation.
+    """
+    resolver = LinkedContextResolver(project_root)
+    result = resolver.build_context_packet(
+        task_for_context(task, transition),
+        parent_tasks=parent_tasks,
+    )
+    if not result.accepted or result.packet is None:
+        return ()
+    identities: set[tuple[str, str]] = set()
+    for document in result.packet.documents:
+        if not document.required:
+            continue
+        identities.add((document.ref or document.path.as_posix(), document.sha256))
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
 def load_parent_tasks(adapter, task: Task) -> tuple[Task, ...]:
     """Load the task's ancestor lineage, original idea first.
 

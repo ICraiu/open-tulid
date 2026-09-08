@@ -39,6 +39,7 @@ from open_tulid.runtime import (
     render_execution_prompt,
     task_semantic_revision,
 )
+from open_tulid.runtime.context import resolve_source_content_identities
 from open_tulid.runtime.observability import WorkerObservability
 from open_tulid.runtime.execution_contracts import (
     GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA,
@@ -1427,6 +1428,72 @@ def test_scheduler_allows_schedule_below_total_bound(tmp_path: Path):
     assert result.accepted is True
     assert result.scheduled is True
     assert result.job is not None
+
+
+def test_scheduler_renews_budget_when_required_source_content_changes(tmp_path: Path):
+    # A change to the task's required source content (its spec) is an explicit
+    # new semantic revision: old attempts keep their original identity, so a
+    # source decision change starts a fresh attempt budget rather than exhausting
+    # the durable account.
+    spec_dir = tmp_path / "artifacts"
+    spec_dir.mkdir()
+    spec = spec_dir / "spec.md"
+    spec.write_text("Version one.\n", encoding="utf-8")
+
+    task = Task(
+        id=TASK_ID,
+        title="Implement thing",
+        path="tasks/thing.md",
+        current_state="Todo",
+        task_type="task",
+        artifact_links=("artifacts/spec.md",),
+    )
+    snapshot = _snapshot(task)
+    transition = _workflow().transitions["implement"]
+
+    def current_revision() -> str:
+        return task_semantic_revision(
+            task,
+            source_identities=resolve_source_content_identities(
+                project_root=tmp_path,
+                task=task,
+                transition=transition,
+            ),
+        )
+
+    revision_one = current_revision()
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    _failed_job_with_attempts(
+        store, job_id="01J00000000000000000000A00", revision=revision_one,
+        attempt_numbers=(1, 2), metadata={"updated_at": now},
+    )
+
+    def scheduler() -> Scheduler:
+        return Scheduler(
+            workflow=_workflow(),
+            adapter=FakeAdapter(snapshot),
+            job_store=store,
+            workspace_root=tmp_path / "workspaces",
+            project_root=tmp_path,
+            repo_root=tmp_path,
+            failed_job_backoff_seconds=0,
+            max_total_attempts_per_transition=2,
+        )
+
+    # Two attempts already consumed for revision one: no room within the bound of
+    # two, so scheduling stops.
+    exhausted = scheduler().schedule_one("Agent")
+    assert exhausted.accepted is True
+    assert exhausted.scheduled is False
+    assert exhausted.skipped[0].code == "job.total_attempt_limit_reached"
+
+    # The spec changes -> a new semantic revision -> the durable account is not
+    # renewably exhausted; the task may be scheduled under a fresh budget.
+    spec.write_text("Version two, changed.\n", encoding="utf-8")
+    renewed = scheduler().schedule_one("Agent")
+    assert renewed.accepted is True
+    assert renewed.scheduled is True
 
 
 def test_scheduler_stops_on_non_retryable_classified_failure(tmp_path: Path):

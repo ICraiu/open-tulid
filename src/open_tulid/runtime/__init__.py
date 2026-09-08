@@ -49,6 +49,7 @@ from .execution_contracts import (
     compile_task_execution_contract,
     execution_contract_to_dict,
     load_job_execution_contract,
+    source_content_identities,
 )
 from .repository_facts import (
     BASELINE_MANIFEST_SCHEMA,
@@ -80,7 +81,12 @@ from .instructions import (
     PromptPacket,
     PromptPacketResult,
 )
-from .context import LinkedContextResolver, load_parent_tasks, task_for_context
+from .context import (
+    LinkedContextResolver,
+    load_parent_tasks,
+    resolve_source_content_identities,
+    task_for_context,
+)
 from .prompts import (
     CompiledPrompt,
     PromptManifest,
@@ -219,6 +225,7 @@ __all__ = [
     "compile_task_execution_contract",
     "execution_contract_to_dict",
     "load_job_execution_contract",
+    "source_content_identities",
     "BASELINE_MANIFEST_SCHEMA",
     "REPOSITORY_FACTS_SCHEMA",
     "BaselineManifest",
@@ -243,6 +250,7 @@ __all__ = [
     "PromptPacketResult",
     "LinkedContextResolver",
     "load_parent_tasks",
+    "resolve_source_content_identities",
     "task_for_context",
     "CompiledPrompt",
     "PromptManifest",

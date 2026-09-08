@@ -154,6 +154,26 @@ class ExecutionContractResult:
         return not self.errors
 
 
+def source_content_identities(contract: ExecutionContract) -> tuple[tuple[str, str], ...]:
+    """Original reference plus content digest for each required frozen source.
+
+    The returned ``(ref, sha256)`` identities are the ``selected required source
+    content`` a task depends on: its specification, canonical answers, and any
+    binding generated contract that were frozen at job creation. Unrequired
+    background references discovered by wiki links are excluded so a worker's
+    optional reading never alters the semantic revision. Identities are deduped
+    and canonically ordered for a stable task revision.
+    """
+    identities: set[tuple[str, str]] = set()
+    for context_file in contract.context_files:
+        if not context_file.required:
+            continue
+        refs = context_file.refs or (context_file.source_paths or ("[reference]",))
+        for ref in refs:
+            identities.add((ref, context_file.sha256))
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
+
+
 def compile_standard_execution_contract(
     *,
     project_root: Path,

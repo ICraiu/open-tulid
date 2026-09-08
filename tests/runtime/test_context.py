@@ -11,6 +11,7 @@ from open_tulid.domain import (
 from open_tulid.runtime.context import (
     LinkedContextResolver,
     load_parent_tasks,
+    resolve_source_content_identities,
     task_for_context,
 )
 
@@ -361,3 +362,66 @@ def test_task_for_context_excludes_artifacts_the_transition_requires_or_derives(
     assert required_link not in filtered.artifact_links
     assert derived_link not in filtered.artifact_links
     assert "docs/spec.md" in filtered.artifact_links
+
+
+def _transition(*, task_type: str = "task") -> TransitionDefinition:
+    return TransitionDefinition(
+        id="implement",
+        task_type=task_type,
+        from_state="Todo",
+        to_state="Review",
+        worker="codex",
+        requires=RequirementDefinition(),
+        transaction=None,
+    )
+
+
+def test_resolve_source_content_identities_includes_required_and_excludes_optional(tmp_path: Path):
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "artifacts" / "spec.md").write_text("Spec body.\n", encoding="utf-8")
+    (tmp_path / "docs" / "background.md").write_text("Optional detail.\n", encoding="utf-8")
+
+    task = _task(
+        artifact_links=("artifacts/spec.md",),
+        body="See [[background]].",
+    )
+    identities = resolve_source_content_identities(
+        project_root=tmp_path,
+        task=task,
+        transition=_transition(),
+    )
+
+    refs = {ref for ref, _ in identities}
+    assert "artifacts/spec.md" in refs
+    assert "background" not in refs
+
+
+def test_resolve_source_content_identities_change_with_content(tmp_path: Path):
+    (tmp_path / "artifacts").mkdir()
+    spec = tmp_path / "artifacts" / "spec.md"
+    spec.write_text("Version one.\n", encoding="utf-8")
+    before = resolve_source_content_identities(
+        project_root=tmp_path,
+        task=_task(artifact_links=("artifacts/spec.md",)),
+        transition=_transition(),
+    )
+
+    spec.write_text("Version two, changed.\n", encoding="utf-8")
+    after = resolve_source_content_identities(
+        project_root=tmp_path,
+        task=_task(artifact_links=("artifacts/spec.md",)),
+        transition=_transition(),
+    )
+
+    assert before != after
+    assert {ref for ref, _ in before} == {ref for ref, _ in after}
+
+
+def test_resolve_source_content_identities_is_empty_when_resolution_fails(tmp_path: Path):
+    identities = resolve_source_content_identities(
+        project_root=tmp_path,
+        task=_task(artifact_links=("artifacts/missing.md",)),
+        transition=_transition(),
+    )
+    assert identities == ()
