@@ -1054,35 +1054,71 @@ def _derived_task_plan(
     if transition.derives is None:
         return (), ()
     selected = tuple(artifact for artifact in artifacts if artifact.type == transition.derives.artifact_type)
-    parsed: list[tuple[str, str, tuple[str, ...], str, str | None]] = []
+    source_links = promoted_artifact_links or {}
+
+    # Validate the entire batch before any task, board card, parent link, or
+    # artifact is promoted. Persisted IDs are allocated only after every child
+    # artifact validates, so a rejected batch leaves the tracker and board
+    # untouched.
+    parsed: list[tuple[str, str, tuple[str, ...], str, str, str | None]] = []
     errors: list[DomainError] = []
     local_ids: set[str] = set()
-    source_links = promoted_artifact_links or {}
+    seen_paths: set[str] = set()
     for artifact in selected:
         path = output_dir / artifact.path
+        if artifact.path in seen_paths:
+            errors.append(_error(
+                "task.derived_duplicate_path",
+                f"Duplicate derived task artifact path: {artifact.path}",
+                artifact.path,
+            ))
+        seen_paths.add(artifact.path)
         try:
             local_id, title, dependencies, body = _parse_derived_task_file(path)
         except ValueError as exc:
             errors.append(_error("task.derived_invalid", str(exc), artifact.path))
             continue
-        if local_id in local_ids:
-            errors.append(_error("task.derived_duplicate_local_id", f"Duplicate derived task local_id: {local_id}", local_id))
-        local_ids.add(local_id)
-        source_link = source_links.get((artifact.type, artifact.path))
-        parsed.append((local_id, title, dependencies, body, source_link))
-    if errors:
-        return (), tuple(errors)
-    ids = _allocate_numeric_task_ids(tuple(local_id for local_id, *_ in parsed), existing_task_ids)
-    planned: list[Mapping[str, object]] = []
-    for local_id, title, dependencies, body, source_link in parsed:
-        unknown = tuple(dep for dep in dependencies if dep not in ids)
-        if unknown:
+        except OSError as exc:
             errors.append(_error(
-                "task.derived_unknown_dependency",
-                f"Derived task {local_id!r} references unknown local dependencies: {', '.join(unknown)}",
-                local_id,
+                "task.derived_source_unreadable",
+                f"Derived task source is not readable: {exc}",
+                artifact.path,
             ))
             continue
+        if local_id in local_ids:
+            errors.append(_error(
+                "task.derived_duplicate_local_id",
+                f"Duplicate derived task local_id: {local_id}",
+                local_id,
+            ))
+        local_ids.add(local_id)
+        source_link = source_links.get((artifact.type, artifact.path))
+        parsed.append((local_id, title, dependencies, body, artifact.path, source_link))
+    if errors:
+        return (), tuple(errors)
+
+    by_local_id = {item[0]: item for item in parsed}
+    for local_id, _title, dependencies, _body, _path, _link in parsed:
+        for dep in dependencies:
+            if dep == local_id:
+                errors.append(_error(
+                    "task.derived_self_dependency",
+                    f"Derived task {local_id!r} must not depend on itself.",
+                    local_id,
+                ))
+            elif dep not in by_local_id:
+                errors.append(_error(
+                    "task.derived_unknown_dependency",
+                    f"Derived task {local_id!r} references unknown local dependency: {dep}",
+                    local_id,
+                ))
+    errors.extend(_derived_cycle_errors(tuple(item[0] for item in parsed), by_local_id))
+    if errors:
+        return (), tuple(errors)
+
+    ids = _allocate_numeric_task_ids(tuple(item[0] for item in parsed), existing_task_ids)
+    planned: list[Mapping[str, object]] = []
+    for local_id, title, dependencies, body, _path, source_link in parsed:
         task_id = ids[local_id]
         task = Task(
             id=task_id,
@@ -1097,6 +1133,43 @@ def _derived_task_plan(
         )
         planned.append({"task": task, "link": f"{task_id}-{_slugify(title)}"})
     return tuple(planned), tuple(errors)
+
+
+def _derived_cycle_errors(
+    local_ids: tuple[str, ...],
+    by_local_id: Mapping[str, tuple[str, str, tuple[str, ...], str, str, str | None]],
+) -> tuple[DomainError, ...]:
+    errors: list[DomainError] = []
+    visited: set[str] = set()
+    stack: list[str] = []
+    on_stack: set[str] = set()
+
+    def _deps(node: str) -> tuple[str, ...]:
+        return by_local_id[node][2]
+
+    def _visit(node: str) -> None:
+        visited.add(node)
+        stack.append(node)
+        on_stack.add(node)
+        for dep in _deps(node):
+            if dep not in by_local_id:
+                continue
+            if dep in on_stack:
+                cycle = stack[stack.index(dep):] + [dep]
+                errors.append(_error(
+                    "task.derived_dependency_cycle",
+                    f"Derived task dependency cycle detected: {' -> '.join(cycle)}",
+                    node,
+                ))
+            elif dep not in visited:
+                _visit(dep)
+        stack.pop()
+        on_stack.discard(node)
+
+    for node in local_ids:
+        if node not in visited:
+            _visit(node)
+    return tuple(errors)
 
 
 NUMERIC_TASK_ID_RE = re.compile(r"^[1-9][0-9]*$")

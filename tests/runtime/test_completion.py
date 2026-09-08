@@ -1098,6 +1098,153 @@ def test_completion_rejects_derived_task_with_duplicate_heading(tmp_path: Path):
     assert "task.duplicate_heading" in result.errors[0].message
 
 
+def _derived_workflow() -> WorkflowDefinition:
+    base = _workflow()
+    return WorkflowDefinition(
+        schema_version=base.schema_version,
+        states=base.states,
+        task_types=MappingProxyType({
+            **dict(base.task_types),
+            "chunk": TaskTypeDefinition(id="chunk", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({"child_task": ArtifactTypeDefinition(id="child_task")}),
+        validation_types=base.validation_types,
+        operation_types=base.operation_types,
+        workers=base.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+                derives=DerivesDefinition(task_type="chunk", state="Todo", artifact_type="child_task"),
+            ),
+        }),
+    )
+
+
+def _derived_service(tmp_path: Path):
+    store = _job_store(tmp_path)
+    events = JsonlEventStore(tmp_path / "events")
+    adapter = FakeAdapter(_task())
+    service = CompletionService(
+        workflow=_derived_workflow(),
+        adapter=adapter,
+        job_store=store,
+        event_store=events,
+    )
+    return service, adapter, events
+
+
+def test_completion_rejects_derived_task_with_self_dependency(tmp_path: Path):
+    service, adapter, events = _derived_service(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "child.md").write_text(
+        "---\nlocal_id: child\ndependencies: [child]\n---\n# Child\n\nDo child.\n",
+        encoding="utf-8",
+    )
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(ArtifactSubmission(type="child_task", path="child.md"),),
+        ),
+    )
+    event_types = [event.event_type for event in events.iter_events()]
+
+    assert result.accepted is False
+    assert result.verification is not None
+    assert result.verification.accepted is True
+    assert {error.code for error in result.errors} >= {"task.derived_self_dependency"}
+    assert "ExecutionCompletionRejected" in event_types
+    assert "TaskDerived" not in event_types
+    assert "TransitionAccepted" not in event_types
+
+
+def test_completion_rejects_derived_task_with_dependency_cycle(tmp_path: Path):
+    service, adapter, events = _derived_service(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "a.md").write_text(
+        "---\nlocal_id: a\ndependencies: [b]\n---\n# Task A\n\nDo A.\n",
+        encoding="utf-8",
+    )
+    (output / "b.md").write_text(
+        "---\nlocal_id: b\ndependencies: [a]\n---\n# Task B\n\nDo B.\n",
+        encoding="utf-8",
+    )
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(ArtifactSubmission(type="child_task", path="a.md"), ArtifactSubmission(type="child_task", path="b.md")),
+        ),
+    )
+    event_types = [event.event_type for event in events.iter_events()]
+
+    assert result.accepted is False
+    assert result.verification is not None
+    assert result.verification.accepted is True
+    assert {error.code for error in result.errors} >= {"task.derived_dependency_cycle"}
+    assert "TaskDerived" not in event_types
+    assert "TransitionAccepted" not in event_types
+
+
+def test_completion_rejects_missing_derived_task_source(tmp_path: Path):
+    service, adapter, events = _derived_service(tmp_path)
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(ArtifactSubmission(type="child_task", path="missing.md"),),
+        ),
+    )
+    event_types = [event.event_type for event in events.iter_events()]
+
+    assert result.accepted is False
+    assert result.verification is not None
+    assert result.verification.accepted is False
+    assert {error.code for error in result.errors} >= {"completion.artifact_not_found"}
+    assert "TaskDerived" not in event_types
+    assert "TransitionAccepted" not in event_types
+    assert adapter.moved_to is None
+
+
+def test_completion_rejects_batch_with_one_invalid_child_leaves_zero_partial(tmp_path: Path):
+    service, adapter, events = _derived_service(tmp_path)
+    output = tmp_path / "workspace" / "output"
+    (output / "good.md").write_text(
+        "---\nlocal_id: good\n---\n# Good\n\nDo good.\n",
+        encoding="utf-8",
+    )
+    (output / "bad.md").write_text(
+        "---\nlocal_id: bad\ndependencies: [missing]\n---\n# Bad\n\nDo bad.\n",
+        encoding="utf-8",
+    )
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="decomposed",
+            artifacts=(ArtifactSubmission(type="child_task", path="good.md"), ArtifactSubmission(type="child_task", path="bad.md")),
+        ),
+    )
+    event_types = [event.event_type for event in events.iter_events()]
+
+    assert result.accepted is False
+    assert result.verification is not None
+    assert result.verification.accepted is True
+    assert {error.code for error in result.errors} >= {"task.derived_unknown_dependency"}
+    assert "TaskDerived" not in event_types
+    assert "TransitionAccepted" not in event_types
+    assert adapter.moved_to is None
+
+
 def test_completion_requires_changed_files_when_transition_demands_them(tmp_path: Path):
     store = _job_store(tmp_path)
     workspace = tmp_path / "workspace"
