@@ -29,7 +29,11 @@ from .base import (
     WriteResult,
 )
 from .obsidian_format import parse_task_row
-from open_tulid.vault.task_schema import declared_ids_for_project, validate_task_schema
+from open_tulid.vault.task_schema import (
+    declared_ids_for_project,
+    validate_task_schema,
+    validate_task_structure,
+)
 
 
 ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
@@ -388,6 +392,11 @@ class ObsidianAdapter:
             if isinstance(doc, DomainError):
                 loaded.errors.append(doc)
                 continue
+            loaded.errors.extend(validate_task_structure(
+                doc.task.body,
+                location=str(task_path),
+                require_title=False,
+            ))
             note_name = task_path.stem
             existing = loaded.task_paths_by_id.get(doc.task.id)
             if existing is not None:

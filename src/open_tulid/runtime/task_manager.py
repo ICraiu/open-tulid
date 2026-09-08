@@ -33,6 +33,7 @@ from .task_contracts import (
     implementation_contract_required,
     task_uses_global_contract,
 )
+from open_tulid.vault.task_schema import validate_task_structure
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,9 @@ class TaskManager:
                 f"Task {command.task_id!r} was not found.",
                 command.task_id,
             ),))
+        structure_errors = validate_task_structure(task.body, location=task.path, require_title=False)
+        if structure_errors:
+            return CommandResult(accepted=False, errors=tuple(structure_errors))
         transition = self.workflow.transitions.get(command.transition_id)
         if transition is None:
             return CommandResult(accepted=False, errors=(_error(

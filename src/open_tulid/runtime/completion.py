@@ -19,6 +19,7 @@ from open_tulid.runtime.execution_contracts import load_job_execution_contract
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
+from open_tulid.vault.task_schema import validate_task_structure
 
 from .verifier import (
     ArtifactSubmission,
@@ -1123,21 +1124,32 @@ def _parse_derived_task_file(path: Path) -> tuple[str, str, tuple[str, ...], str
         raise ValueError(f"Derived task frontmatter is invalid: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError("Derived task frontmatter must be a mapping.")
-    local_id = str(parsed.get("local_id", "")).strip()
+    local_id_raw = parsed.get("local_id")
+    if not isinstance(local_id_raw, str):
+        raise ValueError("Derived task frontmatter requires local_id as a string.")
+    local_id = local_id_raw.strip()
     if not local_id:
-        raise ValueError("Derived task frontmatter requires local_id.")
+        raise ValueError("Derived task frontmatter requires a nonempty local_id.")
     dependencies_raw = parsed.get("dependencies")
     if dependencies_raw is None:
         dependencies = ()
     elif isinstance(dependencies_raw, str):
         dependencies = (dependencies_raw,)
     elif isinstance(dependencies_raw, list):
-        dependencies = tuple(str(item) for item in dependencies_raw)
+        if not all(isinstance(item, str) for item in dependencies_raw):
+            raise ValueError("Derived task dependencies must be lists of strings.")
+        dependencies = tuple(dependencies_raw)
     else:
         raise ValueError("Derived task dependencies must be a string or list.")
     title = next((line[2:].strip() for line in body.splitlines() if line.startswith("# ")), "")
     if not title:
         raise ValueError("Derived task body requires a Markdown H1 title.")
+    structure_errors = validate_task_structure(body, location=str(path))
+    if structure_errors:
+        raise ValueError(
+            "Derived task body is structurally invalid: "
+            + "; ".join(f"{error.code}: {error.message}" for error in structure_errors)
+        )
     return local_id, title, dependencies, body
 
 

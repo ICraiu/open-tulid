@@ -635,6 +635,48 @@ class TestVaultValidateFailures:
         finally:
             os.chdir(original)
 
+    def test_duplicate_section_headings_fail(self, tmp_path: Path):
+        _make_config(tmp_path, ["Agent"])
+        _make_project(tmp_path, "Agent", kanban_files={
+            "Work.md": "## Todo\n- [ ] [[Task 1]]\n",
+        })
+        task_path = _make_task(tmp_path, "Agent", "Task 1")
+        task_path.write_text(
+            "---\n"
+            f"id: {TASK_ID}\n"
+            "type: ProductIdea\n"
+            "state: Todo\n"
+            "---\n"
+            "\n"
+            "Idea Task 1 captures an unmet product need.\n"
+            "\n"
+            "## Why\n"
+            "First why.\n"
+            "\n"
+            "## Why\n"
+            "Second why.\n"
+            "\n"
+            "## What\n"
+            "What changes.\n"
+            "\n"
+            "## How\n"
+            "Which seam.\n"
+            "\n"
+            "## Acceptance\n"
+            "- the idea is described\n",
+            encoding="utf-8",
+        )
+
+        original = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            result = runner.invoke(app, ["vault", "validate"])
+        finally:
+            os.chdir(original)
+        assert result.exit_code == 1
+        assert "task.duplicate_heading" in result.output
+        assert "Why" in result.output
+
     def test_non_task_content_in_section(self, tmp_path: Path):
         _make_config(tmp_path, ["Agent"])
         _make_project(tmp_path, "Agent", kanban_files={
