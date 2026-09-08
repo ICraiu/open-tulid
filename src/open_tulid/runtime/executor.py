@@ -162,6 +162,7 @@ def render_execution_prompt(
     prompt_packet = None
     parent_tasks: tuple[Task, ...] = ()
     context_packet = None
+    context_task = task
     project_root = _adapter_project_root(adapter)
     if project_root is not None:
         parent_tasks = load_parent_tasks(adapter, task)
@@ -200,6 +201,19 @@ def render_execution_prompt(
             else None
         ),
     )
+    # Planning transitions (specification and breakdown) additionally receive
+    # repository facts and the unfinished task inventory before any parent or
+    # linked-reference context, so the worker can distinguish implemented
+    # behavior from remaining work and avoid duplicate ownership.
+    planning_inputs = _planning_inputs_text(
+        adapter,
+        project_root,
+        transition,
+        context_task,
+        parent_tasks,
+    )
+    if planning_inputs:
+        prompt_text = f"{prompt_text}\n\n{planning_inputs}"
     # Operative worker and completion instructions must precede potentially
     # very large parent and linked-reference context so the model sees the
     # entire execution contract before it begins acting on background material.
@@ -2002,6 +2016,35 @@ def _adapter_project_root(adapter: StorageAdapter) -> Path | None:
     config = getattr(adapter, "config", None)
     project_root = getattr(config, "project_root", None)
     return project_root if isinstance(project_root, Path) else None
+
+
+def _planning_inputs_text(
+    adapter: StorageAdapter,
+    project_root: Path | None,
+    transition: TransitionDefinition,
+    task: Task,
+    parent_tasks: tuple[Task, ...],
+) -> str:
+    """Render repository facts and the unfinished task set for planning workers.
+
+    Only specification and breakdown transitions receive these inputs. Both are
+    derived from the live adapter/project root at render time, which is already
+    how the legacy planning prompt resolves its linked context.
+    """
+    from open_tulid.runtime.planning_input import build_planning_inputs, requires_planning_inputs
+
+    if project_root is None or not requires_planning_inputs(transition):
+        return ""
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+
+    repository = capture_repository_snapshot(project_root)
+    project = adapter.load_project()
+    return build_planning_inputs(
+        repository=repository,
+        project=project,
+        current_task=task,
+        parent_tasks=parent_tasks,
+    ).text
 
 
 def _project_standard_runtime(adapter: StorageAdapter) -> object:

@@ -283,6 +283,109 @@ def test_render_execution_prompt_builds_complete_packet_without_running_job():
     assert rendered.text.count("curl -sS -X POST") == 1
 
 
+def test_render_execution_prompt_injects_planning_inputs_for_breakdown_transition(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    (project / "package.json").write_text('{"name":"app","scripts":{"test":"jest"}}\n', encoding="utf-8")
+    (project / "tasks").mkdir()
+    (project / "tasks" / "existing.md").write_text("Existing unfinished task body.\n", encoding="utf-8")
+
+    current = _task()
+    existing = Task(
+        id="01J00000000000000000000002",
+        title="Existing integration",
+        path="tasks/existing.md",
+        current_state="Todo",
+        task_type="ImplementationTask",
+        dependencies=(TASK_ID,),
+        body="Existing unfinished task body.",
+    )
+
+    class BreakdownAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+        def load_project(self) -> LoadProjectResult:
+            return LoadProjectResult(snapshot=ProjectSnapshot(
+                project_id="Agent",
+                tasks=MappingProxyType({TASK_ID: current, existing.id: existing}),
+                board_positions=MappingProxyType({}),
+            ))
+
+        def read_task(self, task_id: str) -> ReadTaskResult:
+            tasks = {TASK_ID: current, existing.id: existing}
+            return ReadTaskResult(task=tasks[task_id]) if task_id in tasks else ReadTaskResult()
+
+    workflow = _workflow_without_requirements()
+    breakdown = workflow.transitions["code"]
+    breakdown = TransitionDefinition(
+        id="BreakDownImplementationSpec",
+        task_type="QuestionRound",
+        from_state="ReadyForBreakdown",
+        to_state="Done",
+        worker="codex_breakdown",
+        requires=RequirementDefinition(),
+        transaction=None,
+        derives=DerivesDefinition(
+            task_type="ImplementationTask",
+            state="Todo",
+            artifact_type="ImplementationTaskFile",
+        ),
+    )
+    workflow = WorkflowDefinition(
+        schema_version=workflow.schema_version,
+        states=workflow.states,
+        task_types=workflow.task_types,
+        artifact_types=workflow.artifact_types,
+        validation_types=workflow.validation_types,
+        operation_types=workflow.operation_types,
+        workers=workflow.workers,
+        transitions=MappingProxyType({"BreakDownImplementationSpec": breakdown}),
+    )
+
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=BreakdownAdapter(),
+        task=current,
+        transition=breakdown,
+        worker_id="codex_breakdown",
+        job_id="breakdown-preview",
+        completion_endpoint="http://preview.invalid/jobs/breakdown-preview/complete",
+    )
+
+    assert rendered.accepted is True
+    assert "# Planning Inputs" in rendered.text
+    assert "## Repository Facts" in rendered.text
+    assert "package.json" in rendered.text
+    assert "## Unfinished Project Tasks" in rendered.text
+    assert "01J00000000000000000000002 — Existing integration" in rendered.text
+    assert "Existing unfinished task body." in rendered.text
+
+
+def test_render_execution_prompt_omits_planning_inputs_for_non_planning_transition(tmp_path: Path):
+    project = tmp_path / "project"
+    project.mkdir(parents=True)
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    (project / "tasks").mkdir()
+
+    class ImplAdapter(FakeAdapter):
+        config = type("Cfg", (), {"project_root": project})()
+
+    workflow = _workflow()
+    rendered = render_execution_prompt(
+        workflow=workflow,
+        adapter=ImplAdapter(),
+        task=_task(),
+        transition=workflow.transitions["code"],
+        worker_id="codex",
+        job_id="impl-preview",
+        completion_endpoint="http://preview.invalid/jobs/impl-preview/complete",
+    )
+
+    assert rendered.accepted is True
+    assert "# Planning Inputs" not in rendered.text
+    assert "## Unfinished Project Tasks" not in rendered.text
+
+
 def test_normalize_ephemeral_completion_fields_only_rewrites_job_header():
     norm = normalize_ephemeral_completion_fields
     paste = (
