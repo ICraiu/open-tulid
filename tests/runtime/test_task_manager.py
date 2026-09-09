@@ -223,6 +223,7 @@ def _success_workflow() -> WorkflowDefinition:
 @dataclass(frozen=True)
 class FakeJob:
     status: str
+    job_id: str = "job"
     metadata: Mapping[str, Any] = MappingProxyType({})
     project_id: str = "Agent"
     task_id: str = TASK_ID
@@ -268,7 +269,7 @@ def test_request_transition_rejects_manual_implementation_without_acceptance():
     assert result.effects == ()
 
 
-def test_request_transition_accepts_manual_implementation_with_committed_acceptance():
+def test_request_transition_accepts_manual_implementation_with_committed_acceptance(tmp_path):
     # 6C: with a committed acceptance record (accepted job carrying the delivery
     # transaction) present, the manual implementation-completing transition is
     # aligned to the runtime path and moves the card.
@@ -279,7 +280,17 @@ def test_request_transition_accepts_manual_implementation_with_committed_accepta
         metadata={"acceptance_transaction_id": f"job-sub"},
         project_id="Agent",
     )
+    from open_tulid.runtime.events import TransactionJournalStore
+    from open_tulid.runtime.attempts import task_semantic_revision
+    journals = TransactionJournalStore(tmp_path / "events/journals")
+    record = journals.prepare(journal_id="job-sub", project_id="Agent", task_id=TASK_ID,
+        transition_id="implement", effects=(), events=(), context={
+            "job_id": accepted.job_id, "task_revision": task_semantic_revision(_snapshot().tasks[TASK_ID]),
+            "verification_accepted": True, "expected_to_state": "Done",
+        }).record
+    journals.commit(record)
     manager = TaskManager(
+        project_root=tmp_path,
         workflow=_success_workflow(),
         adapter=FakeAdapter(_snapshot()),
         history_job_store=FakeJobStore((accepted,)),

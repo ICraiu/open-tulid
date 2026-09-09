@@ -1421,6 +1421,9 @@ def _render_prompt_preview(
             project_id=project,
             task_id=task.id,
             review_transition=transition,
+            current_contract=execution_contract,
+            workflow=workflow,
+            journals=TransactionJournalStore(project_path / "events" / "journals"),
         )
         if evidence is None:
             _print_domain_errors((DomainError(

@@ -192,6 +192,11 @@ class Scheduler:
                 repo_root=self.repo_root,
                 job_store=self.job_store,
                 project_id=project_id,
+                journal_store=self.journal_store or (
+                    TransactionJournalStore(self.project_root / "events" / "journals")
+                    if self.project_root is not None else None
+                ),
+                source_identities_for=self._source_identities_for,
             )
             if dependency_error is not None:
                 skipped.append(dependency_error)
@@ -803,6 +808,8 @@ def _dependency_error(
     repo_root: Path | None = None,
     job_store: FileExecutionJobStore | None = None,
     project_id: str | None = None,
+    journal_store=None,
+    source_identities_for=None,
 ) -> DomainError | None:
     for dependency_id in task.dependencies:
         dependency = snapshot.tasks.get(dependency_id)
@@ -841,7 +848,9 @@ def _dependency_error(
             current_identity = repository_identity(repo_root)
             if current_identity is not None:
                 recorded, accepted = _dependency_accepted_repo_identity(
-                    job_store, project_id, dependency_id
+                    job_store, project_id, dependency_id, task=dependency,
+                    workflow=workflow, journals=journal_store,
+                    source_identities_for=source_identities_for,
                 )
                 if not accepted:
                     return _error(
@@ -872,6 +881,7 @@ def _dependency_accepted_repo_identity(
     job_store: FileExecutionJobStore,
     project_id: str,
     task_id: str,
+    *, task, workflow, journals, source_identities_for=None,
 ) -> tuple[str | None, bool]:
     """Recorded accepted repository identity for a dependency.
 
@@ -889,6 +899,14 @@ def _dependency_accepted_repo_identity(
         and job.task_id == task_id
         and _status_value(job.status) == ExecutionJobStatus.ACCEPTED.value
     )
+    if not accepted_jobs:
+        return None, False
+    from .acceptance import accepted_task_evidence
+    accepted_jobs = tuple(job for job in accepted_jobs if accepted_task_evidence(
+        job, task=task, workflow=workflow, journals=journals,
+        source_identities=(source_identities_for(task, workflow.transitions[job.transition_id])
+            if source_identities_for is not None and job.transition_id in workflow.transitions else ()),
+    ))
     if not accepted_jobs:
         return None, False
     latest = max(

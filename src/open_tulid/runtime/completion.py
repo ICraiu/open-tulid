@@ -92,7 +92,7 @@ class CompletionService:
         self.adapter = adapter
         self.job_store = job_store
         self.event_store = event_store
-        self.journal_store = journal_store
+        self.journal_store = journal_store or TransactionJournalStore(event_store.root / "journals")
         self.artifact_root = artifact_root
         self.repo_root = repo_root
         self.repo_command_runner = repo_command_runner
@@ -546,6 +546,9 @@ class CompletionService:
             output_relative=output_relative,
             acceptance_context={
                 "job_id": job.job_id,
+                "task_revision": _acceptance_task_revision(job, frozen.contract, self.adapter),
+                "verification_accepted": verification.accepted,
+                "verification_report": verification.report.to_dict() if verification.report else None,
                 "submission_id": submission_id,
                 "output_relative": output_relative,
                 "acceptance_metadata": {
@@ -1113,6 +1116,13 @@ class CompletionService:
 
 def _format_errors(errors: tuple[DomainError, ...]) -> str:
     return "; ".join(f"{error.code}: {error.message}" for error in errors)
+
+
+def _acceptance_task_revision(job, contract, adapter):
+    from .attempts import task_semantic_revision
+    from .execution_contracts import source_content_identities
+    task = contract.source_task if contract is not None else adapter.read_task(job.task_id).task
+    return task_semantic_revision(task, source_identities=source_content_identities(contract) if contract else ())
 
 
 @dataclass(frozen=True)

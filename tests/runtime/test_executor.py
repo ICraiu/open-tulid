@@ -5,7 +5,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -169,7 +169,7 @@ class FakeAdapter:
         ))
 
     def read_task(self, task_id: str) -> ReadTaskResult:
-        return ReadTaskResult(task=_task()) if task_id == TASK_ID else ReadTaskResult()
+        return ReadTaskResult(task=replace(_task(), current_state=self.moved_to or _task().current_state)) if task_id == TASK_ID else ReadTaskResult()
 
     def write_task(self, task: Task) -> WriteResult:
         return WriteResult(path=task.path)

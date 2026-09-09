@@ -152,7 +152,10 @@ def task_uses_global_contract(task: Task, workflow: WorkflowDefinition) -> bool:
     task_type = task_types.get(task.task_type)
     if task_type is None:
         return False
-    return task.task_type == "ImplementationTask"
+    return task.task_type == "ImplementationTask" or any(
+        transition.task_type == task.task_type and transition.review is True
+        for transition in workflow.transitions.values()
+    )
 
 
 def parse_implementation_contract_file(

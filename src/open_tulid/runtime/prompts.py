@@ -143,11 +143,22 @@ def find_review_evidence(
     project_id: str,
     task_id: str,
     review_transition: object,
+    current_contract=None,
+    workflow=None,
+    journals=None,
 ) -> ReviewEvidence | None:
     """Select the newest accepted job that produced the review transition's source state."""
     from_state = str(getattr(review_transition, "from_state", ""))
     candidates: list[ExecutionJob] = []
     for job in jobs:
+        if current_contract is not None:
+            from .acceptance import accepted_task_evidence
+            from .execution_contracts import source_content_identities
+            if not accepted_task_evidence(
+                job, task=current_contract.source_task, workflow=workflow, journals=journals,
+                source_identities=source_content_identities(current_contract),
+            ):
+                continue
         status = job.status.value if hasattr(job.status, "value") else str(job.status)
         frozen = load_job_execution_contract(job, required=True)
         report = job.metadata.get("verification_report")

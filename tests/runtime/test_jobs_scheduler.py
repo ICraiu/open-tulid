@@ -563,6 +563,7 @@ def test_scheduler_compiles_self_review_from_prior_verification_evidence(tmp_pat
             },
         },
     )).accepted is True
+    _record_dependency_acceptance(tmp_path, store, task, project_root=project_root)
     scheduler = Scheduler(
         workflow=workflow,
         adapter=FakeAdapter(_snapshot(task)),
@@ -693,6 +694,7 @@ def test_preview_matches_scheduled_review_packet_from_identical_evidence(tmp_pat
         },
     )).accepted is True
 
+    _record_dependency_acceptance(tmp_path, store, task, project_root=project_root)
     scheduler = Scheduler(
         workflow=workflow,
         adapter=FakeAdapter(_snapshot(task)),
@@ -1966,6 +1968,7 @@ def test_scheduler_admits_dependent_against_accepted_repository_identity(tmp_pat
         repo_root=repo,
     )
 
+    _record_dependency_acceptance(tmp_path, store, dep)
     result = scheduler.schedule_one("Agent")
 
     assert result.accepted is True
@@ -2052,6 +2055,7 @@ def test_scheduler_rejects_dependent_when_accepted_repository_identity_moved(tmp
         repo_root=repo,
     )
 
+    _record_dependency_acceptance(tmp_path, store, dep)
     result = scheduler.schedule_one("Agent")
 
     assert result.accepted is True
@@ -2408,9 +2412,31 @@ def test_scheduler_uses_renamed_states_and_custom_task_types_for_success(tmp_pat
         repo_root=repo,
     )
 
+    _record_dependency_acceptance(tmp_path, store, dep)
     result = scheduler.schedule_one("Agent")
 
     assert result.accepted is True
     assert result.scheduled is True
     assert result.task_id == TASK_ID
     assert not any(skip.code.startswith("task.dependency") for skip in result.skipped)
+
+
+def _record_dependency_acceptance(tmp_path, store, task, project_root=None):
+    from open_tulid.runtime.attempts import task_semantic_revision
+    job = store.list().jobs[0]
+    journal_id = job.job_id + "-acceptance"
+    journal_store = TransactionJournalStore((project_root or tmp_path / "tracker") / "events/journals")
+    report = dict(job.metadata.get("verification_report") or {"checks": [{"status": "passed"}]})
+    report.update(candidate_id="candidate", candidate_manifest_sha256="manifest")
+    record = journal_store.prepare(journal_id=journal_id, project_id="Agent",
+        task_id=task.id, transition_id=job.transition_id, effects=(), events=(), context={
+            "job_id": job.job_id, "task_revision": task_semantic_revision(task),
+            "verification_accepted": True, "expected_to_state": task.current_state,
+            "verification_report": report, "candidate_id": "candidate", "candidate_manifest_sha256": "manifest",
+        }).record
+    assert journal_store.commit(record).accepted
+    assert store.update_status(job.job_id, "accepted", metadata={
+        "acceptance_transaction_id": journal_id,
+        "verification_report": report,
+        "review_result": {"behavior": "dependency", "evidence": "test", "remaining_blockers": []},
+    }).accepted
