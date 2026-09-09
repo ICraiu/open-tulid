@@ -1955,7 +1955,7 @@ def test_scheduler_admits_dependent_against_accepted_repository_identity(tmp_pat
         worker_id="codex",
         workspace_path=str(tmp_path / "work"),
         status="accepted",
-        metadata={"accepted_repository_identity": identity},
+        metadata={"acceptance_repository_identity": identity},
     )).accepted is True
     scheduler = Scheduler(
         workflow=_workflow(review=True),
@@ -2041,7 +2041,7 @@ def test_scheduler_rejects_dependent_when_accepted_repository_identity_moved(tmp
         worker_id="codex",
         workspace_path=str(tmp_path / "work"),
         status="accepted",
-        metadata={"accepted_repository_identity": stale},
+        metadata={"acceptance_repository_identity": stale},
     )).accepted is True
     scheduler = Scheduler(
         workflow=_workflow(review=True),
@@ -2288,7 +2288,7 @@ def test_scheduler_blocks_dependent_on_declared_failure_terminal(tmp_path: Path)
         worker_id="codex",
         workspace_path=str(tmp_path / "work"),
         status="accepted",
-        metadata={"accepted_repository_identity": identity},
+        metadata={"acceptance_repository_identity": identity},
     )).accepted is True
     states = {
         "Todo": StateDefinition(id="Todo"),
@@ -2368,7 +2368,7 @@ def test_scheduler_uses_renamed_states_and_custom_task_types_for_success(tmp_pat
         worker_id="worker-7",
         workspace_path=str(tmp_path / "work"),
         status="accepted",
-        metadata={"accepted_repository_identity": identity},
+        metadata={"acceptance_repository_identity": identity},
     )).accepted is True
     states = {
         "Open": StateDefinition(id="Open"),

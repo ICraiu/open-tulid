@@ -12,9 +12,11 @@ from open_tulid.domain import (
     EventEnvelope,
     EventType,
     ExecutionJob,
+    ExecutionJobStatus,
     ProjectSnapshot,
     WorkflowDefinition,
 )
+from open_tulid.domain.completion import SUCCESS, terminal_outcome_of
 
 from .events import build_event, new_ulid
 from .context import load_parent_tasks
@@ -166,6 +168,15 @@ class TaskManager:
         requirement_errors = _validate_task_state_requirements(task, transition.to_state, self.workflow)
         if requirement_errors:
             return CommandResult(accepted=False, errors=tuple(requirement_errors))
+        acceptance_error = _manual_implementation_acceptance_error(
+            self.workflow,
+            transition,
+            history_job_store=self.history_job_store,
+            project_id=command.project_id,
+            task_id=task.id,
+        )
+        if acceptance_error is not None:
+            return CommandResult(accepted=False, errors=(acceptance_error,))
         events = (_event(
             project_id=command.project_id,
             actor=command.actor,
@@ -443,6 +454,75 @@ def _validate_task_state_requirements(
                 task.id,
             ))
     return errors
+
+
+def _manual_implementation_acceptance_error(
+    workflow: WorkflowDefinition,
+    transition,
+    *,
+    history_job_store,
+    project_id: str,
+    task_id: str,
+) -> DomainError | None:
+    """Align a manual request with the runtime acceptance path.
+
+    A manual request that would move a task into a state declaring a *success*
+    terminal outcome is an implementation-completing transition: it claims the
+    same verified completion the runtime records. Such a request must carry the
+    same committed acceptance record (an accepted job whose delivery transaction
+    was durably committed) that the automatic path requires. Absent that
+    evidence, the request is rejected with an explanation and the code/task/board
+    state are left intact. Manual transitions into non-success-terminal states
+    (clarification, business decisions, block/cancel) intentionally carry no
+    implementation-success guarantee and remain available.
+    """
+    if terminal_outcome_of(workflow, transition.to_state) != SUCCESS:
+        return None
+    if history_job_store is None:
+        return _error(
+            "manual.implementation_acceptance_unverifiable",
+            (
+                f"Manual transition {transition.id!r} would move task {task_id!r} "
+                f"to success state {transition.to_state!r}, which requires a verified "
+                "implementation with committed delivery, but no recorded job store is "
+                "available to confirm that evidence. Refusing to fabricate verified success; "
+                "the code/task/board state is left intact."
+            ),
+            task_id,
+        )
+    listed = history_job_store.list()
+    if not listed.accepted:
+        return _error(
+            "manual.implementation_acceptance_unreadable",
+            f"Manual transition {transition.id!r} cannot confirm acceptance evidence.",
+            task_id,
+        )
+    accepted = tuple(
+        job for job in listed.jobs
+        if job.project_id == project_id
+        and job.task_id == task_id
+        and job.transition_id == transition.id
+        and _job_status_value(job.status) == ExecutionJobStatus.ACCEPTED.value
+        and job.metadata.get("acceptance_transaction_id")
+    )
+    if accepted:
+        return None
+    return _error(
+        "manual.implementation_require_acceptance",
+        (
+            f"Manual transition {transition.id!r} would move task {task_id!r} to "
+            f"success state {transition.to_state!r}, which requires a verified "
+            "implementation with committed delivery. No accepted verification/delivery "
+            "record exists for this task and transition. The code/task/board state is "
+            "left intact; run the scheduled implementation so it can be verified and "
+            "delivered before moving the card."
+        ),
+        task_id,
+    )
+
+
+def _job_status_value(status: ExecutionJobStatus | str) -> str:
+    return status.value if hasattr(status, "value") else str(status)
 
 
 def _has_artifact_link(links: tuple[str, ...], artifact_type: str) -> bool:

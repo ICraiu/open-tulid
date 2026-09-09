@@ -895,7 +895,7 @@ def _dependency_accepted_repo_identity(
         accepted_jobs,
         key=lambda job: _job_timestamp(job) or datetime.min.replace(tzinfo=timezone.utc),
     )
-    recorded = latest.metadata.get("accepted_repository_identity")
+    recorded = latest.metadata.get("acceptance_repository_identity")
     identity = recorded if isinstance(recorded, str) else None
     return identity, True
 

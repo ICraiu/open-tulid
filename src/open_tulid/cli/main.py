@@ -1737,7 +1737,11 @@ def transition_task(
 ) -> None:
     """Apply a trusted manual transition."""
     ctx = _runtime_project_context(project)
-    manager = TaskManager(workflow=ctx["workflow"], adapter=ctx["adapter"])
+    manager = TaskManager(
+        workflow=ctx["workflow"],
+        adapter=ctx["adapter"],
+        history_job_store=ctx["job_store"],
+    )
     checked = manager.request_transition(RequestTransition(
         project_id=project,
         task_id=task_id,
