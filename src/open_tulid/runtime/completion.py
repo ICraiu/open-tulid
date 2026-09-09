@@ -34,6 +34,7 @@ from .verification_runtime import (
     ContainerCommandExecutor, VerificationEnvironment, environment_identity_of,
     prepare_verification_copy,
 )
+from .repository_facts import capture_repository_snapshot, repository_identity
 
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -347,6 +348,19 @@ class CompletionService:
             changed_files=promoted_files,
             task=self.adapter.read_task(job.task_id).task,
         )
+        target_check = _check_integration_target(
+            repo_root=self.repo_root,
+            repo_identity=repository_identity(self.repo_root),
+            contract=frozen.contract,
+        )
+        if not target_check.accepted:
+            return self._reject_completion(
+                job=job,
+                submission_id=submission_id,
+                verification=verification,
+                errors=target_check.errors,
+                message=_format_errors(target_check.errors),
+            )
         existing_task_ids, existing_task_errors = self._existing_task_ids(job.task_id) if transition.derives is not None else ((), ())
         if existing_task_errors:
             return self._reject_completion(
@@ -962,6 +976,75 @@ class CompletionService:
 
 def _format_errors(errors: tuple[DomainError, ...]) -> str:
     return "; ".join(f"{error.code}: {error.message}" for error in errors)
+
+
+@dataclass(frozen=True)
+class _IntegrationTargetCheck:
+    accepted: bool
+    errors: tuple[DomainError, ...] = ()
+
+
+def _check_integration_target(
+    *,
+    repo_root: Path | None,
+    repo_identity: str | None,
+    contract,
+) -> _IntegrationTargetCheck:
+    """Check the integration target before mutating it.
+
+    Compares the target's baseline/branch identity and deliverable manifest with
+    the ones captured for the job. If the source changed since the baseline, the
+    candidate is preserved and integration is halted with a stale/conflict
+    report rather than copying verified bytes over a newer repository or
+    absorbing live user changes into an automated commit. A Git-backed automatic
+    commit additionally requires a clean managed checkout at both baseline and
+    integration time.
+    """
+    if repo_root is None or contract is None:
+        return _IntegrationTargetCheck(accepted=True)
+    current = capture_repository_snapshot(repo_root)
+    if not current.accepted or current.snapshot is None:
+        return _IntegrationTargetCheck(
+            accepted=False,
+            errors=current.errors or (_error(
+                "repo.target_unreadable",
+                "Cannot scan the integration target before mutation.",
+                str(repo_root),
+            ),),
+        )
+    now = current.snapshot
+    baseline_manifest = contract.baseline_manifest
+    baseline_facts = contract.repository_facts
+    drift: list[str] = []
+    if now.baseline.sha256 != baseline_manifest.sha256:
+        drift.append("deliverable manifest changed since the job baseline")
+    if now.facts.git_repository and baseline_facts.git_repository:
+        if (
+            now.facts.base_commit is not None
+            and baseline_facts.base_commit is not None
+            and now.facts.base_commit != baseline_facts.base_commit
+        ):
+            drift.append("branch base commit moved since the job baseline")
+        if baseline_facts.dirty:
+            drift.append("target was not a clean managed checkout at baseline")
+        if now.facts.dirty:
+            drift.append("target has live uncommitted changes")
+    if not drift:
+        return _IntegrationTargetCheck(accepted=True)
+    return _IntegrationTargetCheck(
+        accepted=False,
+        errors=(_error(
+            "repo.stale_target",
+            (
+                "Integration target no longer matches the job baseline "
+                f"(repository identified as {repo_identity}); candidate preserved: "
+                + "; ".join(drift)
+                + ". Stop rather than overwriting the repository with the stale "
+                "candidate; re-plan against the current repository."
+            ),
+            str(repo_root.resolve()),
+        ),),
+    )
 
 
 def _error(code: str, message: str, location: str | None = None) -> DomainError:

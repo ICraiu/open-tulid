@@ -48,6 +48,7 @@ from open_tulid.runtime.execution_contracts import (
     execution_contract_to_dict,
     load_job_execution_contract,
 )
+from open_tulid.runtime.repository_facts import repository_identity
 from open_tulid.runtime.prompts import compile_execution_prompt, find_review_evidence
 from open_tulid.runtime.task_contracts import (
     parse_implementation_contract,
@@ -1836,6 +1837,90 @@ def test_scheduler_can_opt_out_of_serial_repo_lane(tmp_path: Path):
     assert result.scheduled is True
     assert result.task_id == TASK_ID
     assert result.transition_id == "review"
+
+
+def test_scheduler_blocks_concurrent_integration_across_projects_that_share_a_repository(tmp_path: Path):
+    # Two configured projects can point at the same repository; their worker
+    # model resources may differ, but they must not integrate concurrently.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    assert identity is not None
+    task = Task(
+        id=TASK_ID,
+        title="Implement thing",
+        path="tasks/thing.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    # An active integration job from ANOTHER project on the same repository.
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="OtherProject",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="running",
+        metadata={"repository_identity": identity},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert result.skipped[0].code == "repo_lane.active_job_exists"
+
+
+def test_scheduler_allows_integration_when_other_project_uses_a_different_repository(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    other_repo = tmp_path / "other"
+    other_repo.mkdir()
+    assert repository_identity(other_repo) != identity
+    task = Task(
+        id=TASK_ID,
+        title="Implement thing",
+        path="tasks/thing.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="OtherProject",
+        task_id=TASK_ID,
+        transition_id="implement",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="running",
+        metadata={"repository_identity": repository_identity(other_repo)},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == TASK_ID
+    assert result.transition_id == "implement"
 
 
 def test_scheduler_defers_task_when_required_resource_is_busy(tmp_path: Path):

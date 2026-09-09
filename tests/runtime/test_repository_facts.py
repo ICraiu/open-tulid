@@ -1,6 +1,45 @@
 from __future__ import annotations
 
-from open_tulid.runtime.repository_facts import capture_repository_snapshot
+import os
+
+import pytest
+
+from open_tulid.runtime.repository_facts import capture_repository_snapshot, repository_identity
+
+
+def test_repository_identity_resolves_alternate_paths_to_one_repository(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        os.symlink(repo, alias)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+
+    root_identity = repository_identity(repo)
+    alias_identity = repository_identity(alias)
+    other = tmp_path / "other"
+    other.mkdir()
+
+    assert root_identity is not None
+    assert root_identity == alias_identity
+    assert root_identity != repository_identity(other)
+
+
+def test_repository_identity_is_none_without_a_repository():
+    assert repository_identity(None) is None
+
+
+def test_git_repository_identity_uses_top_level_directory(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subdir = repo / "src"
+    subdir.mkdir()
+    os.system(f"git -C {repo} init -q")
+    os.system(f"git -C {repo} config user.email test@example.com")
+    os.system(f"git -C {repo} config user.name tester")
+
+    assert repository_identity(repo) == repository_identity(subdir)
 
 
 def test_repository_snapshot_captures_deterministic_facts_and_baseline(tmp_path):

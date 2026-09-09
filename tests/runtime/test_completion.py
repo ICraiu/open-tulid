@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import subprocess
 import sys
 from types import MappingProxyType
@@ -1639,7 +1640,7 @@ commands:
     transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
     workflow = replace(workflow, transitions={"code": transition})
     compiled = compile_standard_execution_contract(
-        project_root=project, repo_root=workspace, task=_task(), transition=transition,
+        project_root=project, repo_root=repo, task=_task(), transition=transition,
     ).contract
     assert compiled
     identity = "sha256:" + "a" * 64
@@ -1654,9 +1655,14 @@ commands:
     job_id = "01J00000000000000000000JOB"
     assert store.update_status(job_id, "running", metadata=metadata).accepted
     verified_copy = []
+    # 5C: the integration target repo is scanned before mutation, so Git's own
+    # subprocess calls must remain real; only the container verification runner
+    # is intercepted here.
+    original_run = subprocess.run
 
     def docker_runner(args, **kwargs):
-        assert args[:2] == ("docker", "run")
+        if args[:2] != ("docker", "run"):
+            return original_run(args, **kwargs)
         mount = args[args.index("-v") + 1]
         verification_copy = Path(mount.split(":")[0])
         verified_copy.append(verification_copy)
@@ -1691,3 +1697,133 @@ commands:
     assert report.post_manifest_sha256 == sealed_sha
     assert report.post_manifest_sha256 != capture_deliverable_manifest(workspace).sha256
     assert report.source_mutated is False
+
+
+def test_completion_rejects_when_target_repository_changed_since_baseline(tmp_path: Path):
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "app.py").write_text("sealed\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=repo, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+    }).accepted is True
+    # Drift the integration target after the baseline was captured.
+    (repo / "app.py").write_text("user edit\n", encoding="utf-8")
+
+    class PassingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            return VerificationResult(True)
+
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        candidate_root=tmp_path / "candidates",
+        verifier=PassingVerifier(),
+    )
+
+    result = service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(summary="done", changed_files=("app.py",)),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "repo.stale_target"
+    assert "deliverable manifest changed since the job baseline" in result.errors[0].message
+    # The candidate is preserved and the user's newer repository is untouched.
+    assert (repo / "app.py").read_text() == "user edit\n"
+    assert any(child.is_dir() for child in (tmp_path / "candidates").iterdir())
+
+
+def test_completion_stops_git_commit_when_target_has_live_uncommitted_changes(tmp_path: Path):
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    os.system(f"git -C {repo} init -q")
+    os.system(f"git -C {repo} config user.email test@example.com")
+    os.system(f"git -C {repo} config user.name tester")
+    (repo / "README.md").write_text("original\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repo), "add", "README.md"), check=True)
+    subprocess.run(("git", "-C", str(repo), "commit", "-m", "init"), check=True, capture_output=True)
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=repo, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+    }).accepted is True
+    # A live user edit arrives after the clean baseline was frozen.
+    (repo / "README.md").write_text("live user edit\n", encoding="utf-8")
+
+    class PassingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            return VerificationResult(True)
+
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        candidate_root=tmp_path / "candidates",
+        verifier=PassingVerifier(),
+    )
+
+    result = service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(summary="done", changed_files=("main.ts",)),
+    )
+
+    assert result.accepted is False
+    assert result.errors[0].code == "repo.stale_target"
+    assert "live uncommitted changes" in result.errors[0].message
+    assert (repo / "README.md").read_text() == "live user edit\n"
+    # No automatic commit absorbed the user's edit.
+    status = subprocess.run(
+        ("git", "-C", str(repo), "log", "--oneline", "-1"), capture_output=True, text=True,
+    ).stdout.strip()
+    assert status.endswith(" init")

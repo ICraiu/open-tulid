@@ -39,6 +39,7 @@ IMMUTABLE_JOB_METADATA_KEYS = frozenset({
     "prompt_packet",
     "prompt_packet_sha256",
     "prompt_manifest",
+    "repository_identity",
 })
 
 

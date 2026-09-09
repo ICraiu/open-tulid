@@ -33,6 +33,7 @@ from .task_contracts import (
     implementation_contract_required,
     task_uses_global_contract,
 )
+from .repository_facts import repository_identity
 from open_tulid.vault.task_schema import validate_task_structure
 
 
@@ -330,6 +331,10 @@ class TaskManager:
             metadata={
                 "completion_token": secrets.token_urlsafe(24),
                 "output_path": str(output_path),
+                **(
+                    {"repository_identity": repository_identity(self.repo_root)}
+                    if self.repo_root is not None else {}
+                ),
                 **(
                     {
                         "execution_contract": execution_contract_to_dict(frozen_contract),

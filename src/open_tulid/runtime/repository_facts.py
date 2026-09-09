@@ -16,6 +16,7 @@ from open_tulid.domain import DomainError
 
 REPOSITORY_FACTS_SCHEMA = "tulid.repository-facts/v1"
 BASELINE_MANIFEST_SCHEMA = "tulid.baseline-manifest/v1"
+REPOSITORY_IDENTITY_SCHEMA = "tulid.repository-identity/v1"
 
 EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".git",
@@ -213,6 +214,34 @@ def canonical_sha256(payload: object) -> str:
         ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def repository_identity(root: Path | None) -> str | None:
+    """Canonical identity of a repository for the serial integration lane.
+
+    Identity follows the repository, never the project name, so alternate
+    configured paths to the same repository resolve together. For Git projects
+    the resolved ``git rev-parse --show-toplevel`` directory is canonicalized so
+    a subdirectory path and its top-level path map to one identity; otherwise
+    the resolved real path is used (symlinks resolve identically). ``None`` is
+    returned when no repository is configured.
+    """
+    if root is None:
+        return None
+    resolved = _resolve_repository_root(root)
+    payload = {
+        "schema": REPOSITORY_IDENTITY_SCHEMA,
+        "path": str(resolved),
+    }
+    return canonical_sha256(payload)
+
+
+def _resolve_repository_root(root: Path) -> Path:
+    resolved = root.resolve()
+    toplevel = _run_git(resolved, "rev-parse", "--show-toplevel")
+    if toplevel is not None:
+        return Path(toplevel.strip()).resolve()
+    return resolved
 
 
 def _repository_files(root: Path) -> Iterator[Path]:

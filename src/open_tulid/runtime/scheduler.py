@@ -26,6 +26,7 @@ from .task_manager import CreateExecutionJob, TaskManager
 from .transactions import FileTransactionRuntime
 from .attempts import attempt_records_from_metadata, count_consumed_attempts, task_semantic_revision
 from .context import load_parent_tasks, resolve_source_content_identities
+from .repository_facts import repository_identity
 from .failures import failure_from_metadata
 
 
@@ -146,8 +147,10 @@ class Scheduler:
         skipped: list[DomainError] = []
         tasks = _tasks_in_board_order(loaded.snapshot)
         if self.serial_repo_execution:
+            repo_identity = repository_identity(self.repo_root)
             focused = _serial_repo_lane_focus(
                 project_id,
+                repo_identity,
                 loaded.snapshot,
                 self.workflow,
                 self.job_store,
@@ -490,31 +493,59 @@ class _SerialRepoLaneFocus:
 
 def _serial_repo_lane_focus(
     project_id: str,
+    repo_identity: str | None,
     snapshot: ProjectSnapshot,
     workflow: WorkflowDefinition,
     job_store: FileExecutionJobStore,
 ) -> _SerialRepoLaneFocus | DomainError | None:
+    """Focus the shared serial repository lane.
+
+    The lane is keyed on the canonical repository identity, not the project
+    name, so two configured projects pointing at one repository cannot integrate
+    concurrently even when their worker model resources differ. This project's
+    own jobs always occupy its lane (backward compatible with jobs created
+    before repository identity was recorded); jobs from other projects occupy
+    the same lane only when they share the resolved repository identity.
+    """
     listed = job_store.list()
     if not listed.accepted:
         return listed.error or _error("job.read_failed", "Cannot inspect execution jobs.")
 
     tasks = _tasks_in_board_order(snapshot)
     task_ids = {task.id for task in tasks}
-    project_jobs = tuple(
+    own_jobs = tuple(
         job for job in listed.jobs
         if job.project_id == project_id and job.task_id in task_ids
     )
+    external_jobs = tuple(
+        job for job in listed.jobs
+        if job.project_id != project_id
+        and _external_repo_lane_job(job, repo_identity)
+    )
     active_jobs_by_task: dict[str, list[ExecutionJob]] = {}
     jobs_by_task: dict[str, list[ExecutionJob]] = {}
-    for job in project_jobs:
+    for job in own_jobs:
         jobs_by_task.setdefault(job.task_id, []).append(job)
         if _status_value(job.status) in _ACTIVE_REPO_LANE_JOB_STATUSES:
             active_jobs_by_task.setdefault(job.task_id, []).append(job)
+    external_active = tuple(
+        job for job in external_jobs
+        if _status_value(job.status) in _ACTIVE_REPO_LANE_JOB_STATUSES
+    )
 
     for task in tasks:
         active_jobs = tuple(active_jobs_by_task.get(task.id, ()))
         if active_jobs:
             return _SerialRepoLaneFocus(task=task, active_jobs=active_jobs)
+
+    if external_active:
+        # Another project holds this repository's lane; block the first task
+        # this project could schedule so it never admits a concurrent
+        # integration into the same repository.
+        for task in tasks:
+            if _has_scheduler_eligible_transition(task, workflow):
+                return _SerialRepoLaneFocus(task=task, active_jobs=external_active)
+        return None
 
     for task in tasks:
         task_jobs = jobs_by_task.get(task.id, ())
@@ -524,6 +555,14 @@ def _serial_repo_lane_focus(
         ):
             return _SerialRepoLaneFocus(task=task)
     return None
+
+
+def _external_repo_lane_job(job: ExecutionJob, repo_identity: str | None) -> bool:
+    """A job from another project occupies this lane only on a shared repo identity."""
+    if repo_identity is None:
+        return False
+    stored = job.metadata.get("repository_identity")
+    return stored == repo_identity
 
 
 def _repair_ready_job(jobs: tuple[ExecutionJob, ...]) -> ExecutionJob | None:
