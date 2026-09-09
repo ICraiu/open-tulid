@@ -44,6 +44,13 @@ class AgentRunRequest:
     volume_relabel: bool = False
     container_name: str | None = None
     container_user: str | None = None
+    # Plan 4B: decouple the workspace mount point from the working directory so
+    # verification can mount the frozen candidate copy at the project root while
+    # running each global command from a resolved repository-relative subdirectory.
+    mount_container_path: str | None = None
+    # Plan 4B: a non-agent entrypoint override so verification commands run with
+    # the project image's toolchain instead of the agent program.
+    entrypoint: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +121,8 @@ def run_agent_container(
     log_dir: Path | None = None,
 ) -> AgentRunResult:
     workspace = request.workspace.resolve()
-    mounts = (ContainerMount(workspace, request.workdir), *request.mounts)
+    mount_path = request.mount_container_path or request.workdir
+    mounts = (ContainerMount(workspace, mount_path), *request.mounts)
     command: list[str] = [docker_executable, "run"]
     if request.remove:
         command.append("--rm")
@@ -122,6 +130,11 @@ def run_agent_container(
         command.extend(["--name", request.container_name])
     if request.container_user:
         command.extend(["--user", request.container_user])
+    if request.entrypoint:
+        # docker's ``--entrypoint`` accepts a single token; the image's
+        # remaining argv is passed to that entrypoint as the run arguments.
+        command.append("--entrypoint")
+        command.append(request.entrypoint[0])
     for mount in mounts:
         mode = "ro" if mount.readonly else "rw"
         if request.volume_relabel:

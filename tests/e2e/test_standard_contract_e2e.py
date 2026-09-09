@@ -160,6 +160,72 @@ def test_standard_contract_drives_minimal_delta_with_baseline_and_bounded_retry(
         _print_system_logs(project, capsys)
 
 
+def test_verification_executes_in_the_declared_project_container(
+    tmp_path: Path,
+    scripted_runtime_worker_image: str,
+) -> None:
+    """Plan 4B: verification freezes and runs in the declared project environment.
+
+    The container executor mounts a verification copy at the project root,
+    resolves repository-relative working directories inside the container,
+    overrides the agent entrypoint, and runs each global command with the
+    project image's toolchain. No model-proxy/completion credentials are passed.
+    """
+    pytest.importorskip("open_tulid")
+
+    from open_tulid.runtime.verification_runtime import (
+        VERIFICATION_PASSED,
+        ContainerCommandExecutor,
+        VerificationEnvironment,
+    )
+    from open_tulid.runtime.verifier import VerificationCommand
+
+    project = _make_runtime_project(
+        tmp_path,
+        scripted_runtime_worker_image,
+        scenario="standard_contract",
+    )
+    repo = (project.project / ".." / "repo").resolve()
+    (repo / "backend").mkdir(parents=True, exist_ok=True)
+    (repo / "backend" / "check_repo.py").write_text(
+        "import sys\nprint('verifying ' + sys.argv[1])\nraise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    (repo / "check_repo.py").write_text(
+        "import sys\nprint('verifying ' + sys.argv[1])\nraise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+
+    executor = ContainerCommandExecutor(
+        environment=VerificationEnvironment(
+            project_image_identity=scripted_runtime_worker_image,
+            container_workspace="/workspace/project",
+            container_volume_relabel=True,
+        )
+    )
+    copy = tmp_path / "verify-copy"
+    copy.mkdir()
+    shutil_copytree(repo, copy)
+    for command in (
+        VerificationCommand("build", ("python", "check_repo.py", "build")),
+        VerificationCommand("tests", ("python", "check_repo.py", "tests"), working_directory="backend"),
+    ):
+        outcome = executor.execute(command, copy)
+        assert outcome.error is None, outcome.error.message if outcome.error else None
+        assert outcome.check.status == VERIFICATION_PASSED
+        assert outcome.check.exit_code == 0
+
+
+def shutil_copytree(source: Path, target: Path) -> None:
+    import shutil
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, destination, symlinks=True)
+        else:
+            shutil.copy2(child, destination, follow_symlinks=True)
+
+
 def _task_links(project, task_id: str) -> tuple[str, ...]:
     task_path = next(iter((project.project / "tasks").glob(f"{task_id}-*.md")))
     links: list[str] = []

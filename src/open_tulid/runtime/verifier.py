@@ -333,10 +333,17 @@ class DeterministicVerifier:
         artifact_templates: Mapping[str, str | None] | None = None,
         validation_implementations: Mapping[str, Callable[..., object]] | None = None,
         validation_context_factory: Callable[[Path, Path], object] | None = None,
+        executor: object | None = None,
+        environment_identity: str | None = None,
     ) -> None:
         self.artifact_templates = dict(artifact_templates or {})
         self.validation_implementations = dict(validation_implementations or {})
         self.validation_context_factory = validation_context_factory
+        # Plan 4B: a verification command executor decides where/how checks run.
+        # ``None`` means the deterministic host strategy. The default is chosen
+        # lazily so container machinery stays optional for the deterministic suite.
+        self.executor = executor
+        self.environment_identity = environment_identity
 
     def verify(
         self,
@@ -348,6 +355,8 @@ class DeterministicVerifier:
         execution_contract: ExecutionContract | None = None,
         candidate_id: str | None = None,
         candidate_manifest_sha256: str | None = None,
+        executor: object | None = None,
+        environment_identity: str | None = None,
     ) -> VerificationResult:
         errors: list[DomainError] = []
         report: VerificationReport | None = None
@@ -361,15 +370,20 @@ class DeterministicVerifier:
                 transition.id,
             ))
         if execution_contract is not None:
+            effective_environment_identity = environment_identity if environment_identity is not None else self.environment_identity
+            effective_executor = executor if executor is not None else self.executor
             request = verification_request_from_execution_contract(
                 contract=execution_contract,
                 candidate_id=candidate_id,
                 candidate_manifest_sha256=candidate_manifest_sha256,
+                environment_identity=effective_environment_identity,
             )
             report, enforcement_errors = self._enforce_execution_contract(
                 workspace=workspace,
                 contract=execution_contract,
                 request=request,
+                executor=effective_executor,
+                environment_identity=effective_environment_identity,
             )
             errors.extend(enforcement_errors)
         if report is not None:
@@ -566,6 +580,8 @@ class DeterministicVerifier:
         request: VerificationRequest | None = None,
         candidate_id: str | None = None,
         candidate_manifest_sha256: str | None = None,
+        executor: object | None = None,
+        environment_identity: str | None = None,
     ) -> tuple[VerificationReport, tuple[DomainError, ...]]:
         # The only acceptance criterion is the project's configured global
         # commands. A worker may freely create/edit/rename/delete files required
@@ -575,18 +591,30 @@ class DeterministicVerifier:
                 contract=contract,
                 candidate_id=candidate_id,
                 candidate_manifest_sha256=candidate_manifest_sha256,
+                environment_identity=environment_identity,
             )
         baseline_sha = contract.baseline_manifest.sha256
         pre_sha = _workspace_manifest_sha256(workspace)
-        checks, check_errors = _run_contract_checks(workspace, contract)
+        pre_lockfile = _capture_lockfile_identity(workspace)
+        checks, check_errors = _run_contract_checks(workspace, contract, executor)
         # Measure the real source tree before and after the checks ran. Source
         # mutation is a post-tree differing from the pre-verification tree;
         # cache/build outputs excluded by snapshot rules are not tracked source.
         # Plan 4A: never repeat the baseline digest as the candidate/post digest
         # unless the actual source tree is unchanged by verification.
         post_sha = _workspace_manifest_sha256(workspace)
+        post_lockfile = _capture_lockfile_identity(workspace)
         not_run = sum(1 for check in checks if check.status == VERIFICATION_NOT_RUN_STATUS)
         source_mutated = post_sha != pre_sha
+        all_errors = list(check_errors)
+        lockfile_mutated = pre_lockfile is not None and post_lockfile is not None and pre_lockfile.sha256 != post_lockfile.sha256
+        if lockfile_mutated:
+            source_mutated = True
+            all_errors.append(_error(
+                "verification.lockfile_mutated",
+                "Verification rewrote committed dependency locks; the candidate is rejected.",
+                request.candidate_id,
+            ))
         return VerificationReport(
             VERIFICATION_REPORT_SCHEMA_V2,
             None,
@@ -606,8 +634,8 @@ class DeterministicVerifier:
             request.environment_identity,
             not_run,
             source_mutated,
-            _granular_classification(None, check_errors, not_run=not_run, source_mutated=source_mutated),
-        ), check_errors
+            _granular_classification(None, all_errors, not_run=not_run, source_mutated=source_mutated),
+        ), tuple(all_errors)
 
     def _run_trusted_validations(
         self,
@@ -726,97 +754,47 @@ def _read_text(path: Path) -> str | None:
 def _run_contract_checks(
     workspace: Path,
     contract: ExecutionContract,
+    executor: object | None = None,
 ) -> tuple[tuple[VerificationCheckResult, ...], tuple[DomainError, ...]]:
     results: list[VerificationCheckResult] = []
     errors: list[DomainError] = []
+    command_executor = executor or _default_executor()
     for check in contract.resolved_checks:
         if check.runner != "command":
             continue
-        command = _as_command_line(check.argv)
-        cwd = _contained_path(workspace, check.working_directory)
-        expected = check.expect.exit_code
-        started = _now_utc_iso()
-        if cwd is None or not cwd.is_dir():
-            results.append(VerificationCheckResult(
-                check.id, "environment_error", check.argv,
-                stderr=_bounded_excerpt("working directory unavailable"),
-                working_directory=check.working_directory,
-                timeout_seconds=check.timeout_seconds,
-                expected_exit_code=expected,
-                started_at=started, ended_at=_now_utc_iso(),
-            ))
-            errors.append(_error("verification.check_environment", f"Verification command {check.id!r} has no usable working directory: {check.working_directory!r}.", check.id))
-            continue
-        try:
-            started_ns = _monotonic_ns()
-            completed = subprocess.run(check.argv, cwd=cwd, capture_output=True, text=True, timeout=check.timeout_seconds, check=False)
-            duration = _seconds_since(started_ns)
-        except subprocess.TimeoutExpired as exc:
-            results.append(VerificationCheckResult(
-                check.id, "timeout", check.argv,
-                stdout=_bounded_excerpt(_as_text(exc.stdout)),
-                stderr=_bounded_excerpt(_as_text(exc.stderr)),
-                working_directory=check.working_directory,
-                timeout_seconds=check.timeout_seconds,
-                expected_exit_code=expected,
-                started_at=started, ended_at=_now_utc_iso(),
-                duration_seconds=_seconds_since(started_ns),
-            ))
-            errors.append(_error("verification.check_timeout", f"Verification command {check.id!r} timed out after {check.timeout_seconds}s: {command}.", check.id))
-            continue
-        except OSError as exc:
-            results.append(VerificationCheckResult(
-                check.id, "environment_error", check.argv,
-                stderr=_bounded_excerpt(str(exc)),
-                working_directory=check.working_directory,
-                timeout_seconds=check.timeout_seconds,
-                expected_exit_code=expected,
-                started_at=started, ended_at=_now_utc_iso(),
-                duration_seconds=_seconds_since(started_ns),
-            ))
-            errors.append(_error("verification.check_environment", f"Verification command {check.id!r} could not be found or run ({command}): {exc}", check.id))
-            continue
-        stdout_ok = all(value in completed.stdout for value in check.expect.stdout_contains)
-        stderr_ok = all(value in completed.stderr for value in check.expect.stderr_contains)
-        passed = completed.returncode == expected and stdout_ok and stderr_ok
-        results.append(VerificationCheckResult(
-            check.id, VERIFICATION_PASSED if passed else "failed", check.argv,
-            completed.returncode,
-            _bounded_excerpt(completed.stdout),
-            _bounded_excerpt(completed.stderr),
-            check.working_directory,
-            check.timeout_seconds,
-            expected,
-            started, _now_utc_iso(), duration,
-        ))
-        if not passed:
-            detail = _check_failure_detail(check.id, expected, completed, check.expect)
-            errors.append(_error("verification.check_failed", detail, check.id))
+        outcome = command_executor.execute(_as_verification_command(check), workspace)
+        results.append(outcome.check)
+        if outcome.error is not None:
+            errors.append(outcome.error)
     return tuple(results), tuple(errors)
 
 
-def _monotonic_ns() -> int:
-    import time
-    return time.monotonic_ns()
+def _default_executor():
+    # Plan 4B: without an injected executor, verification runs deterministically
+    # on the host for unit/e2e tests. The production runtime injects the
+    # container strategy against the resolved project image.
+    from open_tulid.runtime.verification_runtime import HostCommandExecutor
+    return HostCommandExecutor()
 
 
-def _seconds_since(started_ns: int) -> float:
-    import time
-    return max(0.0, (time.monotonic_ns() - started_ns) / 1_000_000_000)
+def _as_verification_command(check) -> VerificationCommand:
+    return VerificationCommand(
+        name=check.id,
+        argv=tuple(check.argv),
+        working_directory=check.working_directory,
+        timeout_seconds=check.timeout_seconds,
+        expected_exit_code=check.expect.exit_code,
+    )
 
 
-def _now_utc_iso() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _bounded_excerpt(value: str) -> str:
-    """Bound inline log excerpts; complete logs are retained as log artifacts."""
-    value = value or ""
-    if len(value) <= LOG_EXCERPT_CHARACTER_LIMIT:
-        return value
-    marker = f"\n[... {len(value) - LOG_EXCERPT_CHARACTER_LIMIT} characters omitted; full log retained as artifact]"
-    return value[: LOG_EXCERPT_CHARACTER_LIMIT - len(marker)] + marker
+def _capture_lockfile_identity(workspace: Path):
+    from open_tulid.runtime.verification_runtime import capture_lockfile_identity
+    if not workspace.is_dir():
+        return None
+    try:
+        return capture_lockfile_identity(workspace)
+    except OSError:
+        return None
 
 
 def _workspace_manifest_sha256(workspace: Path) -> str:
@@ -839,45 +817,16 @@ def _verification_incomplete_message(report: "VerificationReport") -> str:
     return "Not every global command passed."
 
 
-def _as_command_line(argv: Sequence[str]) -> str:
-    import shlex
-    return shlex.join(argv)
-
-
-def _check_failure_detail(
-    check_id: str,
-    expected_exit_code: int | None,
-    completed: subprocess.CompletedProcess[str],
-    expect: object,
-) -> str:
-    reasons: list[str] = []
-    if completed.returncode != expected_exit_code:
-        reasons.append(
-            f"exit code {completed.returncode} (expected {expected_exit_code or 0})"
-        )
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-    tail = "\n".join((stdout, stderr)).strip().splitlines()[-5:]
-    evidence = (" ".join(line.strip() for line in tail) if tail else "no output")
-    details = "; ".join(reasons) if reasons else "exit expectation was not met"
-    line_count = len(tail)
-    return (
-        f"Verification command {check_id!r} failed ({details}; "
-        f"{line_count} output line(s) captured: {evidence[:400]})"
-    )
-
-
-def _as_text(value: str | bytes | None) -> str:
-    if value is None:
-        return ""
-    return value.decode(errors="replace") if isinstance(value, bytes) else value
-
-
 def _failure_classification(errors: Sequence[DomainError]) -> str:
     codes = {error.code for error in errors}
     if any(code.startswith("verification.baseline") for code in codes):
         return "baseline_failure"
-    if any(code in {"verification.check_environment", "verification.check_timeout"} for code in codes):
+    if any(
+        code in {"verification.check_environment", "verification.check_timeout"}
+        or code.startswith("verification.env_")
+        or code == "verification.lockfile_mutated"
+        for code in codes
+    ):
         return "environment_failure"
     if any(code.startswith("execution_contract") or code.startswith("verification.path") or code.startswith("verification.deletion") or code.startswith("verification.rename") or code.startswith("verification.max_files") or code.startswith("verification.changed_line_budget") for code in codes):
         return "contract_failure"
@@ -910,7 +859,13 @@ def _granular_classification(
         return VERIFICATION_CLASSIFICATION_SOURCE_MUTATION
     if any(code.startswith("contract.") for code in codes):
         return VERIFICATION_CLASSIFICATION_MALFORMED_POLICY
-    if any(code.startswith("verification.dependency") or code.startswith("verification.env_") or code in {"contract.check_environment"} for code in codes):
+    dependency_codes = (
+        "verification.dependency",
+        "verification.env_",
+        "verification.lockfile_mutated",
+        "contract.check_environment",
+    )
+    if any(code.startswith(code_prefix) for code in codes for code_prefix in dependency_codes):
         return VERIFICATION_CLASSIFICATION_DEPENDENCY_PREPARATION
     if "verification.check_environment" in codes:
         return VERIFICATION_CLASSIFICATION_ENVIRONMENT_UNAVAILABLE

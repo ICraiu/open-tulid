@@ -70,6 +70,8 @@ class CompletionService:
         verifier: DeterministicVerifier | None = None,
         validation_implementations: Mapping[str, object] | None = None,
         validation_context_factory: object | None = None,
+        verification_executor: object | None = None,
+        verification_environment_identity: str | None = None,
         max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS,
     ) -> None:
         self.workflow = workflow
@@ -81,14 +83,19 @@ class CompletionService:
         self.repo_root = repo_root
         self.repo_command_runner = repo_command_runner
         self.candidate_root = candidate_root
-        self.verifier = verifier or DeterministicVerifier(
+        passed_verifier = verifier or DeterministicVerifier(
             artifact_templates={
                 artifact_id: artifact.template
                 for artifact_id, artifact in workflow.artifact_types.items()
             },
             validation_implementations=validation_implementations,
             validation_context_factory=validation_context_factory,
+            executor=verification_executor,
+            environment_identity=verification_environment_identity,
         )
+        self.verifier = passed_verifier
+        self.verification_executor = verification_executor
+        self.verification_environment_identity = verification_environment_identity
         self.max_repair_attempts = max_repair_attempts
 
     def submit(
@@ -266,6 +273,8 @@ class CompletionService:
                 execution_contract=frozen.contract,
                 candidate_id=candidate.candidate_id,
                 candidate_manifest_sha256=candidate.manifest_sha256,
+                executor=self.verification_executor,
+                environment_identity=self.verification_environment_identity,
             )
         except Exception as exc:
             duration_seconds = round(time.monotonic() - validation_started, 3)
