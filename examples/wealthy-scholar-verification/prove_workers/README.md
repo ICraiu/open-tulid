@@ -28,9 +28,10 @@ verifiable commit while another worker holds the slot.
 
 ## Isolation guarantees
 
-- `copy_repo` bare-clones the live project repository into the workspace, so no
-  ref can be pushed back into the live project.
-- `copy_tracker` copies the whole tracker vault into the workspace.
+- `copy_repo` creates a working checkout with independent Git objects and removes
+  the origin remote, so ordinary experiment commits cannot push to the live project.
+- `copy_tracker` copies the tracker into a new destination; existing experiments
+  are never overwritten.
 - `shield` refuses any configured path that resolves inside a live root
   (project repo or tracker), including symlinked paths. The tool exits before
   touching anything if a violation is found. This is the live-write guard 6F
@@ -61,7 +62,10 @@ Prepare isolation and identity, then drive the real chain:
   --ledger-dir prove_workers_ledger
 ```
 
-Then run the real chain with the configured `local_llm` (opencode) worker against
+Set `TULID_CONFIG` to the isolated configuration file to keep jobs, leases, logs,
+and daemon state under its parent directory without changing the process home.
+
+Then run the real chain with the configured worker assignments against
 the isolated tracker copy via the existing CLI, and call the tool again with a
 worker runner that appends each attempt's evidence to the ledger. Append every
 attempt, retry, failure, verification/promotion record, duration, and manual

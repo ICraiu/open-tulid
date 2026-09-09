@@ -115,15 +115,19 @@ def shield(paths, live_roots: dict, label: str) -> list[str]:
 
 
 def copy_repo(source_repo: Path, dest: Path) -> None:
-    """Bare-clone the source repo into dest so no remotes mutate the original."""
-    dest.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "clone", "--bare", "--no-hardlinks", str(source_repo), str(dest)],
+    """Create an independent working checkout with no live write remote."""
+    if dest.exists():
+        raise FileExistsError(f"Preserving existing experiment checkout: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "--no-hardlinks", str(source_repo), str(dest)],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(dest), "remote", "remove", "origin"],
                    check=True, capture_output=True)
 
 
 def copy_tracker(source_vault: Path, dest: Path) -> None:
     """Copy the whole tracker vault (projects + artifacts) into dest."""
-    shutil.copytree(source_vault, dest, dirs_exist_ok=True,
+    shutil.copytree(source_vault, dest, dirs_exist_ok=False,
                     ignore=shutil.ignore_patterns(".git", "__pycache__", "*.lock"))
 
 
@@ -134,6 +138,9 @@ class Ledger:
 
     def __init__(self, root: Path):
         self.root = root
+        if (root / "run-ledger.json").exists():
+            self.record = json.loads((root / "run-ledger.json").read_text())
+            return
         self.record = {
             "schema": "tulid.prove_workers.ledger/v1",
             "experiment_id": f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
@@ -174,7 +181,7 @@ class Ledger:
         self.record["summary"] = {
             "completed": sum(1 for a in attempts if a.get("status") == "delivered"),
             "failed": sum(1 for a in attempts if a.get("status") == "failure"),
-            "retries": sum(a.get("retry_index", 0) for a in attempts),
+            "retries": sum(1 for a in attempts if a.get("retry_index", 0) > 0),
             "duration_seconds": round(sum(a.get("duration_seconds", 0.0) for a in attempts), 3),
             "manual_interventions": sum(1 for e in self.record["chain"]
                                         for a in e["attempts"] if a.get("manual", False)),
@@ -366,13 +373,13 @@ def isolate_inputs(args):
     """Set up isolation and return (workspace, ledger, violations, identity)."""
     live_roots = {"repo": args.source_repo, "tracker": args.source_tracker}
     # Validate configured paths against live roots before touching anything.
-    violations = shield([args.ledger_dir, args.source_repo, args.source_tracker],
+    violations = shield([args.ledger_dir],
                         {k: v for k, v in live_roots.items() if v}, "configured")
     if violations:
         raise SystemExit("refusing to run: " + "; ".join(violations))
 
     workspace = resolve(args.ledger_dir) / "isolation"
-    repo_copy = workspace / "project.git"
+    repo_copy = workspace / "project"
     tracker_copy = workspace / "tracker"
 
     ledger = Ledger(resolve(args.ledger_dir))
@@ -394,6 +401,7 @@ def isolate_inputs(args):
         copy_tracker(args.source_tracker, tracker_copy)
     ledger.set_isolation(repo_copy, tracker_copy, shield(
         [args.ledger_dir], {k: v for k, v in live_roots.items() if v}, "configured"))
+    ledger.write()
     return workspace, ledger, identity
 
 

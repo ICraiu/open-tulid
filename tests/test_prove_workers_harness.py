@@ -75,6 +75,44 @@ def _parent(p: Path) -> Path:
     return p.parent
 
 
+def test_isolation_produces_working_checkout_without_live_remote(tmp_path, monkeypatch):
+    import subprocess
+    source = tmp_path / "live"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    (source / "app.py").write_text("original")
+    subprocess.run(["git", "-C", str(source), "add", "app.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "baseline"], check=True)
+    tracker = tmp_path / "vault"
+    tracker.mkdir()
+    (tracker / "task.md").write_text("task")
+    monkeypatch.setattr(pw, "image_identity", lambda image: {"image": image})
+    monkeypatch.setattr(pw, "model_endpoint", lambda url: {"reachable": False})
+    args = pw.build_arg_parser().parse_args(["--source-repo", str(source), "--source-tracker", str(tracker), "--ledger-dir", str(tmp_path / "proof")])
+    workspace, ledger, identity = pw.isolate_inputs(args)
+    checkout = workspace / "project"
+    assert (checkout / "app.py").read_text() == "original"
+    assert subprocess.check_output(["git", "-C", str(checkout), "remote"], text=True) == ""
+    ledger.note("failed attempt remains visible")
+    ledger.write()
+    assert pw.Ledger(ledger.root).record["notes"] == ["failed attempt remains visible"]
+    (checkout / "app.py").write_text("isolated edit")
+    assert (source / "app.py").read_text() == "original"
+
+
+def test_config_override_keeps_runtime_state_in_isolated_directory(tmp_path, monkeypatch):
+    from open_tulid.config import load_config
+    vault = tmp_path / "vault"
+    (vault / "project").mkdir(parents=True)
+    config = tmp_path / "isolated/config.yaml"
+    config.parent.mkdir()
+    config.write_text(f"tracker:\n  type: obsidian\n  root: {vault}\nprojects:\n  project:\n    path: project\n")
+    monkeypatch.setenv("TULID_CONFIG", str(config))
+    loaded = load_config()
+    assert loaded.config_dir == config.parent
+    assert loaded.vault_root == vault
+
+
 class LedgerTests(unittest.TestCase):
     def test_chain_repair_is_recorded_not_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
