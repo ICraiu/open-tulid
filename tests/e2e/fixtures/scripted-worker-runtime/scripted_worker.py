@@ -179,6 +179,12 @@ if transition_id == "SelfReview":
                 "tests_pass": "passed",
                 "project_build": "passed",
             },
+            "review_result": {
+                "behavior": "health endpoint returns expected response",
+                "evidence": "app.py handler and test_health verify the behavior",
+                "defects_fixes": [],
+                "remaining_blockers": [],
+            },
         })
         sys.exit(0 if status == 200 else 1)
 
@@ -192,6 +198,12 @@ if transition_id == "SelfReview":
         "validation_evidence": {
             "tests_pass": "passed",
             "project_build": "passed",
+        },
+        "review_result": {
+            "behavior": "health endpoint returns expected response",
+            "evidence": "app.py handler and test_health verify the behavior",
+            "defects_fixes": [{"defect": "missing blank line", "fix": "added newline", "status": "fixed"}],
+            "remaining_blockers": [],
         },
     })
     sys.exit(0 if status == 200 else 1)

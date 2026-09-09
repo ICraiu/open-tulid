@@ -639,6 +639,69 @@ def test_self_review_prompt_is_distinct_and_uses_prior_authoritative_evidence(tm
     assert prompt.text.count("curl -sS -X POST") == 1
 
 
+def test_review_packet_is_requirement_driven_and_carries_evidence_records(tmp_path):
+    """Plan 6B: the review packet is requirement-driven and consumes the frozen
+    task, prior verification/change evidence, and bounded repair history."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    review_transition = replace(
+        _transition(),
+        id="SelfReview",
+        from_state="SelfReview",
+        to_state="Done",
+        requires=replace(
+            _transition().requires,
+            changed_files_required=False,
+        ),
+    )
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=review_transition,
+    )
+    assert compiled_contract.contract is not None
+    evidence = ReviewEvidence(
+        source_job_id="implementation-job",
+        verification_report={
+            "changes": {"added": [], "edited": ["app.py"], "removed": [], "renamed": [], "changed_lines": 2},
+            "checks": [{"id": "tests_pass", "status": "passed", "exit_code": 0}],
+        },
+        repair_history=(
+            {
+                "classification": "implementation_failure",
+                "error_codes": ("completion.artifact_missing",),
+                "repair_ready": True,
+                "retry_reason": "artifact missing",
+            },
+        ),
+    )
+
+    prompt = compile_execution_prompt(compiled_contract.contract, review_evidence=evidence)
+
+    # 1. The authoritative task body and requirements are present.
+    assert "## Assigned Task and Requirements" in prompt.text
+    assert "## Required Reading" in prompt.text
+    # 2. The procedure is requirement-to-evidence driven.
+    procedure = next(s.text for s in prompt.sections if s.id == "review_procedure")
+    assert "map it to code and tests" in procedure
+    assert "integration seams" in procedure
+    assert "missing behavior" in procedure
+    assert "scope drift" in procedure
+    assert "unfinished user-facing states" in procedure
+    # 3. Authoritative prior evidence and bounded repair history are retained.
+    evidence_section = next(s.text for s in prompt.sections if s.id == "prior_implementation_evidence")
+    assert "Authoritative changes:" in evidence_section
+    assert "repair_ready" in evidence_section or "repair" in evidence_section.casefold()
+    # 4. A compact requirement-to-evidence review result is requested and kept in the record.
+    assert "review_result" in prompt.text
+    assert "remaining_blockers" in prompt.text
+    guidance = next(s.text for s in prompt.sections if s.id == "review_result")
+    assert "clarification/planning path" in guidance
+    assert prompt.text.count("curl -sS -X POST") == 1
+
+
 def test_context_excerpt_rejects_duplicate_heading_and_oversized_content(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()

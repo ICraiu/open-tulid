@@ -26,6 +26,7 @@ from .verifier import (
     CompletionSubmission,
     DeterministicVerifier,
     VerificationResult,
+    _validate_review_result,
     normalize_artifacts,
 )
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
@@ -39,6 +40,7 @@ from .verification_runtime import (
     prepare_verification_copy,
 )
 from .repository_facts import capture_repository_snapshot, repository_identity
+from .prompts import is_review_transition
 
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -197,8 +199,21 @@ class CompletionService:
                 f"Transition {job.transition_id!r} is not defined.",
                 job.transition_id,
             ),))
+        if is_review_transition(transition):
+            review_result_errors = _validate_review_result(submission.review_result)
+            if review_result_errors:
+                return CompletionResult(False, errors=review_result_errors)
 
         actor = EventActor(type="executor", id=job.worker_id)
+        submission_data = {
+            "summary": submission.summary,
+            "attempt": submission.attempt,
+            "artifacts": [_artifact_to_dict(artifact) for artifact in submission.artifacts],
+            "changed_files": list(submission.changed_files),
+            "validation_evidence": dict(submission.validation_evidence),
+        }
+        if submission.review_result is not None:
+            submission_data["review_result"] = dict(submission.review_result)
         self.event_store.append(build_event(
             project_id=job.project_id,
             actor=actor,
@@ -208,13 +223,7 @@ class CompletionService:
             job_id=job.job_id,
             transition_id=job.transition_id,
             submission_id=submission_id,
-            data={
-                "summary": submission.summary,
-                "attempt": submission.attempt,
-                "artifacts": [_artifact_to_dict(artifact) for artifact in submission.artifacts],
-                "changed_files": list(submission.changed_files),
-                "validation_evidence": dict(submission.validation_evidence),
-            },
+            data=submission_data,
         ))
         self.job_store.update_status(
             job.job_id,
@@ -301,6 +310,7 @@ class CompletionService:
                 candidate_manifest_sha256=candidate.manifest_sha256,
                 executor=executor,
                 environment_identity=environment_identity,
+                review_transition=is_review_transition(transition),
             )
         except Exception as exc:
             duration_seconds = round(time.monotonic() - validation_started, 3)
@@ -569,6 +579,7 @@ class CompletionService:
                     )}
                     if commit_effect is not None else {}
                 ),
+                **({"review_result": dict(submission.review_result)} if submission.review_result is not None else {}),
                 "completion_submissions": _record_submission(
                     job.metadata,
                     submission_id,

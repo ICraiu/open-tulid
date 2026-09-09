@@ -49,6 +49,9 @@ class ArtifactSubmission:
     sha256: str | None = None
 
 
+REVIEW_RESULT_SCHEMA = "tulid.review_result/v1"
+
+
 @dataclass(frozen=True)
 class CompletionSubmission:
     submission_id: str | None = None
@@ -57,6 +60,10 @@ class CompletionSubmission:
     artifacts: tuple[ArtifactSubmission, ...] = ()
     changed_files: tuple[str, ...] = ()
     validation_evidence: Mapping[str, str] = field(default_factory=dict)
+    # Compact requirement-to-evidence result required for review transitions
+    # (plan 6B). It names the behavior, cited source/test evidence, defects/fixes,
+    # and remaining blockers. Retained in the completion/acceptance record.
+    review_result: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -388,8 +395,11 @@ class DeterministicVerifier:
         candidate_manifest_sha256: str | None = None,
         executor: object | None = None,
         environment_identity: str | None = None,
+        review_transition: bool = False,
     ) -> VerificationResult:
         errors: list[DomainError] = []
+        if review_transition:
+            errors.extend(_validate_review_result(submission.review_result))
         report: VerificationReport | None = None
         if (
             execution_contract is not None
@@ -1015,6 +1025,18 @@ def submission_from_mapping(payload: Mapping[str, object]) -> CompletionSubmissi
     evidence = payload.get("validation_evidence", {})
     if not isinstance(evidence, Mapping):
         evidence = {}
+    review_result = payload.get("review_result")
+    parsed_review = None
+    if review_result is not None:
+        if not isinstance(review_result, Mapping):
+            parsed_review = {"_invalid": "review_result must be an object"}
+        else:
+            validation_errors = _validate_review_result(review_result)
+            parsed_review = dict(review_result)
+            if validation_errors:
+                parsed_review["_review_result_invalid"] = ", ".join(
+                    item.message for item in validation_errors if isinstance(item, DomainError)
+                )
     return CompletionSubmission(
         submission_id=_optional_string(payload.get("submission_id")),
         attempt=_optional_int(payload.get("attempt")),
@@ -1022,7 +1044,65 @@ def submission_from_mapping(payload: Mapping[str, object]) -> CompletionSubmissi
         artifacts=_artifact_tuple(payload.get("artifacts", ())),
         changed_files=_string_tuple(payload.get("changed_files", ())),
         validation_evidence={str(key): str(value) for key, value in evidence.items()},
+        review_result=parsed_review,
     )
+
+
+def _validate_review_result(
+    review_result: Mapping[str, object] | None,
+) -> tuple[DomainError, ...]:
+    """Structural validation of the compact requirement-to-evidence review result.
+
+    A review must name the behavior and cite the source/test evidence inspected,
+    and must be an object. A remaining blocker is recorded as a distinct blocker
+    for the clarification/planning path: it prevents this completion from being
+    treated as verified implementation success.
+    """
+    if review_result is None:
+        return (_error(
+            "completion.review_result_missing",
+            "A review transition requires a compact review_result naming the behavior, "
+            "the source/test evidence, any defects/fixes, and remaining blockers.",
+            "review_result",
+        ),)
+    if "_invalid" in review_result or "_review_result_invalid" in review_result:
+        return (_error(
+            "completion.review_result_invalid",
+            "Review result is malformed; it must be an object with behavior/evidence fields.",
+            "review_result",
+        ),)
+    behavior = review_result.get("behavior")
+    evidence = review_result.get("evidence")
+    errors: list[DomainError] = []
+    if not isinstance(behavior, str) or not behavior.strip():
+        errors.append(_error(
+            "completion.review_result_behavior_missing",
+            "Review result must name at least one required behavior.",
+            "review_result.behavior",
+        ))
+    if not isinstance(evidence, str) or not evidence.strip():
+        errors.append(_error(
+            "completion.review_result_evidence_missing",
+            "Review result must cite the source/test evidence inspected for the reported behavior.",
+            "review_result.evidence",
+        ))
+    blockers = review_result.get("remaining_blockers", ())
+    if isinstance(blockers, Sequence) and not isinstance(blockers, (str, bytes)):
+        for raw in blockers:
+            if not isinstance(raw, str) or not raw.strip():
+                errors.append(_error(
+                    "completion.review_result_blocker_invalid",
+                    "A remaining blocker must be a non-empty string.",
+                    "review_result.remaining_blockers",
+                ))
+        if any(isinstance(raw, str) and raw.strip() for raw in blockers):
+            errors.append(_error(
+                "completion.review_blocked",
+                "Review found remaining product blockers; route them to the clarification/planning "
+                "path instead of recording verified implementation success.",
+                "review_result.remaining_blockers",
+            ))
+    return tuple(errors)
 
 
 def _contained_path(root_path: Path, value: str) -> Path | None:

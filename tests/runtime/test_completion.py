@@ -2398,6 +2398,140 @@ commands:
     assert meta["verification_report"]["checks"] == ["backend"]
 
 
+def test_review_submission_requires_and_persists_compact_review_result(tmp_path: Path):
+    """Plan 6B: a review must carry a requirement-to-evidence result naming the
+    behavior, cited evidence, defects/fixes, and remaining blockers; it is
+    retained on the accepted completion record."""
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    (tmp_path / "missing-base").mkdir()
+    store = _job_store(tmp_path / "missing-base")
+    workspace = tmp_path / "missing-base" / "workspace"
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    workflow = _workflow()
+    # Keep the transition id so it matches the seeded job; inject review semantics
+    # through the from-state, which is how a workflow names a review transition.
+    transition = replace(
+        workflow.transitions["code"],
+        from_state="SelfReview",
+        to_state="Done",
+        requires=replace(workflow.transitions["code"].requires, changed_files_required=False),
+    )
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=None, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+        "completion_token": "secret",
+    }).accepted is True
+
+    class PassingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            return VerificationResult(True, report=_FakeReport())
+
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=None,
+        candidate_root=tmp_path / "candidates",
+        verifier=PassingVerifier(),
+    )
+
+    # A review without a review_result is rejected as unverified.
+    missing = service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(summary="no result"),
+    )
+    assert missing.accepted is False
+    assert any("completion.review_result_missing" == e.code for e in missing.errors)
+
+    # A review whose blockers are unresolved is never ordinary verified success.
+    (tmp_path / "blocker-base").mkdir()
+    blocker_store = _job_store(tmp_path / "blocker-base")
+    assert blocker_store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+        "completion_token": "secret",
+    }).accepted is True
+    blocker_service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=blocker_store,
+        event_store=JsonlEventStore(tmp_path / "blocker-base" / "events"),
+        repo_root=None,
+        candidate_root=tmp_path / "blocker-base" / "candidates",
+        verifier=PassingVerifier(),
+    )
+    blocker = blocker_service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(
+            summary="review found a blocker",
+            review_result={
+                "behavior": "behavior",
+                "evidence": "code/tests",
+                "defects_fixes": [],
+                "remaining_blockers": ["product decision unresolved"],
+            },
+        ),
+    )
+    assert blocker.accepted is False
+    assert any("completion.review_blocked" == e.code for e in blocker.errors)
+
+    # A no-defect review with a genuine compact result is accepted and retained.
+    (tmp_path / "accept-base").mkdir()
+    accept_store = _job_store(tmp_path / "accept-base")
+    assert accept_store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+        "completion_token": "secret",
+    }).accepted is True
+    accept_service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=accept_store,
+        event_store=JsonlEventStore(tmp_path / "accept-base" / "events"),
+        repo_root=None,
+        candidate_root=tmp_path / "accept-base" / "candidates",
+        verifier=PassingVerifier(),
+    )
+    accepted = accept_service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(
+            submission_id="review-no-change",
+            summary="no in-scope defect",
+            review_result={
+                "behavior": "behavior",
+                "evidence": "code/tests inspected",
+                "defects_fixes": [],
+                "remaining_blockers": [],
+            },
+        ),
+    )
+    assert accepted.accepted is True
+    loaded = accept_store.get(job_id)
+    assert loaded.job is not None
+    assert loaded.job.metadata["review_result"]["behavior"] == "behavior"
+
+
 class _FakeReport:
     def to_dict(self) -> Mapping[str, object]:
         return {"checks": ["backend"], "passed": True}

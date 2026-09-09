@@ -599,32 +599,33 @@ def _compile_review_prompt(
         _section(
             "mission", "Review Mission",
             "\n".join((
-                f"Audit the implementation produced for: {contract.generated_contract.objective}",
-                "Use the authoritative prior implementation evidence below.",
+                f"Audit the implementation produced for task {contract.source_task.title!r} "
+                "against its requirements and the authoritative prior implementation evidence below.",
                 "Find a concrete in-scope defect and correct it, or submit a valid no-change review.",
                 "Do not restart implementation or perform unrelated cleanup.",
             )),
             "execution_contract", "generated_contract.objective",
-            "Frames self-review as an evidence-backed audit rather than another implementation pass.",
+            "Frames self-review as an evidence-backed, requirement-driven audit rather than another implementation pass.",
+            truncatable=True,
+        ),
+        _section(
+            "assigned_task", "Assigned Task and Requirements",
+            _contract_text(contract, include_requirements=True, include_objective=True),
+            "execution_contract", "generated_contract",
+            "States the authoritative task body and every requirement review must map to code or test evidence.",
+        ),
+        _section(
+            "required_reading", "Required Reading",
+            _required_reading_text(contract),
+            "context_file", _context_reading_refs(contract),
+            "Names every complete frozen source file (task, specification, canonical answers) review may read.",
             truncatable=True,
         ),
         _section(
             "prior_implementation_evidence", "Prior Implementation Evidence",
             _review_evidence_text(prior),
             "historical_job", evidence.source_job_id,
-            "Supplies the authoritative prior diff summary, checks, and repair history.",
-        ),
-        _section(
-            "execution_contract", "Review Contract",
-            _contract_text(contract, include_requirements=False, include_objective=False),
-            "execution_contract", "generated_contract",
-            "Keeps review corrections inside the original behavior and scope.",
-        ),
-        _section(
-            "requirements_audit", "Requirements Audit",
-            "\n".join(f"- {item}" for item in contract.generated_contract.requirements),
-            "execution_contract", "generated_contract.requirements",
-            "Lists behavior that review must map to code or test evidence.",
+            "Supplies the authoritative prior diff summary, checks, repair history, and an explicit no-evidence marker.",
         ),
         _section(
             "required_validation", "Required Validation", _checks_text(contract.resolved_checks),
@@ -633,26 +634,35 @@ def _compile_review_prompt(
         ),
         _section(
             "review_procedure", "Review Procedure", "\n".join((
-                "1. Map every requirement to prior check, code, or test evidence.",
-                "2. Inspect the authoritative changed files and named interfaces.",
-                "3. Identify a concrete in-scope defect, if any.",
-                "4. Make only a targeted correction; otherwise leave the workspace unchanged.",
-                "5. Run affected focused checks and every required project check.",
-                "6. Submit the correction or an explicit no-change review with fresh evidence.",
+                "1. Re-read the assigned task, then carry every requirement and settled answer into your working notes.",
+                "2. For each requirement, map it to code and tests: does the changed code satisfy the behavior, and does a test assert it?",
+                "3. Examine the relevant integration seams (within and across the named interfaces, persistence, and stages), not only the changed files.",
+                "4. Inspect beyond the changed files wherever a concrete requirement or prior failure points to locating the behavior.",
+                "5. Identify missing behavior, ineffective/brittle tests, regressions, scope drift, and unfinished user-facing states.",
+                "6. Make only a small targeted correction inside the task boundary; otherwise leave the workspace unchanged.",
+                "7. Run the narrowest affected tests, then every required project check.",
+                "8. Submit the correction or an explicit no-change review with fresh evidence and a compact review result.",
             )),
             "runtime_policy", f"compiler/v{PROMPT_COMPILER_VERSION}",
-            "Provides the distinct contract-to-change review loop.",
+            "Provides the distinct requirement-to-evidence review loop.",
         ),
         _section(
             "scope_reminder", "Review Boundaries",
             "Do not add abstractions, broaden tests, create planning reports, or edit unrelated files. "
-            "An empty diff is correct when no concrete defect exists.",
+            "An empty diff is correct when no concrete defect exists. A corrective patch must stay "
+            "inside the assigned task, pass the same global policy, and be promoted as a new verified candidate.",
             "runtime_policy", f"compiler/v{PROMPT_COMPILER_VERSION}",
-            "Prevents gratuitous review edits and broad cleanup.",
+            "Prevents gratuitous review edits, broad cleanup, and out-of-scope redesign.",
         ),
         _section(
-            "completion_submission", "Completion Submission", _completion_text(contract),
-            "runtime", "completion_api", "Provides the sole completion mechanism.",
+            "review_result", "Review Result",
+            _review_result_guidance_text(),
+            "runtime", "review_result",
+            "Requests the compact requirement-to-evidence result retained in the completion record.",
+        ),
+        _section(
+            "completion_submission", "Completion Submission", _completion_text(contract, review_result=True),
+            "runtime", "completion_api", "Provides the sole completion mechanism, including the review result.",
         ),
     )
     return _finalize(contract, "self_review", sections)
@@ -860,7 +870,7 @@ def _excerpts_text(contract: ExecutionContract) -> str:
     )
 
 
-def _completion_text(contract: ExecutionContract) -> str:
+def _completion_text(contract: ExecutionContract, *, review_result: bool = False) -> str:
     validation_ids = [check.id for check in contract.resolved_checks]
     artifacts: list[object] = (
         [{"type": artifact, "path": "required-output-path"} for artifact in contract.transition.requires.artifacts]
@@ -877,6 +887,8 @@ def _completion_text(contract: ExecutionContract) -> str:
         "changed_files": changed_files,
         "validation_evidence": evidence,
     }
+    if review_result:
+        example["review_result"] = _review_result_example()
     changed_files_rule = (
         "This transition requires a change. Replace the changed_files example with every actual changed workspace path."
         if contract.transition.requires.changed_files_required
@@ -894,6 +906,36 @@ def _completion_text(contract: ExecutionContract) -> str:
         json.dumps(example, sort_keys=True),
         "JSON",
         "```",
+    ))
+
+
+def _review_result_example() -> dict[str, object]:
+    """Compact result example a review worker must mirror and fill in.
+
+    The retained review result names the behavior, the relevant source/test
+    evidence inspected, any defects/fixes, and remaining product blockers. An
+    empty ``defects_fixes`` and ``remaining_blockers`` is valid for a genuine
+    no-defect review. A remaining product decision is a blocker for the existing
+    clarification/planning path, never an improvised redesign inside review.
+    """
+    return {
+        "behavior": "behavior required by the task",
+        "evidence": "source/tests inspected for it",
+        "defects_fixes": [
+            {"defect": "in-scope defect", "fix": "targeted fix", "status": "fixed"}
+        ],
+        "remaining_blockers": [],
+    }
+
+
+def _review_result_guidance_text() -> str:
+    return "\n".join((
+        "Retain one compact requirement-to-evidence result in the completion record.",
+        "For each required behavior, name it and cite the source and test evidence that satisfies it.",
+        "Record every concrete in-scope defect and its targeted fix, or state that none was found.",
+        "If a genuine product decision is unresolved, list it under remaining_blockers and stop: "
+        "it must go to the existing clarification/planning path, not be redesigned inside review.",
+        "Generic assurances without cited code/test evidence are not acceptable.",
     ))
 
 
@@ -918,6 +960,12 @@ def _review_evidence_text(prior: Mapping[str, object]) -> str:
                 "stderr": str(item.get("stderr", ""))[:400],
             }
             lines.append("- " + json.dumps(detail, sort_keys=True, separators=(",", ":")))
+        if not checks:
+            lines.append(
+                "No trusted checks are recorded for this task. This packet is not "
+                "evidence of a verified implementation; do not treat an empty diff "
+                "as if verification ran."
+            )
     history = prior.get("repair_history", ())
     if isinstance(history, Sequence) and not isinstance(history, (str, bytes)) and history:
         lines.append("Prior repair history:")
