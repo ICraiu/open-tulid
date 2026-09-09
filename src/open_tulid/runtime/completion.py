@@ -760,6 +760,8 @@ class CompletionService:
                         "path": change.path,
                         "before_sha256": change.before_sha256,
                         "after_sha256": change.after_sha256,
+                        "before_mode": change.before_mode,
+                        "after_mode": change.after_mode,
                     }
                     for change in candidate.changes
                 ),
@@ -1289,6 +1291,10 @@ def _candidate_change_plan(
                 "source_path": str(source),
                 "target_path": str(target),
                 "expected_after_sha256": change.after_sha256,
+                "expected_before_sha256": change.before_sha256,
+                "expected_before_mode": change.before_mode,
+                "expected_after_mode": change.after_mode,
+                "target_existed": target.exists(),
             })
     return tuple(planned)
 
@@ -1330,7 +1336,8 @@ def _validate_integrated_source(
                 f"Change {change.path!r} did not reach the integrated repository.",
                 str(target),
             ))
-        elif change.after_sha256 and _file_sha256(target) != change.after_sha256:
+        elif ((change.after_sha256 and _file_sha256(target) != change.after_sha256)
+              or (change.after_mode is not None and target.stat().st_mode & 0o777 != change.after_mode)):
             errors.append(_error(
                 "transaction.integrated_source_mismatch",
                 f"Change {change.path!r} content differs from the verified candidate.",
@@ -1358,7 +1365,8 @@ def _accepted_commit_sha(*, repo_root: Path | None, runner) -> str | None:
 
 def _same_file_content(left: Path, right: Path) -> bool:
     try:
-        return left.read_bytes() == right.read_bytes()
+        return (left.read_bytes() == right.read_bytes()
+                and left.stat().st_mode & 0o777 == right.stat().st_mode & 0o777)
     except OSError:
         return False
 

@@ -1216,6 +1216,7 @@ def _baseline_manifest_from_dict(raw: object) -> BaselineManifest:
             path=_required_string(_mapping(item, "baseline entry"), "path"),
             sha256=_required_string(_mapping(item, "baseline entry"), "sha256"),
             size=int(_mapping(item, "baseline entry").get("size", 0)),
+            mode=_mapping(item, "baseline entry").get("mode"),
         )
         for item in raw_entries
     )

@@ -69,6 +69,8 @@ class CandidateChange:
     path: str
     before_sha256: str | None = None
     after_sha256: str | None = None
+    before_mode: int | None = None
+    after_mode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,8 @@ class Candidate:
                     "path": change.path,
                     "before_sha256": change.before_sha256,
                     "after_sha256": change.after_sha256,
+                    "before_mode": change.before_mode,
+                    "after_mode": change.after_mode,
                 }
                 for change in self.changes
             ],
@@ -255,12 +259,13 @@ def capture_deliverable_manifest(root: Path) -> BaselineManifest:
             path=relative,
             sha256=_file_sha256(path),
             size=path.stat().st_size,
+            mode=path.stat().st_mode & 0o777,
         ))
     ordered = tuple(sorted(entries, key=lambda entry: entry.path))
     payload = {
         "schema": BASELINE_MANIFEST_SCHEMA,
         "entries": [
-            {"path": entry.path, "sha256": entry.sha256, "size": entry.size}
+            {"path": entry.path, "sha256": entry.sha256, "size": entry.size, "mode": entry.mode}
             for entry in ordered
         ],
     }
@@ -320,17 +325,20 @@ def _compute_delta(
     changes: list[CandidateChange] = []
     for path in sorted(set(after) - set(before)):
         entry = after[path]
-        changes.append(CandidateChange(KIND_ADD, path, None, entry.sha256))
+        changes.append(CandidateChange(KIND_ADD, path, None, entry.sha256, None, entry.mode))
     for path in sorted(set(before) - set(after)):
         entry = before[path]
-        changes.append(CandidateChange(KIND_DELETE, path, entry.sha256, None))
+        changes.append(CandidateChange(KIND_DELETE, path, entry.sha256, None, entry.mode, None))
     for path in sorted(set(before) & set(after)):
-        if before[path].sha256 != after[path].sha256:
+        if (before[path].sha256 != after[path].sha256 or
+                (before[path].mode is not None and before[path].mode != after[path].mode)):
             changes.append(CandidateChange(
                 KIND_EDIT,
                 path,
                 before[path].sha256,
                 after[path].sha256,
+                before[path].mode,
+                after[path].mode,
             ))
     return tuple(changes)
 
@@ -364,6 +372,8 @@ def _candidate_body(candidate: Candidate) -> dict[str, object]:
                 "path": change.path,
                 "before_sha256": change.before_sha256,
                 "after_sha256": change.after_sha256,
+                "before_mode": change.before_mode,
+                "after_mode": change.after_mode,
             }
             for change in candidate.changes
         ],

@@ -65,6 +65,7 @@ class FileManifestEntry:
     path: str
     sha256: str
     size: int
+    mode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ def capture_repository_snapshot(repo_root: Path | None) -> RepositorySnapshotRes
                 path=path.relative_to(root).as_posix(),
                 sha256=_file_sha256(path),
                 size=path.stat().st_size,
+                mode=path.stat().st_mode & 0o777,
             ))
         top_level_entries = tuple(sorted(
             path.name
@@ -184,6 +186,7 @@ def baseline_manifest_to_dict(manifest: BaselineManifest) -> dict[str, object]:
                 "path": entry.path,
                 "sha256": entry.sha256,
                 "size": entry.size,
+                **({"mode": entry.mode} if entry.mode is not None else {}),
             }
             for entry in manifest.entries
         ],
@@ -275,6 +278,7 @@ def _baseline_manifest(entries: tuple[FileManifestEntry, ...]) -> BaselineManife
                 "path": entry.path,
                 "sha256": entry.sha256,
                 "size": entry.size,
+                **({"mode": entry.mode} if entry.mode is not None else {}),
             }
             for entry in ordered
         ],

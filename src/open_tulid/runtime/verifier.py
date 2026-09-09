@@ -828,7 +828,8 @@ def _manifest_changes(
     after = {entry.path: entry for entry in post.entries}
     added = set(after) - set(before)
     removed = set(before) - set(after)
-    edited = tuple(sorted(path for path in set(before) & set(after) if before[path].sha256 != after[path].sha256))
+    edited = tuple(sorted(path for path in set(before) & set(after) if before[path].sha256 != after[path].sha256
+                          or (before[path].mode is not None and before[path].mode != after[path].mode)))
     renamed: list[tuple[str, str]] = []
     for old in sorted(removed):
         matches = sorted(new for new in added if before[old].sha256 == after[new].sha256)

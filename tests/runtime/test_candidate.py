@@ -41,6 +41,33 @@ def test_candidate_never_replaces_existing_evidence(tmp_path):
     assert (first.captured.storage_path / "app.py").read_text() == "first"
 
 
+def test_executable_change_is_verified_and_delivered(tmp_path):
+    from open_tulid.runtime.candidate import capture_deliverable_manifest
+    from open_tulid.runtime.completion import _candidate_change_plan, _validate_integrated_source
+    import shutil
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "run.sh").write_text("#!/bin/sh\nexit 0\n")
+    (repo / "run.sh").chmod(0o644)
+    baseline = capture_deliverable_manifest(repo)
+    workspace = tmp_path / "workspace"
+    shutil.copytree(repo, workspace)
+    (workspace / "run.sh").chmod(0o755)
+    captured = capture_candidate(workspace=workspace, storage_root=tmp_path / "store",
+                                 candidate_id="mode", baseline=baseline).captured
+    assert captured.manifest.sha256 != baseline.sha256
+    assert len(captured.candidate.changes) == 1
+    assert captured.candidate.changes[0].after_mode == 0o755
+    assert _validate_integrated_source(repo_root=repo, candidate=captured.candidate)
+    # The delivery operation must include the mode-only edit.
+    plan = _candidate_change_plan(repo_root=repo, candidate_storage=captured.storage_path,
+                              changes=captured.candidate.changes)
+    assert len(plan) == 1
+    shutil.copy2(plan[0]["source_path"], plan[0]["target_path"])
+    assert (repo / "run.sh").stat().st_mode & 0o777 == 0o755
+    assert not _validate_integrated_source(repo_root=repo, candidate=captured.candidate)
+
+
 def _baseline(entries: tuple[tuple[str, str, int], ...]) -> BaselineManifest:
     ordered = tuple(
         FileManifestEntry(path=path, sha256=sha256, size=size)
