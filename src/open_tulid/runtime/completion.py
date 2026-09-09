@@ -30,6 +30,10 @@ from .verifier import (
 )
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
 from .candidate import capture_candidate
+from .verification_runtime import (
+    ContainerCommandExecutor, VerificationEnvironment, environment_identity_of,
+    prepare_verification_copy,
+)
 
 
 TERMINAL_JOB_STATUSES = frozenset({
@@ -265,16 +269,33 @@ class CompletionService:
             },
         ))
         try:
+            verification_workspace = Path(job.workspace_path)
+            executor = self.verification_executor
+            environment_identity = self.verification_environment_identity
+            if frozen.contract is not None:
+                verification_workspace = prepare_verification_copy(
+                    candidate_path=captured.captured.storage_path,
+                    writable_root=captured.captured.storage_path.parent / "verification",
+                    copy_id=candidate.candidate_id,
+                )
+                if executor is None:
+                    # Durable, sanitized environment frozen before the worker
+                    # starts. CLI submission/recovery uses the same identity.
+                    environment = VerificationEnvironment(
+                        **dict(job.metadata.get("verification_environment") or {})
+                    )
+                    executor = ContainerCommandExecutor(environment=environment)
+                    environment_identity = environment_identity_of(environment)
             verification = self.verifier.verify(
-                workspace=Path(job.workspace_path),
+                workspace=verification_workspace,
                 output_dir=Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
                 transition=transition,
                 submission=submission,
                 execution_contract=frozen.contract,
                 candidate_id=candidate.candidate_id,
                 candidate_manifest_sha256=candidate.manifest_sha256,
-                executor=self.verification_executor,
-                environment_identity=self.verification_environment_identity,
+                executor=executor,
+                environment_identity=environment_identity,
             )
         except Exception as exc:
             duration_seconds = round(time.monotonic() - validation_started, 3)
@@ -318,7 +339,7 @@ class CompletionService:
         )
         promoted_files = _changed_file_plan(
             repo_root=self.repo_root,
-            workspace=Path(job.workspace_path),
+            workspace=captured.captured.storage_path if frozen.contract is not None else Path(job.workspace_path),
             changed_files=submission.changed_files,
         )
         commit_effect = _commit_plan(

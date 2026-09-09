@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from open_tulid.runtime.verification_runtime import HostCommandExecutor
+
 from pathlib import Path
 
 from open_tulid.domain import RequirementDefinition, Task, TransitionDefinition
@@ -142,7 +144,7 @@ def test_command_policy_digest_sensitive_to_order_and_definition():
 def test_report_carries_request_policy_candidate_and_environment_identity(tmp_path):
     compiled = _compiled(tmp_path)
     assert compiled.contract is not None
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=_repo(tmp_path),
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -168,7 +170,7 @@ def test_report_carries_request_policy_candidate_and_environment_identity(tmp_pa
 def test_check_result_captures_cwd_timeout_expected_exit_timing_and_log_refs(tmp_path):
     compiled = _compiled(tmp_path)
     assert compiled.contract is not None
-    report = DeterministicVerifier().verify(
+    report = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=_repo(tmp_path),
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -210,7 +212,7 @@ commands:
         transition=_transition(),
     )
     assert compiled.contract is not None
-    report = DeterministicVerifier().verify(
+    report = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -269,7 +271,7 @@ commands:
     )
     assert compiled.contract is not None
     candidate_manifest = "immutable-candidate-sha"
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -308,7 +310,7 @@ commands:
         transition=_transition(),
     )
     assert compiled.contract is not None
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -344,7 +346,7 @@ commands:
         transition=_transition(),
     )
     assert compiled.contract is not None
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -375,7 +377,7 @@ def test_deprecated_baseline_repetition_does_not_hide_actual_change(tmp_path):
     baseline = compiled.contract.baseline_manifest.sha256
     # Mutate the tracked source before verifying, so the real post tree differs.
     (repo / "src" / "app.js").write_text("module.exports = () => 'changed';\n", encoding="utf-8")
-    report = DeterministicVerifier().verify(
+    report = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),

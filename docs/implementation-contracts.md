@@ -10,7 +10,8 @@ and authoritative.
 
 A worker is free to create, edit, rename, and delete any files required by its
 task. Tulid does **not** reject a completion because a file was not predicted in
-advance. **File diffs are never part of the contract acceptance decision.**
+advance. **Predicted file lists are never acceptance criteria.** Verification still rejects
+commands that mutate the captured deliverable source or committed lockfiles.
 
 ## What Tulid removed
 
@@ -53,7 +54,7 @@ commands:
       exit_code: 0
 ```
 
-- `commands` is a list of deterministic, explicit, non-empty `argv` arrays.
+- `commands` is a non-empty ordered list of deterministic, explicit, non-empty `argv` arrays.
 - `working_directory` is workspace-relative and defaults to `.`.
 - `timeout_seconds` defaults to `300`.
 - `expect.exit_code` defaults to `0`; a command passes only when that exit
@@ -72,15 +73,17 @@ At scheduling time a `Todo` `ImplementationTask` is selected directly for
 `ImplementTask` under the project global contract — no `codex_contract`, no
 `PrepareExecutionContract`, no regeneration loop.
 
-1. Tulid runs the configured commands in the completed worker workspace.
+1. Tulid captures the completed source and runs every frozen global command in
+   a writable copy, inside the same resolved project image as the worker. Missing
+   image/environment evidence is a blocker; production never falls back to host execution.
 2. Each command passes only when its configured exit expectation is met.
 3. `stdout`, `stderr`, and the exit status of every command are retained as
    verification evidence.
 4. Timeouts, command-not-found, nonzero exits, and malformed command definitions
    produce clear, actionable feedback.
 5. Bounded retries reuse the **same** task and the **same** global command policy.
-6. `SelfReview` is an ordinary workflow transition and can run the same global
-   commands again if configured.
+6. Implementation and `SelfReview` inherit the same ordered project policy.
+   The configured worker does not select a smaller acceptance subset.
 
 ### Lifecycle
 
@@ -111,3 +114,17 @@ the project's command-only global contract.
 - A rejected completion retries on the **same** `ImplementTask` job with verifier
   feedback under the global retry policy; it never re-enters contract preparation
   and never resets the task to `Todo`.
+
+## Component discovery
+
+The project global entry point must discover every required suite, including
+Python/research, frontend tests/build, and deterministic integrated behavior when
+promised by the specification. Successful command names alone are not coverage.
+Use project-owned discovery assertions for missing/empty suites and explicitly
+record any scope deferrals. A newly introduced component must join this entry
+point before it can pass; tasks do not acquire their own command lists.
+
+See [the staged Wealthy Scholar setup](../examples/wealthy-scholar-verification/README.md)
+for audited manifests, a complete ordered policy, and a strict discovery runner.
+Its missing application setup must be resolved on an isolated copy before
+admitting dependent tasks. This example has not been installed in the live project.

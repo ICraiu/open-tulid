@@ -25,7 +25,7 @@ class CommandExpectation:
 @dataclass(frozen=True)
 class ProjectCommand:
     """A deterministic, explicit, non-empty argv command that Tulid runs in the
-    completed worker workspace to verify the project.
+    captured candidate in the declared project environment to verify the project.
 
     The command passes only when its configured exit expectation is met. There is
     no file/directory allowlist, no predicted-file requirement, and no per-task
@@ -192,8 +192,8 @@ def _parse_commands(raw: object, path: Path, errors: list[DomainError]) -> tuple
     if raw is None:
         errors.append(_error("contract.commands_missing", "Project contract requires a non-empty commands list.", location))
         return ()
-    if not isinstance(raw, list):
-        errors.append(_error("contract.commands_invalid", "commands must be a list of command definitions.", location))
+    if not isinstance(raw, list) or not raw:
+        errors.append(_error("contract.commands_invalid", "commands must be a non-empty list of command definitions.", location))
         return ()
     parsed: list[ProjectCommand] = []
     seen: set[str] = set()

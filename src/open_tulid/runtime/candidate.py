@@ -144,7 +144,7 @@ def capture_candidate(
     storage_root = Path(storage_root)
     storage = storage_root / candidate_id
     try:
-        pre = _deliverable_manifest(workspace)
+        pre = capture_deliverable_manifest(workspace)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(
             "candidate.capture_failed",
@@ -162,8 +162,8 @@ def capture_candidate(
             location=str(storage),
         ),))
     try:
-        post = _deliverable_manifest(workspace)
-        stored = _deliverable_manifest(storage)
+        post = capture_deliverable_manifest(workspace)
+        stored = capture_deliverable_manifest(storage)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(
             "candidate.capture_failed",
@@ -223,7 +223,7 @@ def capture_candidate(
             "Cannot persist the sealed candidate record.",
             location=str(storage_root),
         ),))
-    if post.sha256 != _deliverable_manifest(workspace).sha256:
+    if post.sha256 != capture_deliverable_manifest(workspace).sha256:
         # The workspace mutated after the sealed snapshot was confirmed but
         # before the record was written; do not accept a now-stale seal.
         return CaptureCandidateResult(errors=(_candidate_error(
@@ -241,9 +241,10 @@ def capture_candidate(
     ))
 
 
-def _deliverable_manifest(root: Path) -> BaselineManifest:
+def capture_deliverable_manifest(root: Path) -> BaselineManifest:
+    """Hash the authoritative deliverable surface used by capture and verification."""
     entries: list[FileManifestEntry] = []
-    for path in _walk_deliverables(root):
+    for path in iter_deliverable_files(root):
         relative = path.relative_to(root).as_posix()
         entries.append(FileManifestEntry(
             path=relative,
@@ -265,7 +266,8 @@ def _deliverable_manifest(root: Path) -> BaselineManifest:
     )
 
 
-def _walk_deliverables(root: Path):
+def iter_deliverable_files(root: Path):
+    """Walk source deterministically, excluding only declared ephemeral directories."""
     import os
     for current, directory_names, file_names in os.walk(root):
         directory_names[:] = sorted(

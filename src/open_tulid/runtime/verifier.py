@@ -5,7 +5,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -340,8 +340,7 @@ class DeterministicVerifier:
         self.validation_implementations = dict(validation_implementations or {})
         self.validation_context_factory = validation_context_factory
         # Plan 4B: a verification command executor decides where/how checks run.
-        # ``None`` means the deterministic host strategy. The default is chosen
-        # lazily so container machinery stays optional for the deterministic suite.
+        # Missing environment fails closed; tests may explicitly inject a host executor.
         self.executor = executor
         self.environment_identity = environment_identity
 
@@ -377,6 +376,7 @@ class DeterministicVerifier:
                 candidate_id=candidate_id,
                 candidate_manifest_sha256=candidate_manifest_sha256,
                 environment_identity=effective_environment_identity,
+                project_image_identity=getattr(getattr(effective_executor, "environment", None), "project_image_identity", None),
             )
             report, enforcement_errors = self._enforce_execution_contract(
                 workspace=workspace,
@@ -763,18 +763,29 @@ def _run_contract_checks(
         if check.runner != "command":
             continue
         outcome = command_executor.execute(_as_verification_command(check), workspace)
-        results.append(outcome.check)
+        log_root = workspace / ".open-tulid" / "verification-logs"
+        log_root.mkdir(parents=True, exist_ok=True)
+        refs = []
+        for stream in ("stdout", "stderr"):
+            path = log_root / f"{len(results):03d}.{stream}.log"
+            path.write_text(getattr(outcome.check, stream), encoding="utf-8")
+            refs.append(str(path))
+        results.append(replace(
+            outcome.check,
+            stdout=_bounded_excerpt(outcome.check.stdout),
+            stderr=_bounded_excerpt(outcome.check.stderr),
+            log_refs=tuple(refs),
+        ))
         if outcome.error is not None:
             errors.append(outcome.error)
     return tuple(results), tuple(errors)
 
 
 def _default_executor():
-    # Plan 4B: without an injected executor, verification runs deterministically
-    # on the host for unit/e2e tests. The production runtime injects the
-    # container strategy against the resolved project image.
-    from open_tulid.runtime.verification_runtime import HostCommandExecutor
-    return HostCommandExecutor()
+    # Missing environment is an explicit blocker. Host execution is available
+    # only through explicit injection by deterministic tests.
+    from open_tulid.runtime.verification_runtime import ContainerCommandExecutor, VerificationEnvironment
+    return ContainerCommandExecutor(environment=VerificationEnvironment())
 
 
 def _as_verification_command(check) -> VerificationCommand:
@@ -803,10 +814,8 @@ def _workspace_manifest_sha256(workspace: Path) -> str:
     Used to stop a report from blindly repeating the baseline digest as the
     candidate/post digest when the source tree actually changed.
     """
-    snapshot = capture_repository_snapshot(workspace)
-    if snapshot.accepted and snapshot.snapshot is not None:
-        return snapshot.snapshot.baseline.sha256
-    return ""
+    from .candidate import capture_deliverable_manifest
+    return capture_deliverable_manifest(workspace).sha256
 
 
 def _verification_incomplete_message(report: "VerificationReport") -> str:
@@ -1054,3 +1063,10 @@ def _git_changed_files(workspace: Path) -> set[str] | None:
         if path:
             changed.add(path)
     return changed
+
+
+def _bounded_excerpt(value: str) -> str:
+    if len(value) <= LOG_EXCERPT_CHARACTER_LIMIT:
+        return value
+    marker = "\n[output omitted; full log retained as artifact]"
+    return value[:LOG_EXCERPT_CHARACTER_LIMIT - len(marker)] + marker

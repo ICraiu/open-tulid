@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from open_tulid.runtime.verification_runtime import HostCommandExecutor
+
 import subprocess
 from pathlib import Path
 
@@ -245,9 +247,10 @@ def test_container_executor_timeout_terminates_container_and_records_interrupted
     assert outcome.error is not None and outcome.error.code == "verification.check_timeout"
     # docker stop + rm -f were issued so the container is terminated.
     docker_run = runner.calls[0][0]
-    assert any("open-tulid-verify-slow" in token for token in docker_run)
+    container_name = docker_run[docker_run.index("--name") + 1]
+    assert container_name.startswith("open-tulid-verify-")
     stop_calls = [c for c in runner.calls if "stop" in c[0]]
-    assert stop_calls, runner.calls
+    assert stop_calls[0][0][-1] == container_name
 
 
 def test_container_executor_reports_env_blocker_without_passing_model_credentials(tmp_path):
@@ -267,7 +270,7 @@ def test_verifier_carries_environment_identity_and_injected_executor(tmp_path):
     compiled = _compiled(tmp_path)
     assert compiled.contract is not None
     from open_tulid.runtime.verification_runtime import HostCommandExecutor
-    verifier = DeterministicVerifier()
+    verifier = DeterministicVerifier(executor=HostCommandExecutor())
     result = verifier.verify(
         workspace=_repo_copy(tmp_path),
         transition=_transition(),
@@ -284,3 +287,66 @@ def test_verifier_carries_environment_identity_and_injected_executor(tmp_path):
     assert report.environment_identity == "env:linux-x86_64"
     assert report.request_sha256
     assert report.not_run_checks == 0
+
+
+def test_installed_dependencies_do_not_change_committed_lock_identity(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "package-lock.json").write_text('{"lockfileVersion": 3}')
+    before = capture_lockfile_identity(repo)
+    dependency = repo / "node_modules" / "package" / "package.json"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text('{"name": "installed"}')
+    assert capture_lockfile_identity(repo) == before
+    (repo / "package-lock.json").write_text('{"lockfileVersion": 2}')
+    assert capture_lockfile_identity(repo) != before
+
+
+def test_image_resolution_pins_identity_without_starting_or_pulling():
+    from open_tulid.runtime.verification_runtime import resolve_project_image
+    runner = FakeRunner(stdout="sha256:" + "a" * 64 + "\n")
+    assert resolve_project_image("project:latest", "docker", runner=runner) == "sha256:" + "a" * 64
+    assert runner.calls[0][0] == ("docker", "image", "inspect", "--format", "{{.Id}}", "project:latest")
+
+
+def test_concurrent_verification_containers_have_distinct_names(tmp_path):
+    runner = FakeRunner()
+    executor = ContainerCommandExecutor(environment=VerificationEnvironment(project_image_identity="image"), runner=runner)
+    repo = _make_repo(tmp_path)
+    for _ in range(2):
+        executor.execute(VerificationCommand("unsafe name/../", ("true",)), repo)
+    names = [args[args.index("--name") + 1] for args, _ in runner.calls]
+    assert names[0] != names[1]
+    assert all(name.startswith("open-tulid-verify-") and "/" not in name for name in names)
+
+
+def test_container_start_errors_are_environment_blockers(tmp_path):
+    for code in (125, 126, 127):
+        executor = ContainerCommandExecutor(
+            environment=VerificationEnvironment(project_image_identity="image"),
+            runner=FakeRunner(returncode=code, stderr="runtime failed"),
+        )
+        result = executor.execute(VerificationCommand("check", ("node", "--test")), _make_repo(tmp_path))
+        assert result.check.status == "environment_error"
+        assert result.error.code == "verification.env_image_unavailable"
+
+
+def test_source_under_build_directory_is_not_exempt_from_mutation_checks(tmp_path):
+    compiled = _compiled(tmp_path)
+    repo = _repo_copy(tmp_path)
+    (repo / "build").mkdir()
+    source = repo / "build/versioned.js"
+    source.write_text("before")
+
+    class MutatingExecutor(HostCommandExecutor):
+        def execute(self, command, workspace):
+            source.write_text("mutated")
+            return super().execute(command, workspace)
+
+    result = DeterministicVerifier(executor=MutatingExecutor()).verify(
+        workspace=repo, transition=_transition(),
+        submission=CompletionSubmission(changed_files=("src/app.js",)),
+        execution_contract=compiled.contract,
+    )
+    assert not result.accepted
+    assert result.report.source_mutated
+    assert any(error.code == "verification.source_mutation" for error in result.errors)

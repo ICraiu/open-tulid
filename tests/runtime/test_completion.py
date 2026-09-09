@@ -1499,3 +1499,113 @@ def _workflow_with_requires(requires: RequirementDefinition) -> WorkflowDefiniti
         }),
         storage=workflow.storage,
     )
+
+
+def _global_completion(tmp_path, monkeypatch, *, image=True, returncode=0):
+    """Real frozen job -> candidate capture -> container verifier -> workflow."""
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    from open_tulid.runtime.candidate import capture_deliverable_manifest
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [node, --test]
+  - name: research
+    argv: [uv, run, --frozen, pytest]
+  - name: frontend
+    argv: [npm, run, build]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "app.py").write_text("sealed source\n")
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=workspace, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    metadata = {
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+    }
+    identity = "sha256:" + "a" * 64
+    if image:
+        metadata["verification_environment"] = {
+            "project_image_identity": identity, "container_user": "1000:1000",
+            "container_workspace": "/workspace/project",
+        }
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata=metadata).accepted
+    calls = []
+    verified_paths = []
+
+    def docker_runner(args, **kwargs):
+        # Only this test's fake container boundary may execute; no Docker call.
+        calls.append(args)
+        assert args[:2] == ("docker", "run")
+        assert identity in args
+        assert "--entrypoint" in args and "/bin/sh" in args
+        assert "1000:1000" in args
+        assert "OPEN_TULID_VERIFICATION=1" in args
+        assert not any("TOKEN" in part or "PROXY" in part for part in args)
+        mount = args[args.index("-v") + 1]
+        verification_copy = Path(mount.split(":")[0])
+        verified_paths.append(verification_copy)
+        assert verification_copy != workspace
+        assert (verification_copy / "app.py").read_text() == "sealed source\n"
+        # A worker racing after capture cannot change the verifier's bytes.
+        (workspace / "app.py").write_text("late worker edit\n")
+        return subprocess.CompletedProcess(args, returncode if len(calls) == 2 else 0,
+                                           "complete log\n" * 1000, "")
+
+    monkeypatch.setattr("open_tulid.runtime.verification_runtime.subprocess.run", docker_runner)
+    events = JsonlEventStore(tmp_path / "events")
+    adapter = FakeAdapter(_task())
+    service = CompletionService(workflow=workflow, adapter=adapter, job_store=store, event_store=events)
+    result = service.submit(job_id=job_id, token="secret", submission=CompletionSubmission(
+        submission_id="component-submission", changed_files=("app.py",),
+    ))
+    report = next(event.data["verification_report"] for event in events.iter_events()
+                  if event.event_type == "ExecutionCompletionValidationFinished")
+    if image:
+        assert [check["id"] for check in report["checks"]] == ["backend", "research", "frontend"]
+        assert report["project_image_identity"] == identity
+        assert report["environment_identity"]
+        assert report["candidate_manifest_sha256"] == report["post_manifest_sha256"]
+        assert capture_deliverable_manifest(verified_paths[0]).sha256 == report["candidate_manifest_sha256"]
+        assert len(report["checks"][0]["stdout"]) <= 2000
+        assert Path(report["checks"][0]["log_refs"][0]).read_text() == "complete log\n" * 1000
+    return result, adapter, calls, report, service, job_id
+
+
+def test_global_completion_verifies_sealed_candidate_in_frozen_environment(tmp_path, monkeypatch):
+    result, adapter, calls, report, service, job_id = _global_completion(tmp_path, monkeypatch)
+    assert result.accepted, result.errors
+    assert adapter.moved_to == "CodeReview"
+    assert len(calls) == 3
+    replay = service.submit(job_id=job_id, token="secret", submission=CompletionSubmission(
+        submission_id="component-submission",
+    ))
+    assert replay.accepted
+    assert len(calls) == 3
+
+
+def test_global_completion_cannot_hide_failed_component_with_later_success(tmp_path, monkeypatch):
+    result, adapter, calls, report, *_ = _global_completion(tmp_path, monkeypatch, returncode=1)
+    assert not result.accepted
+    assert adapter.moved_to is None
+    assert len(calls) == 3
+    assert [check["status"] for check in report["checks"]] == ["passed", "failed", "passed"]
+
+
+def test_global_completion_without_frozen_environment_never_runs_on_host(tmp_path, monkeypatch):
+    result, adapter, calls, report, *_ = _global_completion(tmp_path, monkeypatch, image=False)
+    assert not result.accepted
+    assert adapter.moved_to is None
+    assert not calls
+    assert all(check["status"] == "environment_error" for check in report["checks"])

@@ -33,6 +33,7 @@ ACTIVE_JOB_STATUSES = frozenset({
 })
 
 IMMUTABLE_JOB_METADATA_KEYS = frozenset({
+    "verification_environment",
     "execution_contract",
     "execution_contract_sha256",
     "prompt_packet",

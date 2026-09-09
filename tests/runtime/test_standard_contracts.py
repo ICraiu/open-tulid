@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from open_tulid.runtime.verification_runtime import HostCommandExecutor
+
 import hashlib
 from pathlib import Path
 from types import MappingProxyType
@@ -175,7 +177,7 @@ def test_global_e2e_verifier_runs_commands_in_configured_dir_with_exit_expectati
     assert tests_check.argv == ("python", "check_verify.py", "tests")
     assert tests_check.working_directory == "."
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=transition,
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -214,7 +216,7 @@ commands:
     )
     assert compiled.contract is not None
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -253,7 +255,7 @@ commands:
     )
     assert compiled.contract is not None
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=_transition(),
         submission=CompletionSubmission(changed_files=("src/app.js",)),
@@ -289,7 +291,7 @@ def test_verifier_allows_worker_to_add_previously_unknown_file_and_directory(tmp
     (repo / "research").mkdir()
     (repo / "research" / "notes.md").write_text("# Plan\n", encoding="utf-8")
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=transition,
         submission=CompletionSubmission(changed_files=("research/notes.md",)),
@@ -393,7 +395,7 @@ retry:
         encoding="utf-8",
     )
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=project_root,
         transition=transition,
         submission=CompletionSubmission(changed_files=("tests/test_evidence.py",)),
@@ -827,3 +829,26 @@ def test_job_payload_rejects_tampered_frozen_context_file(tmp_path):
 
     assert loaded.accepted is False
     assert loaded.errors[0].code == "execution_contract.hash_mismatch"
+
+
+def test_empty_global_command_policy_is_rejected_before_admission(tmp_path):
+    (tmp_path / STANDARD_CONTRACT_FILENAME).write_text("schema: tulid.contract/v1\ncommands: []\n")
+    from open_tulid.runtime.standard_contracts import load_standard_contract
+    result = load_standard_contract(tmp_path)
+    assert not result.accepted
+    assert result.contract is None
+
+
+def test_command_projection_preserves_nonzero_expectation(tmp_path):
+    _contract(tmp_path, """schema: tulid.contract/v1
+commands:
+  - name: expected_failure
+    argv: [python, -c, "raise SystemExit(3)"]
+    expect: {exit_code: 3}
+""")
+    compiled = compile_standard_execution_contract(
+        project_root=tmp_path, repo_root=_repo(tmp_path),
+        task=_implementation_task(), transition=_transition(),
+    )
+    assert compiled.accepted, compiled.errors
+    assert compiled.contract.commands[0].expect.exit_code == 3

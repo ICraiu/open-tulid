@@ -35,6 +35,7 @@ from .prompt_versions import (
     SUPPORTED_PROMPT_COMPILER_VERSIONS,
 )
 from .standard_contracts import (
+    CommandExpectation,
     ProjectCommand,
     StandardContract,
     load_standard_contract,
@@ -140,6 +141,7 @@ class ExecutionContract:
                 argv=check.argv,
                 working_directory=check.working_directory,
                 timeout_seconds=check.timeout_seconds,
+                expect=CommandExpectation(exit_code=check.expect.exit_code),
             ))
         return tuple(commands)
 

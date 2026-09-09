@@ -1,0 +1,26 @@
+schema: tulid.contract/v1
+runtime:
+  container_user: "1000:1000"
+  opencode_config_home: .open-tulid/home
+commands:
+  - name: project_setup
+    argv: [python3, tools/verify_project.py, --inventory]
+    timeout_seconds: 60
+  - name: prepare_backend
+    argv: [npm, ci, --prefix, backend, --no-audit, --no-fund]
+    timeout_seconds: 600
+  - name: prepare_frontend
+    argv: [npm, ci, --prefix, frontend, --no-audit, --no-fund]
+    timeout_seconds: 600
+  - name: prepare_integration
+    argv: [npm, ci, --prefix, tests, --no-audit, --no-fund]
+    timeout_seconds: 600
+  - name: prepare_research
+    argv: [uv, sync, --locked, --project, research, --all-extras]
+    timeout_seconds: 600
+  - name: project_components
+    argv: [python3, tools/verify_project.py]
+    timeout_seconds: 3600
+retry:
+  max_attempts: 3
+  visible_feedback: true

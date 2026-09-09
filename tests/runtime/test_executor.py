@@ -459,11 +459,48 @@ def test_normalize_ephemeral_completion_fields_only_rewrites_job_header():
     assert norm(preview) != norm(different)
 
 
+@pytest.mark.parametrize("global_policy", [False, True])
 def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     tmp_path: Path,
     monkeypatch,
+    global_policy,
 ):
     workspace = tmp_path / "workspace"
+    metadata = {"completion_token": "secret"}
+    repo = None
+    image_identity = "sha256:" + "a" * 64
+    verification_calls = []
+    if global_policy:
+        import subprocess
+        from open_tulid.runtime.execution_contracts import compile_standard_execution_contract, execution_contract_to_dict
+        from open_tulid.runtime.prompts import compile_execution_prompt
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("source")
+        tracker = tmp_path / "tracker"
+        tracker.mkdir()
+        (tracker / "contract.yaml").write_text("schema: tulid.contract/v1\ncommands:\n  - name: project\n    argv: [python, -c, pass]\n")
+        compiled = compile_standard_execution_contract(
+            project_root=tracker, repo_root=repo, task=FakeAdapter().read_task(TASK_ID).task,
+            transition=_workflow().transitions["code"],
+        ).contract
+        assert compiled
+        prompt = compile_execution_prompt(compiled)
+        metadata.update(execution_contract=execution_contract_to_dict(compiled),
+                        execution_contract_sha256=compiled.sha256,
+                        prompt_packet=prompt.text, prompt_packet_sha256=prompt.manifest.packet_sha256,
+                        prompt_manifest=prompt.manifest.to_dict())
+        monkeypatch.setattr("open_tulid.runtime.verification_runtime.resolve_project_image",
+                            lambda image, executable: image_identity)
+        original_run = subprocess.run
+        def verify_container(args, **kwargs):
+            if args[0] == "git":
+                return original_run(args, **kwargs)
+            verification_calls.append(args)
+            assert args[:2] == ("docker", "run")
+            assert image_identity in args
+            return subprocess.CompletedProcess(args, 0, "project verified", "")
+        monkeypatch.setattr("open_tulid.runtime.verification_runtime.subprocess.run", verify_container)
     store = FileExecutionJobStore(tmp_path / "jobs")
     assert store.create(ExecutionJob(
         job_id=JOB_ID,
@@ -472,12 +509,15 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
         transition_id="code",
         worker_id="codex",
         workspace_path=str(workspace),
-        metadata={"completion_token": "secret"},
+        metadata=metadata,
     )).accepted is True
     adapter = FakeAdapter()
     seen: dict[str, object] = {}
 
     def fake_run_agent_container(request, *, docker_executable):
+        if global_policy:
+            assert request.image == image_identity
+            assert store.get(JOB_ID).job.metadata["verification_environment"]["project_image_identity"] == image_identity
         seen["args"] = request.args
         seen["endpoint"] = request.env["OPEN_TULID_COMPLETION_ENDPOINT"]
         seen["prompt"] = request.env["OPEN_TULID_PROMPT_PACKET"]
@@ -524,7 +564,7 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
             completion_container_host="127.0.0.1",
             worker_args={"codex": ("exec", "{prompt_packet}")},
         ),
-        project_config=ProjectConfig(name="Agent", tracker_path="Agent"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent", repo_root=repo),
     )
 
     result = executor.run(JOB_ID)
@@ -537,12 +577,15 @@ def test_executor_serves_completion_endpoint_and_accepts_before_worker_exit(
     assert seen["prompt"] == "/workspace/project/.open-tulid/prompt-packet.md"
     assert (workspace / ".open-tulid" / "prompt-packet.md").is_file()
     prompt = (workspace / ".open-tulid" / "prompt-packet.md").read_text(encoding="utf-8")
-    assert "## Completion Submission" in prompt
-    assert "When the work and required validations are complete, submit completion evidence with `curl`." in prompt
-    assert "curl -sS -X POST \\" in prompt
-    assert prompt.rstrip().endswith(
-        "A zero exit code without an accepted completion submission is a failed Tulid job."
-    )
+    if not global_policy:
+        assert "## Completion Submission" in prompt
+        assert "When the work and required validations are complete, submit completion evidence with `curl`." in prompt
+        assert "curl -sS -X POST \\" in prompt
+        assert prompt.rstrip().endswith(
+            "A zero exit code without an accepted completion submission is a failed Tulid job."
+        )
+    else:
+        assert len(verification_calls) == 1
     assert adapter.moved_to == "CodeReview"
     loaded = store.get(JOB_ID)
     assert loaded.job is not None

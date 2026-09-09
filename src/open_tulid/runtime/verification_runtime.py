@@ -22,9 +22,11 @@ project code directly on the Tulid host. This module provides:
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, Sequence
@@ -34,7 +36,10 @@ from open_tulid.runtime.repository_facts import KNOWN_MANIFESTS, canonical_sha25
 from open_tulid.runtime.verifier import VerificationCheckResult, VerificationCommand
 
 # Committed dependency sources whose content must not change during verification.
-LOCKFILE_NAMES = frozenset(KNOWN_MANIFESTS)
+LOCKFILE_NAMES = frozenset(KNOWN_MANIFESTS) | {
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.lock", "Gemfile.lock", "Pipfile.lock", "go.sum",
+}
 
 # Outcome of running one global command, bound to that exact command/workspace.
 @dataclass(frozen=True)
@@ -141,7 +146,8 @@ def capture_lockfile_identity(workspace: Path) -> LockfileIdentity:
     committed locks, which is rejected rather than silently allowed.
     """
     entries: list[tuple[str, str]] = []
-    for path in sorted(workspace.rglob("*")):
+    from .candidate import iter_deliverable_files
+    for path in iter_deliverable_files(workspace):
         if not path.is_file():
             continue
         if path.name not in LOCKFILE_NAMES:
@@ -161,9 +167,8 @@ def capture_lockfile_identity(workspace: Path) -> LockfileIdentity:
 class HostCommandExecutor:
     """Deterministic host subprocess strategy (unit/e2e tests).
 
-    Kept as the default so the deterministic suite exercises the same check
-    semantics without depending on Docker or the declared project image. The
-    production runtime uses :class:`ContainerCommandExecutor` instead.
+    Explicitly injected by tests to exercise check semantics without Docker.
+    Production never defaults to this executor.
     """
 
     def execute(
@@ -179,7 +184,7 @@ class HostCommandExecutor:
                 id=command.name,
                 status="environment_error",
                 argv=command.argv,
-                stderr=_bounded_excerpt("working directory unavailable"),
+                stderr=_output_text("working directory unavailable"),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=expected,
@@ -206,8 +211,8 @@ class HostCommandExecutor:
                 id=command.name,
                 status="timeout",
                 argv=command.argv,
-                stdout=_bounded_excerpt(_as_text(exc.stdout)),
-                stderr=_bounded_excerpt(_as_text(exc.stderr)),
+                stdout=_output_text(_as_text(exc.stdout)),
+                stderr=_output_text(_as_text(exc.stderr)),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=expected,
@@ -225,7 +230,7 @@ class HostCommandExecutor:
                 id=command.name,
                 status="environment_error",
                 argv=command.argv,
-                stderr=_bounded_excerpt(str(exc)),
+                stderr=_output_text(str(exc)),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=expected,
@@ -239,16 +244,14 @@ class HostCommandExecutor:
                 command.name,
             ))
         duration = _seconds_since(start_ns)
-        stdout_ok = all(value in completed.stdout for value in ())
-        stderr_ok = all(value in completed.stderr for value in ())
-        passed = completed.returncode == expected and stdout_ok and stderr_ok
+        passed = completed.returncode == expected
         check = VerificationCheckResult(
             id=command.name,
             status=VERIFICATION_PASSED if passed else "failed",
             argv=command.argv,
             exit_code=completed.returncode,
-            stdout=_bounded_excerpt(completed.stdout),
-            stderr=_bounded_excerpt(completed.stderr),
+            stdout=_output_text(completed.stdout),
+            stderr=_output_text(completed.stderr),
             working_directory=command.working_directory,
             timeout_seconds=command.timeout_seconds,
             expected_exit_code=expected,
@@ -305,7 +308,7 @@ class ContainerCommandExecutor:
                 id=command.name,
                 status="environment_error",
                 argv=command.argv,
-                stderr=_bounded_excerpt("working directory unavailable"),
+                stderr=_output_text("working directory unavailable"),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=command.expected_exit_code,
@@ -322,7 +325,7 @@ class ContainerCommandExecutor:
                 id=command.name,
                 status="environment_error",
                 argv=command.argv,
-                stderr=_bounded_excerpt("no resolved project image for verification"),
+                stderr=_output_text("no resolved project image for verification"),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=command.expected_exit_code,
@@ -336,7 +339,7 @@ class ContainerCommandExecutor:
             ))
         relative_parts = Path(command.working_directory).parts if command.working_directory not in ("", ".") else ()
         container_cwd = "/".join((env.container_workspace.rstrip("/"), *relative_parts))
-        container_name = f"open-tulid-verify-{command.name}"
+        container_name = f"open-tulid-verify-{uuid.uuid4().hex}"
         request = self._agent_run_request(
             agent_id="verifier",
             image=env.project_image_identity,
@@ -367,8 +370,8 @@ class ContainerCommandExecutor:
                 id=command.name,
                 status="timeout",
                 argv=command.argv,
-                stdout=_bounded_excerpt(result.stdout),
-                stderr=_bounded_excerpt(result.stderr or f"Verification container for {command.name!r} timed out after {command.timeout_seconds}s"),
+                stdout=_output_text(result.stdout),
+                stderr=_output_text(result.stderr or f"Verification container for {command.name!r} timed out after {command.timeout_seconds}s"),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=command.expected_exit_code,
@@ -381,12 +384,12 @@ class ContainerCommandExecutor:
                 f"Verification command {command.name!r} timed out after {command.timeout_seconds}s; the container was terminated.",
                 command.name,
             ))
-        if result.returncode in (127, 126) and _docker_unavailable(result):
+        if result.returncode in (125, 126, 127):
             check = VerificationCheckResult(
                 id=command.name,
                 status="environment_error",
                 argv=command.argv,
-                stderr=_bounded_excerpt(result.stderr or result.stdout),
+                stderr=_output_text(result.stderr or result.stdout),
                 working_directory=command.working_directory,
                 timeout_seconds=command.timeout_seconds,
                 expected_exit_code=command.expected_exit_code,
@@ -405,8 +408,8 @@ class ContainerCommandExecutor:
             status=VERIFICATION_PASSED if passed else "failed",
             argv=command.argv,
             exit_code=result.returncode,
-            stdout=_bounded_excerpt(result.stdout),
-            stderr=_bounded_excerpt(result.stderr),
+            stdout=_output_text(result.stdout),
+            stderr=_output_text(result.stderr),
             working_directory=command.working_directory,
             timeout_seconds=command.timeout_seconds,
             expected_exit_code=command.expected_exit_code,
@@ -435,11 +438,6 @@ class ContainerCommandExecutor:
                 continue
 
 
-def _docker_unavailable(result) -> bool:
-    blob = f"{result.stderr or ''}{result.stdout or ''}".lower()
-    return "no such container" in blob or "cannot connect" in blob or "not found" in blob
-
-
 def _container_failure_detail(
     check_id: str,
     expected_exit_code: int | None,
@@ -454,13 +452,9 @@ def _container_failure_detail(
     )
 
 
-def _bounded_excerpt(value: str) -> str:
-    from open_tulid.runtime.verifier import LOG_EXCERPT_CHARACTER_LIMIT
-    value = value or ""
-    if len(value) <= LOG_EXCERPT_CHARACTER_LIMIT:
-        return value
-    marker = f"\n[... {len(value) - LOG_EXCERPT_CHARACTER_LIMIT} characters omitted; full log retained as artifact]"
-    return value[: LOG_EXCERPT_CHARACTER_LIMIT - len(marker)] + marker
+def _output_text(value: str) -> str:
+    # The verifier persists complete logs before bounding inline report excerpts.
+    return value or ""
 
 
 def _check_failure_detail(
@@ -524,3 +518,15 @@ def _error(code: str, message: str, location: str | None = None) -> DomainError:
 
 # Re-export for convenience.
 VERIFICATION_PASSED = "passed"
+
+
+def resolve_project_image(image: str, docker_executable: str, *, runner=None) -> str:
+    """Pin the worker and verifier to the same local image, without pulling it."""
+    completed = (runner or subprocess.run)(
+        (docker_executable, "image", "inspect", "--format", "{{.Id}}", image),
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    identity = completed.stdout.strip()
+    if completed.returncode or re.fullmatch(r"sha256:[0-9a-f]{64}", identity) is None:
+        raise ValueError(f"Cannot resolve project image {image!r}: {completed.stderr.strip() or 'invalid image identity'}")
+    return identity

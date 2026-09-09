@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from open_tulid.runtime.verification_runtime import HostCommandExecutor
+
 import hashlib
 from dataclasses import replace
 from pathlib import Path
@@ -694,7 +696,7 @@ def test_verifier_runs_frozen_checks_without_path_diff_rejection(tmp_path):
     assert compiled.contract is not None
     repo.joinpath("app.py").write_text("def healthz():\n    return 'ok'\n", encoding="utf-8")
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=transition,
         submission=CompletionSubmission(changed_files=("app.py",)),
@@ -725,7 +727,7 @@ def test_verifier_allows_unknown_file_without_contract_rejection(tmp_path):
     (repo / "research").mkdir()
     (repo / "research" / "notes.md").write_text("# Plan\n", encoding="utf-8")
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo,
         transition=transition,
         submission=CompletionSubmission(changed_files=("research/notes.md",)),
@@ -1015,10 +1017,27 @@ def test_verifier_rejects_when_a_frozen_command_fails(tmp_path):
     # Break the focused check command so the verification command exits non-zero.
     repo.joinpath("check_repo.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
 
-    result = DeterministicVerifier().verify(
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
         workspace=repo, transition=transition,
         submission=CompletionSubmission(changed_files=("app.py",)), execution_contract=compiled.contract,
     )
 
     assert result.accepted is False
     assert {error.code for error in result.errors} == {"verification.check_failed"}
+
+
+def test_job_store_freezes_verification_environment(tmp_path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="job-env", project_id="Agent", task_id=TASK_ID,
+        transition_id="ImplementTask", worker_id="qwen",
+        workspace_path=str(tmp_path / "workspace"),
+    )).accepted
+    assert store.update_status("job-env", "running", metadata={
+        "verification_environment": {"project_image_identity": "sha256:original"},
+    }).accepted
+    changed = store.update_status("job-env", "running", metadata={
+        "verification_environment": {"project_image_identity": "sha256:changed"},
+    })
+    assert not changed.accepted
+    assert changed.error.code == "job.immutable_metadata"

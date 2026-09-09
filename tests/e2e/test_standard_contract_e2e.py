@@ -100,8 +100,21 @@ def test_standard_contract_drives_minimal_delta_with_baseline_and_bounded_retry(
         contract_meta = implement_job["metadata"]["execution_contract"]
         assert contract_meta["generated_contract"]["schema"] == "tulid.global_contract/v1"
         resolved_ids = [check["id"] for check in contract_meta["resolved_checks"]]
-        assert "build" in resolved_ids, resolved_ids
-        assert "tests" in resolved_ids, resolved_ids
+        assert resolved_ids == ["build", "tests"]
+        environment = implement_job["metadata"]["verification_environment"]
+        assert environment["project_image_identity"].startswith("sha256:")
+        verification_events = [
+            event for event in JsonlEventStore(project.project / "events").iter_events()
+            if event.job_id == implement_job["job_id"]
+            and event.event_type == "ExecutionCompletionValidationFinished"
+            and event.data.get("accepted")
+        ]
+        assert verification_events
+        report = verification_events[-1].data["verification_report"]
+        assert report["project_image_identity"] == environment["project_image_identity"]
+        assert report["candidate_manifest_sha256"] == report["post_manifest_sha256"]
+        assert [check["id"] for check in report["checks"]] == resolved_ids
+        assert all(check["status"] == "passed" and check["log_refs"] for check in report["checks"])
         surface = contract_meta["generated_contract"]["change_surface"]
         # Command-only contract: no file allowlist is recorded for acceptance.
         assert surface["add"] == []

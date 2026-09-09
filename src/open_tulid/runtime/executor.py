@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import threading
 import time
-from dataclasses import dataclass, replace as _replace_request
+from dataclasses import asdict, dataclass, replace as _replace_request
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
@@ -487,6 +488,33 @@ class JobExecutor:
                 request,
                 container_user=standard_runtime.container_user or request.container_user,
             )
+            if frozen.contract is not None:
+                from .verification_runtime import VerificationEnvironment, resolve_project_image
+                try:
+                    saved_environment = job.metadata.get("verification_environment")
+                    image = (saved_environment["project_image_identity"] if saved_environment
+                             else resolve_project_image(request.image, self.runtime.docker_executable))
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    endpoint.stop()
+                    return self._fail_before_run(job, _error(
+                        "verification.env_image_unavailable", str(exc), job.job_id,
+                    ))
+                environment = VerificationEnvironment(**dict(saved_environment)) if saved_environment else VerificationEnvironment(
+                    project_image_identity=image,
+                    container_workspace=self.runtime.container_workspace,
+                    docker_executable=self.runtime.docker_executable,
+                    container_user=request.container_user,
+                    container_volume_relabel=request.volume_relabel,
+                )
+                request = _replace_request(request, image=environment.project_image_identity,
+                                           container_user=environment.container_user,
+                                           volume_relabel=environment.container_volume_relabel)
+                saved = self.job_store.update_status(job.job_id, ExecutionJobStatus.RUNNING, metadata={
+                    "verification_environment": asdict(environment),
+                })
+                if not saved.accepted:
+                    endpoint.stop()
+                    return self._fail_before_run(job, saved.error)
             log_dir = _agent_log_dir(prepared.workspace)
             started_at = _utc_now()
             _write_run_trace(
