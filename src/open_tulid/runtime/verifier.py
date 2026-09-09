@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import shutil
 import stat
@@ -115,6 +116,32 @@ class VerificationCheckResult:
 
 
 @dataclass(frozen=True)
+class CoverageChange:
+    """A baseline-to-candidate change to a coverage-relevant path (plan 4E).
+
+    Coverage-relevant paths are test files, test-discovery/build configuration,
+    and suites whose composition can change without a later command failing.
+    These changes are recorded on the report so review can see whether a suite
+    was disabled to make a global command exit zero. Legitimate test refactors
+    remain allowed; semantic test-quality assessment stays with review (plan 6),
+    so the verifier only surfaces the fact, it never blocks solely on it.
+    """
+
+    kind: str
+    path: str
+    before_sha256: str | None = None
+    after_sha256: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "path": self.path,
+            "before_sha256": self.before_sha256,
+            "after_sha256": self.after_sha256,
+        }
+
+
+@dataclass(frozen=True)
 class VerificationReport:
     """Tulid-controlled verification evidence binding checks to one candidate.
 
@@ -151,6 +178,10 @@ class VerificationReport:
     # tool/runtime, dependency preparation, command timeout, failed behavior,
     # source mutation, or infrastructure interruption.
     classification_detail: str | None = None
+    # Baseline-to-candidate changes on coverage-relevant paths, surfaced for
+    # review so a disabled test suite cannot be accepted merely because a
+    # global command exits zero (plan 4E).
+    coverage_changes: tuple[CoverageChange, ...] = ()
 
     @property
     def accepted_inline(self) -> bool:
@@ -181,6 +212,7 @@ class VerificationReport:
             "not_run_checks": self.not_run_checks,
             "source_mutated": self.source_mutated,
             "classification_detail": self.classification_detail,
+            "coverage_changes": [change.to_dict() for change in self.coverage_changes],
         }
 
 
@@ -569,6 +601,7 @@ class DeterministicVerifier:
                 not_run_checks=report.not_run_checks,
                 source_mutated=report.source_mutated,
                 classification_detail=_granular_classification(report, errors),
+                coverage_changes=report.coverage_changes,
             )
         return VerificationResult(accepted=not errors, errors=tuple(errors), report=report)
 
@@ -593,8 +626,10 @@ class DeterministicVerifier:
                 candidate_manifest_sha256=candidate_manifest_sha256,
                 environment_identity=environment_identity,
             )
-        baseline_sha = contract.baseline_manifest.sha256
-        pre_sha = _workspace_manifest_sha256(workspace)
+        baseline_manifest = contract.baseline_manifest
+        baseline_sha = baseline_manifest.sha256
+        pre_manifest = _workspace_deliverable_manifest(workspace)
+        pre_sha = pre_manifest.sha256
         pre_lockfile = _capture_lockfile_identity(workspace)
         checks, check_errors = _run_contract_checks(workspace, contract, executor)
         # Measure the real source tree before and after the checks ran. Source
@@ -602,8 +637,13 @@ class DeterministicVerifier:
         # cache/build outputs excluded by snapshot rules are not tracked source.
         # Plan 4A: never repeat the baseline digest as the candidate/post digest
         # unless the actual source tree is unchanged by verification.
-        post_sha = _workspace_manifest_sha256(workspace)
+        post_manifest = _workspace_deliverable_manifest(workspace)
+        post_sha = post_manifest.sha256
         post_lockfile = _capture_lockfile_identity(workspace)
+        # Coverage regression guard (plan 4E): record baseline-to-candidate
+        # changes on test-discovery/build-script paths so review can assess
+        # whether a suite was disabled to make a global command exit zero.
+        coverage_changes = _coverage_changes(baseline_manifest, post_manifest)
         not_run = sum(1 for check in checks if check.status == VERIFICATION_NOT_RUN_STATUS)
         source_mutated = post_sha != pre_sha
         all_errors = list(check_errors)
@@ -635,6 +675,7 @@ class DeterministicVerifier:
             not_run,
             source_mutated,
             _granular_classification(None, all_errors, not_run=not_run, source_mutated=source_mutated),
+            coverage_changes,
         ), tuple(all_errors)
 
     def _run_trusted_validations(
@@ -689,6 +730,84 @@ class DeterministicVerifier:
                         call.type,
                     ))
         return tuple(errors)
+
+
+# Coverage-relevant paths (plan 4E): test files, test-discovery configuration,
+# and build/discovery scripts whose composition can change without a later global
+# command failing. Mirrors the project-owned discovery surface so a disabled
+# suite is surfaced for review rather than accepted merely on a zero exit.
+COVERAGE_RELEVANT_PATTERNS = (
+    "test_*",
+    "*_test.py",
+    "*_test.pyc",
+    "*.test.js",
+    "*.test.jsx",
+    "*.test.ts",
+    "*.test.tsx",
+    "*.spec.js",
+    "*.spec.jsx",
+    "*.spec.ts",
+    "*.spec.tsx",
+    "tests/**",
+    "test/**",
+    "spec/**",
+    "__tests__/**",
+    "conftest.py",
+    "pytest.ini",
+    "tox.ini",
+    "noxfile.py",
+    "setup.cfg",
+    "jest.config*",
+    "vitest.config*",
+    "karma.conf*",
+    "playwright.config*",
+    "cypress.config*",
+    "pyproject.toml",
+    "package.json",
+    "Makefile",
+    "makefile",
+    "*.mk",
+    "justfile",
+    "Dockerfile",
+    "Dockerfile.*",
+    "docker-compose*.yml",
+    "docker-compose*.yaml",
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+)
+
+
+def _coverage_relevant_path(path: str) -> bool:
+    for pattern in COVERAGE_RELEVANT_PATTERNS:
+        if fnmatch.fnmatchcase(path, pattern):
+            return True
+    return False
+
+
+def _coverage_changes(
+    baseline: BaselineManifest | None,
+    post: BaselineManifest,
+) -> tuple[CoverageChange, ...]:
+    """Baseline-to-candidate changes restricted to coverage-relevant paths."""
+    if baseline is None:
+        return ()
+    before = {entry.path: entry for entry in baseline.entries}
+    after = {entry.path: entry for entry in post.entries}
+    changes: list[CoverageChange] = []
+    for path in sorted(set(after) - set(before)):
+        entry = after[path]
+        if _coverage_relevant_path(path):
+            changes.append(CoverageChange("add", path, None, entry.sha256))
+    for path in sorted(set(before) - set(after)):
+        entry = before[path]
+        if _coverage_relevant_path(path):
+            changes.append(CoverageChange("delete", path, entry.sha256, None))
+    for path in sorted(set(before) & set(after)):
+        if before[path].sha256 != after[path].sha256 and _coverage_relevant_path(path):
+            changes.append(CoverageChange(
+                "edit", path, before[path].sha256, after[path].sha256,
+            ))
+    return tuple(changes)
 
 
 def _manifest_changes(
@@ -808,14 +927,19 @@ def _capture_lockfile_identity(workspace: Path):
         return None
 
 
+def _workspace_deliverable_manifest(workspace: Path) -> BaselineManifest:
+    """Real deliverable manifest of the workspace (used for digest recomputation)."""
+    from .candidate import capture_deliverable_manifest
+    return capture_deliverable_manifest(workspace)
+
+
 def _workspace_manifest_sha256(workspace: Path) -> str:
     """Real post-verification source digest of the workspace (or baseline-less "").
 
     Used to stop a report from blindly repeating the baseline digest as the
     candidate/post digest when the source tree actually changed.
     """
-    from .candidate import capture_deliverable_manifest
-    return capture_deliverable_manifest(workspace).sha256
+    return _workspace_deliverable_manifest(workspace).sha256
 
 
 def _verification_incomplete_message(report: "VerificationReport") -> str:

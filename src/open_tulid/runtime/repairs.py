@@ -36,18 +36,29 @@ def plan_repair(*, report: VerificationReport | None, errors: tuple[DomainError,
 
 
 def build_repair_packet(*, report: VerificationReport | None, errors: tuple[DomainError, ...]) -> str:
-    """Render only verifier evidence; never re-inject task or instruction context."""
-    failed_checks = ([{"id": check.id, "exit_code": check.exit_code,
-                       "stdout": _bounded(check.stdout), "stderr": _bounded(check.stderr)}
+    """Render only verifier evidence; never re-inject task or instruction context.
+
+    Command-specific evidence is returned to the worker so a failed assertion is
+    distinguishable from a missing interpreter, service, or lockfile. Each failed
+    check carries a stable ``log_refs`` reference to the retained full log, so a
+    retry/review sees the same failure without copying entire noisy logs into the
+    prompt (plan 4E).
+    """
+    failed_checks = ([{"id": check.id, "status": check.status, "exit_code": check.exit_code,
+                       "stdout": _bounded(check.stdout), "stderr": _bounded(check.stderr),
+                       "log_refs": list(check.log_refs)}
                       for check in report.checks if check.status != "passed"]
                      if report is not None else [])
     report_data = report.to_dict() if report is not None else None
     evidence = {
         "schema": REPAIR_PACKET_SCHEMA,
         "classification": report.classification if report is not None else None,
+        "classification_detail": report.classification_detail if report is not None else None,
         "verification_report": report_data,
         "failed_check_evidence": failed_checks,
         "current_diff_summary": report_data["changes"] if report_data is not None else None,
+        "coverage_changes": (report_data["coverage_changes"]
+                             if report_data is not None else None),
         "errors": [{"code": error.code, "message": error.message, "location": error.location} for error in errors],
     }
     return "\n".join((

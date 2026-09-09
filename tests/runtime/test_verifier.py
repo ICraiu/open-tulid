@@ -385,3 +385,73 @@ def test_deprecated_baseline_repetition_does_not_hide_actual_change(tmp_path):
     ).report
     assert report is not None
     assert report.post_manifest_sha256 != baseline
+
+
+def test_coverage_guard_records_test_and_build_discovery_changes(tmp_path):
+    # Plan 4E: the report surfaces baseline-to-candidate changes on test files
+    # and build/discovery configuration so review can judge whether a suite was
+    # disabled, even when every global command exits zero.
+    compiled = _compiled(tmp_path)
+    assert compiled.contract is not None
+    repo = _repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_app.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    (repo / "jest.config.js").write_text("module.exports = {};\n", encoding="utf-8")
+    (repo / "src" / "app.js").write_text("module.exports = () => 'a';\n", encoding="utf-8")
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
+        workspace=repo,
+        transition=_transition(),
+        submission=CompletionSubmission(
+            changed_files=("src/app.js", "tests/test_app.py", "jest.config.js"),
+        ),
+        execution_contract=compiled.contract,
+        candidate_id="cand-cov",
+    )
+    assert result.accepted is True
+    report = result.report
+    assert report is not None
+    by_path = {change.path: change for change in report.coverage_changes}
+    assert by_path["tests/test_app.py"].kind == "add"
+    assert by_path["jest.config.js"].kind == "add"
+    # Ordinary source edits are not coverage changes; only test/discovery/build
+    # surface is guarded.
+    assert "src/app.js" not in by_path
+
+
+def test_coverage_guard_surfaces_a_deleted_suite_for_review(tmp_path):
+    # A suite removed from the candidate must be visible to review even though a
+    # later global command still exits zero. Deleting discoverable tests is never
+    # silently accepted as demonstrated coverage.
+    repo = _repo(tmp_path)
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_app.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    project_root = tmp_path / "pd"
+    project_root.mkdir()
+    _contract(project_root)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=_task(),
+        transition=_transition(),
+    )
+    assert compiled.contract is not None
+    # Candidate deletes the discovered suite file after the baseline was frozen.
+    (tests_dir / "test_app.py").unlink()
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
+        workspace=repo,
+        transition=_transition(),
+        submission=CompletionSubmission(changed_files=("src/app.js",)),
+        execution_contract=compiled.contract,
+        candidate_id="cand-del",
+    )
+    assert result.accepted is True
+    report = result.report
+    assert report is not None
+    deleted = next(
+        change for change in report.coverage_changes
+        if change.path == "tests/test_app.py"
+    )
+    assert deleted.kind == "delete"
+    assert deleted.before_sha256
+    assert deleted.after_sha256 is None

@@ -1609,3 +1609,85 @@ def test_global_completion_without_frozen_environment_never_runs_on_host(tmp_pat
     assert adapter.moved_to is None
     assert not calls
     assert all(check["status"] == "environment_error" for check in report["checks"])
+
+
+def test_promotion_consumes_sealed_candidate_not_post_test_workspace(tmp_path, monkeypatch):
+    """Plan 4E: promotion uses the original immutable candidate.
+
+    The verifier recomputes the deliverable source digest after checks, and
+    promoted bytes come from the sealed candidate, never from arbitrary post-test
+    workspace contents or a worker's late edits.
+    """
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    from open_tulid.runtime.candidate import capture_deliverable_manifest
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (workspace / "app.py").write_text("sealed source\n")
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=workspace, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    identity = "sha256:" + "a" * 64
+    metadata = {
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+        "verification_environment": {
+            "project_image_identity": identity, "container_user": "1000:1000",
+            "container_workspace": "/workspace/project",
+        },
+    }
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata=metadata).accepted
+    verified_copy = []
+
+    def docker_runner(args, **kwargs):
+        assert args[:2] == ("docker", "run")
+        mount = args[args.index("-v") + 1]
+        verification_copy = Path(mount.split(":")[0])
+        verified_copy.append(verification_copy)
+        # A worker mutating its own workspace after capture is out of scope; it
+        # must never ride along into the delivered repository.
+        (workspace / "app.py").write_text("late worker edit\n")
+        return subprocess.CompletedProcess(args, 0, "ok", "")
+
+    monkeypatch.setattr("open_tulid.runtime.verification_runtime.subprocess.run", docker_runner)
+    events = JsonlEventStore(tmp_path / "events")
+    adapter = FakeAdapter(_task())
+    service = CompletionService(
+        workflow=workflow, adapter=adapter, job_store=store, event_store=events,
+        repo_root=repo, candidate_root=tmp_path / "candidates",
+    )
+    result = service.submit(job_id=job_id, token="secret", submission=CompletionSubmission(
+        submission_id="sealed-promote", changed_files=("app.py",),
+    ))
+    assert result.accepted, result.errors
+    report = result.verification.report
+    assert report is not None
+    # Promoted bytes are the sealed candidate, not the late worker edit.
+    assert (repo / "app.py").read_text() == "sealed source\n"
+    assert (workspace / "app.py").read_text() == "late worker edit\n"
+    # The deliverable digest is recomputed after checks and equals the sealed
+    # candidate (the unchanged verification copy), not the mutable workspace.
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    (sealed / "app.py").write_text("sealed source\n")
+    sealed_sha = capture_deliverable_manifest(sealed).sha256
+    assert verified_copy
+    assert report.post_manifest_sha256 == sealed_sha
+    assert report.post_manifest_sha256 != capture_deliverable_manifest(workspace).sha256
+    assert report.source_mutated is False
