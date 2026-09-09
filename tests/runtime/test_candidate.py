@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import pytest
 from pathlib import Path
 
 from open_tulid.runtime.candidate import (
@@ -16,6 +17,28 @@ from open_tulid.runtime.repository_facts import (
     BaselineManifest,
     canonical_sha256,
 )
+
+
+@pytest.mark.parametrize("identity", ["../outside", "/outside", ".", "..", ""])
+def test_candidate_rejects_path_identities(tmp_path, identity):
+    result = capture_candidate(workspace=tmp_path, storage_root=tmp_path / "store",
+                               candidate_id=identity, baseline=None)
+    assert not result.accepted
+    assert result.errors[0].code == "candidate.invalid_identity"
+
+
+def test_candidate_never_replaces_existing_evidence(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "app.py"
+    source.write_text("first")
+    kwargs = dict(workspace=workspace, storage_root=tmp_path / "store",
+                  candidate_id="complete", baseline=None)
+    first = capture_candidate(**kwargs)
+    source.write_text("second")
+    second = capture_candidate(**kwargs)
+    assert first.accepted and not second.accepted
+    assert (first.captured.storage_path / "app.py").read_text() == "first"
 
 
 def _baseline(entries: tuple[tuple[str, str, int], ...]) -> BaselineManifest:

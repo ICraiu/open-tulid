@@ -142,6 +142,10 @@ def capture_candidate(
     rejected with a retriable error and the original workspace is preserved.
     """
     storage_root = Path(storage_root)
+    if not candidate_id or candidate_id in {".", ".."} or Path(candidate_id).name != candidate_id:
+        return CaptureCandidateResult(errors=(_candidate_error(
+            "candidate.invalid_identity", "Candidate identity must be a single path component.",
+        ),))
     storage = storage_root / candidate_id
     try:
         pre = capture_deliverable_manifest(workspace)
@@ -152,8 +156,9 @@ def capture_candidate(
             location=str(workspace),
         ),))
     try:
-        if storage.exists():
-            shutil.rmtree(storage)
+        storage_root.mkdir(parents=True, exist_ok=True)
+        # Exclusive creation preserves sealed evidence, including during races.
+        storage.mkdir(exist_ok=False)
         _copy_deliverables(workspace, storage)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(

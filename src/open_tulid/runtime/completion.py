@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import re
 import subprocess
@@ -728,7 +729,11 @@ class CompletionService:
         storage_root = self.candidate_root
         if storage_root is None:
             storage_root = Path(job.workspace_path).parent / ".candidates"
-        candidate_id = submission_id
+        # Submission identifiers are worker supplied and only unique within a
+        # job. Never use them directly as a shared filesystem path.
+        candidate_id = hashlib.sha256(
+            json.dumps([job.job_id, submission_id]).encode("utf-8")
+        ).hexdigest()
         result = capture_candidate(
             workspace=Path(job.workspace_path),
             storage_root=storage_root,

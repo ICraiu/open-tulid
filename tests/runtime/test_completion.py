@@ -154,6 +154,28 @@ def _job_store(tmp_path: Path) -> FileExecutionJobStore:
     return store
 
 
+def test_candidate_submission_identity_is_scoped_to_job(tmp_path):
+    from dataclasses import replace
+    store = _job_store(tmp_path)
+    first_job = store.get("01J00000000000000000000JOB").job
+    second_workspace = tmp_path / "second"
+    second_workspace.mkdir()
+    second_job = replace(first_job, job_id="second-job", task_id="other-task",
+                         workspace_path=str(second_workspace))
+    assert store.create(second_job).accepted
+    service = CompletionService(workflow=_workflow(), adapter=FakeAdapter(_task()),
+                                job_store=store, event_store=JsonlEventStore(tmp_path / "events"))
+    captures = []
+    for job, content in ((first_job, "first"), (second_job, "second")):
+        (Path(job.workspace_path) / "app.py").write_text(content)
+        captures.append(service._capture_completion_candidate(
+            job=job, baseline=None, submission_id="../complete",
+            submission=CompletionSubmission()))
+    assert all(result.accepted for result in captures)
+    assert captures[0].captured.storage_path != captures[1].captured.storage_path
+    assert (captures[0].captured.storage_path / "app.py").read_text() == "first"
+
+
 def test_completion_rejects_wrong_token(tmp_path: Path):
     store = _job_store(tmp_path)
     service = CompletionService(
@@ -2294,7 +2316,7 @@ def test_completion_acceptance_journal_records_durable_context(tmp_path: Path):
     record = journals.load(journal_id)
     assert record.status.value == "committed"
     context = record.context
-    assert context["candidate_id"] == "component-submission"
+    assert context["candidate_id"] == store.get("01J00000000000000000000JOB").job.metadata["active_candidate_id"]
     assert context["candidate_manifest_sha256"]
     assert context["expected_previous_state"] == "Todo"
     assert context["expected_to_state"] == "CodeReview"
