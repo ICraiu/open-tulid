@@ -509,6 +509,7 @@ def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
+        (("git", "rev-parse", "--short", "HEAD"), repo),
     ]
 
 
@@ -601,6 +602,7 @@ def test_completion_treats_git_nothing_to_commit_as_success(tmp_path: Path):
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
+        (("git", "rev-parse", "--short", "HEAD"), repo),
     ]
 
 
@@ -648,6 +650,7 @@ def test_completion_skips_explicit_ignored_changed_files_for_commit(tmp_path: Pa
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
+        (("git", "rev-parse", "--short", "HEAD"), repo),
     ]
 
 
@@ -2303,3 +2306,98 @@ def test_completion_acceptance_journal_records_durable_context(tmp_path: Path):
     assert commit["message"] == f"{TASK_ID}: Implement thing"
     assert commit["paths"] == ["src/main.ts"]
     assert commit["expected_outcome"] == "committed"
+
+
+def test_completion_stores_acceptance_evidence_for_review_and_scheduling(tmp_path: Path):
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    from open_tulid.runtime.repository_facts import repository_identity
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("original\n", encoding="utf-8")
+    os.system(f"git -C {repo} init -q")
+    os.system(f"git -C {repo} config user.email test@example.com")
+    os.system(f"git -C {repo} config user.name tester")
+    subprocess.run(("git", "-C", str(repo), "add", "README.md"), check=True)
+    subprocess.run(("git", "-C", str(repo), "commit", "-m", "init"), check=True, capture_output=True)
+    before = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        capture_output=True, text=True,
+    ).stdout.strip()
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=repo, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+    }).accepted is True
+
+    class PassingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            return VerificationResult(True, report=_FakeReport())
+
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        candidate_root=tmp_path / "candidates",
+        verifier=PassingVerifier(),
+    )
+
+    result = service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            submission_id="awesome-evidence",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is True
+    after = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert before != after
+    loaded = store.get(job_id)
+    assert loaded.job is not None
+    meta = loaded.job.metadata
+    # Commit/transaction identities feed review and scheduling (plan 5F).
+    assert meta["acceptance_transaction_id"] == f"{job_id}-awesome-evidence"
+    assert meta["acceptance_repository_identity"] == repository_identity(repo)
+    assert meta["acceptance_repository_commit"] == after
+    # Actual added/edited/deleted paths are recorded on the accepted completion.
+    promoted = meta["promoted_files"]
+    assert any(item.get("type") == "promote_changed_file"
+               and item.get("target_path", "").endswith("src/main.ts") for item in promoted)
+    # The verification report is exposed to review as check evidence.
+    assert meta["verification_report"] is not None
+    assert meta["verification_report"]["checks"] == ["backend"]
+
+
+class _FakeReport:
+    def to_dict(self) -> Mapping[str, object]:
+        return {"checks": ["backend"], "passed": True}

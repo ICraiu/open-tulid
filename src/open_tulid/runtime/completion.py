@@ -560,6 +560,15 @@ class CompletionService:
                 "completed_submission_id": submission_id,
                 "promoted_artifacts": tuple(promoted_artifacts),
                 "promoted_files": tuple(promoted_files),
+                "acceptance_transaction_id": f"{job.job_id}-{submission_id}",
+                "acceptance_repository_identity": repository_identity(self.repo_root),
+                **(
+                    {"acceptance_repository_commit": _accepted_commit_sha(
+                        repo_root=self.repo_root,
+                        runner=self.repo_command_runner,
+                    )}
+                    if commit_effect is not None else {}
+                ),
                 "completion_submissions": _record_submission(
                     job.metadata,
                     submission_id,
@@ -1312,6 +1321,23 @@ def _validate_integrated_source(
                 str(target),
             ))
     return tuple(errors)
+
+
+def _accepted_commit_sha(*, repo_root: Path | None, runner) -> str | None:
+    """The integration commit identity recorded on an accepted completion.
+
+    Returns the repository HEAD short sha when the target is a Git repository
+    whose automatic commit ran; otherwise ``None`` when there is no Git repo or
+    no verifier-driven commit to point to. Review/no-change completions that
+    produced no commit therefore record ``None`` rather than a fabricated id.
+    """
+    if repo_root is None or not (repo_root / ".git").exists():
+        return None
+    command_runner = runner or _run_repo_command
+    head = _git_rev(command_runner, repo_root, "HEAD")
+    if not head:
+        return None
+    return head
 
 
 def _same_file_content(left: Path, right: Path) -> bool:

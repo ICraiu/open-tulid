@@ -1923,6 +1923,183 @@ def test_scheduler_allows_integration_when_other_project_uses_a_different_reposi
     assert result.transition_id == "implement"
 
 
+def test_scheduler_admits_dependent_against_accepted_repository_identity(tmp_path: Path):
+    # Plan 5F: a dependent job is admitted against the accepted repository
+    # identity of its dependency, not merely an updated board column.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    assert identity is not None
+    dep = Task(
+        id="01J00000000000000000000002",
+        title="Dep",
+        path="tasks/dep.md",
+        current_state="Done",
+        task_type="task",
+    )
+    dependent = Task(
+        id=TASK_ID,
+        title="Dependent",
+        path="tasks/dependent.md",
+        current_state="Todo",
+        task_type="task",
+        dependencies=("01J00000000000000000000002",),
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    # The dependency was accepted into this exact repository identity.
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="01J00000000000000000000002",
+        transition_id="review",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="accepted",
+        metadata={"accepted_repository_identity": identity},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(dep, dependent)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == TASK_ID
+    assert not any(skip.code.startswith("task.dependency") for skip in result.skipped)
+
+
+def test_scheduler_rejects_dependent_admitted_on_board_move_without_acceptance(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dep = Task(
+        id="01J00000000000000000000002",
+        title="Dep",
+        path="tasks/dep.md",
+        current_state="Done",
+        task_type="task",
+    )
+    dependent = Task(
+        id=TASK_ID,
+        title="Dependent",
+        path="tasks/dependent.md",
+        current_state="Todo",
+        task_type="task",
+        dependencies=("01J00000000000000000000002",),
+    )
+    # No ACCEPTED completion exists; the Done column alone is a board-only state.
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(dep, dependent)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert [skip.code for skip in result.skipped].count("task.dependency_not_accepted") == 1
+
+
+def test_scheduler_rejects_dependent_when_accepted_repository_identity_moved(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    stale = repository_identity(other)
+    assert repository_identity(repo) != stale
+    dep = Task(
+        id="01J00000000000000000000002",
+        title="Dep",
+        path="tasks/dep.md",
+        current_state="Done",
+        task_type="task",
+    )
+    dependent = Task(
+        id=TASK_ID,
+        title="Dependent",
+        path="tasks/dependent.md",
+        current_state="Todo",
+        task_type="task",
+        dependencies=("01J00000000000000000000002",),
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="01J00000000000000000000002",
+        transition_id="review",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="accepted",
+        metadata={"accepted_repository_identity": stale},
+    )).accepted is True
+    scheduler = Scheduler(
+        workflow=_workflow(review=True),
+        adapter=FakeAdapter(_snapshot(dep, dependent)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert any(skip.code == "task.dependency_repo_moved" for skip in result.skipped)
+
+
+def test_scheduler_keeps_repo_lane_unavailable_on_unresolved_acceptance(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    assert identity is not None
+    task = Task(
+        id=TASK_ID,
+        title="Implement thing",
+        path="tasks/thing.md",
+        current_state="Todo",
+        task_type="task",
+    )
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+    journals.prepare(
+        journal_id="txn-unresolved",
+        project_id="Agent",
+        effects=({"type": "move_task", "task_id": TASK_ID, "to_state": "Review"},),
+        events=(),
+        task_id=TASK_ID,
+        transition_id="implement",
+        context={"repository_identity": identity},
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    scheduler = Scheduler(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_snapshot(task)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+        journal_store=journals,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    # The unresolved acceptance transaction owns the lane: schedule is refused
+    # with an actionable reason until it commits or is reconciled.
+    assert result.accepted is False
+    assert result.errors[0].code == "repo_lane.unresolved_acceptance"
+
+
 def test_scheduler_defers_task_when_required_resource_is_busy(tmp_path: Path):
     store = FileExecutionJobStore(tmp_path / "jobs")
     leases = FileResourceLeaseStore(

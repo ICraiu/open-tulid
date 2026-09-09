@@ -154,6 +154,7 @@ class Scheduler:
                 loaded.snapshot,
                 self.workflow,
                 self.job_store,
+                journal_store=self.journal_store,
             )
             if isinstance(focused, DomainError):
                 return ScheduleResult(scheduled=False, errors=(focused,))
@@ -183,7 +184,14 @@ class Scheduler:
                 tasks = (focused.task,)
 
         for task in tasks:
-            dependency_error = _dependency_error(task, loaded.snapshot, self.workflow)
+            dependency_error = _dependency_error(
+                task,
+                loaded.snapshot,
+                self.workflow,
+                repo_root=self.repo_root,
+                job_store=self.job_store,
+                project_id=project_id,
+            )
             if dependency_error is not None:
                 skipped.append(dependency_error)
                 continue
@@ -497,6 +505,8 @@ def _serial_repo_lane_focus(
     snapshot: ProjectSnapshot,
     workflow: WorkflowDefinition,
     job_store: FileExecutionJobStore,
+    *,
+    journal_store: TransactionJournalStore | None = None,
 ) -> _SerialRepoLaneFocus | DomainError | None:
     """Focus the shared serial repository lane.
 
@@ -506,7 +516,20 @@ def _serial_repo_lane_focus(
     own jobs always occupy its lane (backward compatible with jobs created
     before repository identity was recorded); jobs from other projects occupy
     the same lane only when they share the resolved repository identity.
+
+    A lane with an unresolved acceptance transaction stays unavailable: the
+    transaction owns the repository state until it commits or is reconciled, so
+    a dependent integration cannot be admitted against it.
     """
+    if journal_store is not None and repo_identity is not None:
+        unresolved = _unresolved_acceptance_journal(journal_store, repo_identity)
+        if unresolved is not None:
+            return _error(
+                "repo_lane.unresolved_acceptance",
+                f"Repository lane is held by unresolved acceptance transaction {unresolved!r}; "
+                "recover or reconcile it before admitting another integration.",
+                str(repo_identity),
+            )
     listed = job_store.list()
     if not listed.accepted:
         return listed.error or _error("job.read_failed", "Cannot inspect execution jobs.")
@@ -563,6 +586,28 @@ def _external_repo_lane_job(job: ExecutionJob, repo_identity: str | None) -> boo
         return False
     stored = job.metadata.get("repository_identity")
     return stored == repo_identity
+
+
+def _unresolved_acceptance_journal(
+    journal_store: TransactionJournalStore,
+    repo_identity: str,
+) -> str | None:
+    """Return the journal id of an incomplete acceptance transaction for the lane.
+
+    Only journals that recorded the target repository identity in their durable
+    context qualify as acceptance transactions (job-creation journals never
+    record a repository identity). A prepared/failed acceptance journal means the
+    repository state is owned by that transaction until it settles.
+    """
+    try:
+        incomplete = journal_store.list_incomplete()
+    except Exception:
+        return None
+    for record in incomplete:
+        recorded = record.context.get("repository_identity")
+        if recorded == repo_identity:
+            return record.journal_id
+    return None
 
 
 def _repair_ready_job(jobs: tuple[ExecutionJob, ...]) -> ExecutionJob | None:
@@ -753,6 +798,10 @@ def _dependency_error(
     task: Task,
     snapshot: ProjectSnapshot,
     workflow: WorkflowDefinition,
+    *,
+    repo_root: Path | None = None,
+    job_store: FileExecutionJobStore | None = None,
+    project_id: str | None = None,
 ) -> DomainError | None:
     for dependency_id in task.dependencies:
         dependency = snapshot.tasks.get(dependency_id)
@@ -768,7 +817,73 @@ def _dependency_error(
                 f"Task {task.id!r} depends on unfinished task {dependency_id!r}.",
                 task.id,
             )
+        # Plan 5F: admit the dependent against the accepted repository identity of
+        # the dependency, not a bare board-column change. A dependency whose
+        # terminal state was reached without a recorded acceptance (for example a
+        # manual board move) must not admit an integration, and a dependency
+        # accepted into a repository identity that no longer matches the current
+        # target must not bless a stale candidate.
+        if job_store is not None and repo_root is not None and project_id is not None:
+            current_identity = repository_identity(repo_root)
+            if current_identity is not None:
+                recorded, accepted = _dependency_accepted_repo_identity(
+                    job_store, project_id, dependency_id
+                )
+                if not accepted:
+                    return _error(
+                        "task.dependency_not_accepted",
+                        (
+                            f"Task {task.id!r} depends on task {dependency_id!r} which "
+                            "reached its terminal state without a recorded accepted "
+                            "completion; refusing to admit a dependent against a "
+                            "board-column-only state change."
+                        ),
+                        task.id,
+                    )
+                if recorded != current_identity:
+                    return _error(
+                        "task.dependency_repo_moved",
+                        (
+                            f"Dependency {dependency_id!r} was accepted into repository "
+                            f"identity {recorded}, but the integration target now resolves "
+                            f"to {current_identity}; refusing to admit a dependent against "
+                            "a stale source identity."
+                        ),
+                        task.id,
+                    )
     return None
+
+
+def _dependency_accepted_repo_identity(
+    job_store: FileExecutionJobStore,
+    project_id: str,
+    task_id: str,
+) -> tuple[str | None, bool]:
+    """Recorded accepted repository identity for a dependency.
+
+    Returns ``(recorded_identity, accepted)`` where ``accepted`` is False when no
+    accepted completion exists, and the identity is ``None`` when an accepted job
+    did not record a repository identity (for example a review/no-change
+    completion without a source repository).
+    """
+    listed = job_store.list()
+    if not listed.accepted:
+        return None, False
+    accepted_jobs = tuple(
+        job for job in listed.jobs
+        if job.project_id == project_id
+        and job.task_id == task_id
+        and _status_value(job.status) == ExecutionJobStatus.ACCEPTED.value
+    )
+    if not accepted_jobs:
+        return None, False
+    latest = max(
+        accepted_jobs,
+        key=lambda job: _job_timestamp(job) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    recorded = latest.metadata.get("accepted_repository_identity")
+    identity = recorded if isinstance(recorded, str) else None
+    return identity, True
 
 
 def _has_outgoing_transition(task: Task, workflow: WorkflowDefinition) -> bool:
