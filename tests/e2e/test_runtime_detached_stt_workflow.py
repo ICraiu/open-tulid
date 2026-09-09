@@ -331,6 +331,9 @@ def _make_runtime_project(
     worker_image: str,
     *,
     scenario: str = "default",
+    extra_env: dict[str, str] | None = None,
+    extra_worker_images: dict[str, str] | None = None,
+    runtime_options: str = "",
 ) -> RuntimeProject:
     root = tmp_path / "workspace"
     vault = root / "vault"
@@ -347,6 +350,15 @@ def _make_runtime_project(
     (project / "events").mkdir(mode=0o755)
     (root / CONFIG_DIRNAME).mkdir(parents=True)
     config_template = (fixture_project / "config.yaml.template").read_text(encoding="utf-8")
+    env_block = "\n".join(
+        f'    {name}: "{value}"' for name, value in (extra_env or {}).items()
+    )
+    images_block = "\n".join(
+        f"    {name}: {value}" for name, value in (extra_worker_images or {}).items()
+    )
+    runtime_block = "\n".join(
+        f"  {line.strip()}" for line in runtime_options.splitlines() if line.strip()
+    )
     (root / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(
         config_template.format(
             tracker_type=default_adapter_type(),
@@ -355,6 +367,9 @@ def _make_runtime_project(
             worker_image=worker_image,
             scenario=scenario,
             model_proxy_port=_free_tcp_port(),
+            extra_env=env_block or "",
+            extra_worker_images=images_block or "",
+            extra_runtime=("\n" + runtime_block) if runtime_block else "",
         ),
         encoding="utf-8",
     )

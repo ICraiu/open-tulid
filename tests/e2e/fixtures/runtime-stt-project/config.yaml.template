@@ -15,8 +15,11 @@ runtime:
   completion_container_host: host.docker.internal
   default_timeout_seconds: 30
   container_volume_relabel: true
+{extra_runtime}
   worker_images:
     codex: "{worker_image}"
     local_llm: "{worker_image}"
+{extra_worker_images}
   env:
     SCRIPTED_RUNTIME_SCENARIO: "{scenario}"
+{extra_env}

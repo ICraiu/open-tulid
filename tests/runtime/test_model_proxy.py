@@ -343,6 +343,37 @@ def test_session_store_returns_unknown_for_missing_token():
     assert memory.get("no-such-token").status is SessionStatus.UNKNOWN
 
 
+def test_auth_expiry_with_fake_time_rejects_worker_at_credential_boundary():
+    """Plan 6E, auth expiry: a worker's credential is honored until its fake
+    clock passes the expiry, then the proxied completion is rejected 401. The
+    attempt-deadline bound is therefore real, not assumed."""
+    start = _utc(2026, 9, 7, 12, 0, 0)
+    clock = FakeClock(start)
+    sessions = ModelProxySessionStore(clock=clock, ttl_seconds=3600)
+    session = sessions.issue(
+        job_id="job-1",
+        worker_id="codex",
+        proxy_id="openai",
+        resource_id="remote-llm",
+        attempt_id="job-1@1",
+        expires_at=(start + timedelta(minutes=60)).isoformat(),
+    )
+    assert session.expires_at == (start + timedelta(minutes=60)).isoformat()
+    service = ModelProxyService(sessions=sessions, adapters={"openai": EchoAdapter()})
+    request = ProxyRequest(method="POST", path="/responses", body=b"prompt", headers={})
+
+    # Before expiry the worker's model call succeeds.
+    clock.advance(59 * 60 + 30)
+    assert service.forward(proxy_id="openai", token=session.token, request=request).status == 200
+
+    # Past the credential boundary the same call is rejected and logged as expiry.
+    clock.advance(60)
+    assert sessions.get(session.token).status is SessionStatus.EXPIRED
+    rejected = service.forward(proxy_id="openai", token=session.token, request=request)
+    assert rejected.status == 401
+    assert rejected.body == b"unauthorized"
+
+
 def test_revoke_attempt_does_not_revoke_newly_issued_credential(tmp_path):
     start = _utc(2026, 9, 7, 12, 0, 0)
     clock = FakeClock(start)
