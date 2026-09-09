@@ -559,7 +559,10 @@ class DeterministicVerifier:
             transition=transition,
         ))
 
-        if transition.requires.changed_files_required and not submission.changed_files:
+        from .execution_contracts import GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA
+        authoritative_candidate = (execution_contract is not None and
+            execution_contract.generated_contract.schema == GLOBAL_IMPLEMENTATION_CONTRACT_SCHEMA)
+        if transition.requires.changed_files_required and not submission.changed_files and not authoritative_candidate:
             errors.append(_error(
                 "completion.changed_files_missing",
                 "Changed-file evidence is required for this transition.",
@@ -573,7 +576,7 @@ class DeterministicVerifier:
                     f"Changed file path escapes the workspace: {changed_file}",
                     changed_file,
                 ))
-            elif not changed_path.exists():
+            elif not changed_path.exists() and not authoritative_candidate:
                 errors.append(_error(
                     "completion.changed_file_not_found",
                     f"Changed file does not exist: {changed_file}",
@@ -581,7 +584,7 @@ class DeterministicVerifier:
                 ))
 
         actual_changed_files = _git_changed_files(workspace)
-        if actual_changed_files is not None:
+        if actual_changed_files is not None and not authoritative_candidate:
             submitted = set(submission.changed_files)
             if submitted != actual_changed_files:
                 errors.append(_error(
@@ -665,16 +668,17 @@ class DeterministicVerifier:
                 "Verification rewrote committed dependency locks; the candidate is rejected.",
                 request.candidate_id,
             ))
+        added, edited, removed, renamed = _manifest_changes(baseline_manifest, post_manifest)
         return VerificationReport(
             VERIFICATION_REPORT_SCHEMA_V2,
             None,
             baseline_sha,
             post_sha,
-            (),
-            (),
-            (),
-            (),
-            0,
+            added,
+            edited,
+            removed,
+            renamed,
+            _changed_line_count(workspace, baseline_manifest, (*added, *edited)),
             checks,
             request.candidate_id,
             request.candidate_manifest_sha256,

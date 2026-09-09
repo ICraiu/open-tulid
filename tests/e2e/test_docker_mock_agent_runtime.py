@@ -82,6 +82,7 @@ def test_run_one_with_scripted_docker_worker_accepts_and_moves_task(
         "ExecutionStarted",
         "ExecutionCompletionSubmitted",
         "ExecutionCompletionValidationStarted",
+        "ExecutionCompletionCandidateCaptured",
         "ExecutionCompletionValidationFinished",
         "TransitionAccepted",
         "TaskMoved",

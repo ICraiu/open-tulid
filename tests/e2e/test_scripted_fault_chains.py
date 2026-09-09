@@ -9,7 +9,7 @@ accepted or explicitly blocked/failed outcome with consistent tracker and
 repository state.
 
 Faults injected (all deterministic, driven by the scenario string):
-  - omitted changed paths                -> rejected, repaired, accepted
+  - omitted changed paths                -> verified and delivered from manifest
   - deletion of a tracked repo file      -> deletion delivered exactly
   - worker death during submission       -> fresh bounded attempt accepted
   - malformed planning artifacts         -> explicitly blocked/failed
@@ -92,6 +92,7 @@ statements:
     id: Reviewing
   - kind: state
     id: Shipped
+    terminal_outcome: success
   - kind: task_type
     id: EpicIdea
     instructions: [default]
@@ -189,7 +190,8 @@ statements:
           args:
             command: python check_repo.py build
   - kind: transition
-    id: BuildReview
+    id: InspectBuild
+    review: true
     task_type: BuildTask
     from: Reviewing
     to: Shipped
@@ -346,7 +348,7 @@ def test_chain_multiround_batch_dependency_review_exact_delivery_distinct_worker
         ]
         review_jobs = [
             payload for payload in _job_payloads(project)
-            if payload.get("transition_id") == "BuildReview"
+            if payload.get("transition_id") == "InspectBuild"
         ]
         assert {payload["worker_id"] for payload in implement_jobs} == {"impl_w"}
         assert {payload["worker_id"] for payload in review_jobs} == {"review_w"}
@@ -395,7 +397,7 @@ def test_chain_batch_dependency_review_single_worker_all_steps(
 
         _wait_group(project.project, {"1": "Shipped", "2": "Shipped", "3": "Shipped"})
 
-        workers = {payload["worker_id"] for payload in _job_payloads(project) if payload.get("transition_id") in ("PlanEpic", "WriteBuildSpec", "BreakdownEpic", "RunBuildTask", "BuildReview")}
+        workers = {payload["worker_id"] for payload in _job_payloads(project) if payload.get("transition_id") in ("PlanEpic", "WriteBuildSpec", "BreakdownEpic", "RunBuildTask", "InspectBuild")}
         assert workers == {"single_w"}
 
         assert (project.repo / "app.py").read_text(encoding="utf-8").startswith(
@@ -406,13 +408,12 @@ def test_chain_batch_dependency_review_single_worker_all_steps(
         _print_system_logs(project, capsys)
 
 
-def test_fault_omitted_changed_paths_repaired_to_accepted(
+def test_omitted_changed_paths_are_delivered_from_manifest(
     tmp_path: Path,
     scripted_runtime_worker_image: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Omitted changed paths on the first attempt are rejected and repaired;
-    the exact promoted candidate is accepted afterward."""
+    """Omitted declarations cannot omit verified source from delivery."""
     pytest.importorskip("open_tulid")
 
     project = _make_runtime_project(
@@ -432,23 +433,15 @@ def test_fault_omitted_changed_paths_repaired_to_accepted(
 
         _wait_for(
             lambda: _task_state(project.project, "2") == "Done",
-            "rejected omitted-path submission to be repaired and accepted",
+            "omitted-path candidate to be verified and delivered",
             timeout=90.0,
         )
 
         job = _job_payload_for_transition(project, "ImplementTask")
         assert job["status"] == "accepted"
         submissions = job["metadata"]["completion_submissions"]
-        assert submissions["implement-omit-rejected"]["accepted"] is False
-        assert submissions["implement-omit-repaired"]["accepted"] is True
-        # The verifier rejected the first submission for the omitted changed
-        # paths requirement.
-        rejected = [
-            event
-            for event in JsonlEventStore(project.project / "events").iter_events()
-            if event.event_type == "ExecutionCompletionRejected" and event.job_id == job["job_id"]
-        ]
-        assert rejected
+        assert submissions["implement-omitted"]["accepted"] is True
+        assert (project.repo / "helper.py").read_text() == "def helper():\n    return 1\n"
         assert (project.repo / "app.py").read_text(encoding="utf-8") == (
             "def healthz():\n    return 'ok'\n"
         )
@@ -457,80 +450,21 @@ def test_fault_omitted_changed_paths_repaired_to_accepted(
         _print_system_logs(project, capsys)
 
 
-def test_fault_deletion_bounded_blocked(
-    tmp_path: Path,
-    scripted_runtime_worker_image: str,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A worker that deletes a tracked repository file and submits the deletion
-    as a changed path is rejected because the deletion cannot be re-verified on
-    a copy; the completion must settle bounded with a consistent repository.
-
-    This records the documented limitation (the verifier rejects submitted
-    deleted paths) as a deterministic, bounded outcome: never silently
-    accepted, never spun, and never leaving inconsistent tracker/repo state."""
-    pytest.importorskip("open_tulid")
-
-    project = _make_runtime_project(
-        tmp_path,
-        scripted_runtime_worker_image,
-        scenario="fault_delete_file",
-    )
-    (project.repo / "legacy-note.txt").write_text("legacy content\n", encoding="utf-8")
-
+def test_deletion_is_verified_and_delivered(tmp_path, scripted_runtime_worker_image, capsys):
+    project = _make_runtime_project(tmp_path, scripted_runtime_worker_image, scenario="fault_delete_file")
+    (project.repo / "legacy-note.txt").write_text("legacy content\n")
     try:
         started = _run_tulid(project.root, "runtime", "start", "--interval", "0.2")
         assert started.returncode == 0, started.stdout + started.stderr
-        _wait_for(
-            lambda: _task_state(project.project, "1") == "HumanReview",
-            "product idea to reach HumanReview",
-        )
-        manual = _run_tulid(project.root, "transition", "Agent", "1", "ApproveDirection")
-        assert manual.returncode == 0, manual.stdout + manual.stderr
-        _wait_for(
-            lambda: _task_state(project.project, "1") == "Done",
-            "parent planning to finish before the deletion attempt",
-            timeout=90.0,
-        )
-
-        # The deletion submission is rejected (bounded); repair cannot deliver
-        # a deletion that cannot be re-verified, so the task never claims Done.
-        _wait_for(
-            lambda: _task_state(project.project, "2") != "Done"
-            and any(
-                payload.get("transition_id") == "ImplementTask"
-                and payload.get("status") == "failed"
-                for payload in _job_payloads(project)
-            ),
-            "deletion submission to settle bounded-blocked",
-            timeout=90.0,
-        )
-
-        jobs = _job_payloads(project)
-        deletion_jobs = [
-            payload for payload in jobs if payload.get("transition_id") == "ImplementTask"
-        ]
-        assert any(payload["status"] == "failed" for payload in deletion_jobs)
-        assert all(payload["status"] != "accepted" for payload in deletion_jobs)
-        assert _task_state(project.project, "2") != "Done"
-        # Repository stayed consistent: the legacy file was never destroyed.
-        assert (project.repo / "legacy-note.txt").read_text(encoding="utf-8") == (
-            "legacy content\n"
-        )
-        # The rejection named the deletion as the blocker.
-        rejected = [
-            event
-            for event in JsonlEventStore(project.project / "events").iter_events()
-            if event.event_type == "ExecutionCompletionRejected"
-        ]
-        assert rejected
-        codes = {
-            item.get("code")
-            for event in rejected
-            for item in (event.data or {}).get("feedback", [])
-            if isinstance(item, dict)
-        }
-        assert "completion.changed_file_not_found" in codes or "completion.changed_files_mismatch" in codes
+        _wait_for(lambda: _task_state(project.project, "1") == "HumanReview", "direction approval")
+        approved = _run_tulid(project.root, "transition", "Agent", "1", "ApproveDirection")
+        assert approved.returncode == 0, approved.stdout + approved.stderr
+        _wait_for(lambda: _task_state(project.project, "2") == "Done", "verified deletion delivery", timeout=90)
+        job = _job_payload_for_transition(project, "ImplementTask")
+        assert job["status"] == "accepted"
+        assert not (project.repo / "legacy-note.txt").exists()
+        assert "legacy-note.txt" in job["metadata"]["verification_report"]["changes"]["removed"]
+        assert any(effect["type"] == "delete_changed_file" for effect in job["metadata"]["promoted_files"])
     finally:
         _run_tulid(project.root, "runtime", "stop", "--project", "Agent")
         _print_system_logs(project, capsys)

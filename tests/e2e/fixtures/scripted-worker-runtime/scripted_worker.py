@@ -79,6 +79,11 @@ def role_of(transition):
     State/task-type names are free-form in plan 6E; the worker decides what to
     do from the transition's semantic position, not from the state spelling.
     """
+    frozen_path = workspace / ".open-tulid/execution-contract.json"
+    if frozen_path.exists():
+        frozen = json.loads(frozen_path.read_text())
+        if frozen.get("transition", {}).get("review") is True:
+            return "review"
     lowered = transition.lower()
     if "draftdirection" in lowered or "direction" in lowered:
         return "direction"
@@ -232,28 +237,13 @@ def implement_payload(attempt):
     # fault: worker writes app.py but the first attempt omits changed_files (an
     # Acceptance-level requirement), then a repair supplies the exact paths.
     if is_fault("fault_omit_changed_files"):
-        first = workspace / "first-omit-attempt.txt"
-        if not repair_prompt:
-            first.write_text("remove after the rejection\n", encoding="utf-8")
-            return {
-                "submission_id": "implement-omit-rejected",
-                "attempt": attempt,
-                "summary": "deliberately omitted changed paths",
-                "artifacts": [],
-                "changed_files": [],
-                "validation_evidence": validation_evidence(),
-            }, None
-        if show_batch:
-            (workspace / "helper.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
         (workspace / "app.py").write_text("def healthz():\n    return 'ok'\n", encoding="utf-8")
-        first.unlink(missing_ok=True)
-        changed = ["app.py"] + (["helper.py"] if show_batch else [])
+        (workspace / "helper.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
         return {
-            "submission_id": "implement-omit-repaired",
+            "submission_id": "implement-omitted",
             "attempt": attempt,
-            "summary": "changed paths supplied after rejection",
-            "artifacts": [],
-            "changed_files": changed,
+            "summary": "deliberately omitted changed paths",
+            "artifacts": [], "changed_files": [],
             "validation_evidence": validation_evidence(),
         }, None
 
@@ -267,7 +257,7 @@ def implement_payload(attempt):
             "attempt": attempt,
             "summary": "worker deleted the legacy file",
             "artifacts": [],
-            "changed_files": ["app.py", "deleted:legacy-note.txt"],
+            "changed_files": ["app.py", "legacy-note.txt"],
             "validation_evidence": validation_evidence(),
         }, None
 
