@@ -13,7 +13,7 @@ SUPPORTED_KINDS: Final = frozenset({
 })
 
 STATEMENT_KEYS: Final = {
-    "state": frozenset({"kind", "id"}),
+    "state": frozenset({"kind", "id", "terminal_outcome"}),
     "task_type": frozenset({"kind", "id", "requirements", "instructions"}),
     "artifact_type": frozenset({"kind", "id", "template"}),
     "validation_type": frozenset({"kind", "id", "args"}),
@@ -24,6 +24,10 @@ STATEMENT_KEYS: Final = {
         "requires", "transaction", "instructions", "derives",
     }),
 }
+
+# Explicit terminal outcome declarations a state may carry. Success/failure/
+# cancelled are spelling-independent semantics used by dependency resolution.
+SUPPORTED_TERMINAL_OUTCOMES: Final = frozenset({"success", "failure", "cancelled"})
 
 STATEMENT_REQUIRED_KEYS: Final = {
     "state": frozenset({"kind", "id"}),

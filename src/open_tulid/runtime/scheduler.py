@@ -28,6 +28,7 @@ from .attempts import attempt_records_from_metadata, count_consumed_attempts, ta
 from .context import load_parent_tasks, resolve_source_content_identities
 from .repository_facts import repository_identity
 from .failures import failure_from_metadata
+from open_tulid.domain.completion import dependency_outcome, has_outgoing_transition
 
 
 RECENT_FAILURE_BACKOFF_SECONDS = 60
@@ -811,10 +812,23 @@ def _dependency_error(
                 f"Task {task.id!r} depends on missing task {dependency_id!r}.",
                 task.id,
             )
-        if _has_outgoing_transition(dependency, workflow):
+        dependency_semantic = dependency_outcome(
+            workflow, dependency.task_type, dependency.current_state
+        )
+        if dependency_semantic == "unmet":
             return _error(
                 "task.dependency_unmet",
                 f"Task {task.id!r} depends on unfinished task {dependency_id!r}.",
+                task.id,
+            )
+        if dependency_semantic in ("failure", "cancelled"):
+            return _error(
+                "task.dependency_failed",
+                (
+                    f"Task {task.id!r} depends on task {dependency_id!r} which "
+                    f"finished in a declared {dependency_semantic} terminal state; "
+                    "dependent work must not advance against a failed/cancelled dependency."
+                ),
                 task.id,
             )
         # Plan 5F: admit the dependent against the accepted repository identity of
@@ -884,13 +898,6 @@ def _dependency_accepted_repo_identity(
     recorded = latest.metadata.get("accepted_repository_identity")
     identity = recorded if isinstance(recorded, str) else None
     return identity, True
-
-
-def _has_outgoing_transition(task: Task, workflow: WorkflowDefinition) -> bool:
-    return any(
-        transition.task_type == task.task_type and transition.from_state == task.current_state
-        for transition in workflow.transitions.values()
-    )
 
 
 def _has_accepted_job(jobs: list[ExecutionJob]) -> bool:

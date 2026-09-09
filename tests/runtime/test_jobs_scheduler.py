@@ -2255,3 +2255,162 @@ def test_recover_job_creation_transactions_ignores_failed_creation(tmp_path: Pat
 
     assert recovered == ()
     assert store.list().jobs == ()
+
+
+def test_scheduler_blocks_dependent_on_declared_failure_terminal(tmp_path: Path):
+    # 6A: a dependency that finished in a declared failure terminal must not
+    # admit a dependent, regardless of any accepted repository evidence.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    assert identity is not None
+    dep = Task(
+        id="01J00000000000000000000002",
+        title="Dep",
+        path="tasks/dep.md",
+        current_state="Failed",
+        task_type="task",
+    )
+    dependent = Task(
+        id=TASK_ID,
+        title="Dependent",
+        path="tasks/dependent.md",
+        current_state="Todo",
+        task_type="task",
+        dependencies=("01J00000000000000000000002",),
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="01J00000000000000000000002",
+        transition_id="review",
+        worker_id="codex",
+        workspace_path=str(tmp_path / "work"),
+        status="accepted",
+        metadata={"accepted_repository_identity": identity},
+    )).accepted is True
+    states = {
+        "Todo": StateDefinition(id="Todo"),
+        "Review": StateDefinition(id="Review"),
+        "Done": StateDefinition(id="Done", terminal_outcome="success"),
+        "Failed": StateDefinition(id="Failed", terminal_outcome="failure"),
+    }
+    transitions = {
+        "implement": TransitionDefinition(
+            id="implement", task_type="task", from_state="Todo", to_state="Review",
+            worker="codex", requires=RequirementDefinition(), transaction=None,
+            default_for_scheduler=True,
+        ),
+        "review": TransitionDefinition(
+            id="review", task_type="task", from_state="Review", to_state="Done",
+            worker="codex", requires=RequirementDefinition(), transaction=None,
+            default_for_scheduler=True,
+        ),
+    }
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType(states),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType(transitions),
+    )
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(dep, dependent)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is False
+    assert any(skip.code == "task.dependency_failed" for skip in result.skipped)
+
+
+def test_scheduler_uses_renamed_states_and_custom_task_types_for_success(tmp_path: Path):
+    # 6A: success semantics are not hardcoded to the literal "Done"/"task" names;
+    # arbitrary state names, a custom task type, and an arbitrary worker must
+    # admit a dependent against declared success with accepted repo evidence.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    identity = repository_identity(repo)
+    assert identity is not None
+    dep = Task(
+        id="01J00000000000000000000002",
+        title="Dep",
+        path="tasks/dep.md",
+        current_state="Shipped",
+        task_type="gadget",
+    )
+    dependent = Task(
+        id=TASK_ID,
+        title="Dependent",
+        path="tasks/dependent.md",
+        current_state="Open",
+        task_type="gadget",
+        dependencies=("01J00000000000000000000002",),
+    )
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    assert store.create(ExecutionJob(
+        job_id="01J00000000000000000000JOB",
+        project_id="Agent",
+        task_id="01J00000000000000000000002",
+        transition_id="verify",
+        worker_id="worker-7",
+        workspace_path=str(tmp_path / "work"),
+        status="accepted",
+        metadata={"accepted_repository_identity": identity},
+    )).accepted is True
+    states = {
+        "Open": StateDefinition(id="Open"),
+        "Verify": StateDefinition(id="Verify"),
+        "Shipped": StateDefinition(id="Shipped", terminal_outcome="success"),
+    }
+    transitions = {
+        "do": TransitionDefinition(
+            id="do", task_type="gadget", from_state="Open", to_state="Verify",
+            worker="worker-7", requires=RequirementDefinition(), transaction=None,
+            default_for_scheduler=True,
+        ),
+        "verify": TransitionDefinition(
+            id="verify", task_type="gadget", from_state="Verify", to_state="Shipped",
+            worker="worker-7", requires=RequirementDefinition(), transaction=None,
+            default_for_scheduler=True,
+        ),
+    }
+    workflow = WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType(states),
+        task_types=MappingProxyType({
+            "gadget": TaskTypeDefinition(id="gadget", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType(transitions),
+    )
+    scheduler = Scheduler(
+        workflow=workflow,
+        adapter=FakeAdapter(_snapshot(dep, dependent)),
+        job_store=store,
+        workspace_root=tmp_path / "workspaces",
+        project_root=tmp_path / "tracker",
+        repo_root=repo,
+    )
+
+    result = scheduler.schedule_one("Agent")
+
+    assert result.accepted is True
+    assert result.scheduled is True
+    assert result.task_id == TASK_ID
+    assert not any(skip.code.startswith("task.dependency") for skip in result.skipped)

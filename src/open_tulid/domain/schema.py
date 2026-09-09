@@ -229,8 +229,16 @@ class StorageDefinition:
 @dataclass(frozen=True)
 class StateDefinition:
     """One named workflow state.
-    States are the stable nodes tasks move between."""
+    States are the stable nodes tasks move between.
+
+    ``terminal_outcome`` is an explicit semantic declaration of what reaching a
+    state means for dependency resolution: "success", "failure", or "cancelled".
+    ``None`` is the legacy ambiguous case, preserved for backward compatibility
+    while an explicit migration diagnostic is emitted. Nothing here is inferred
+    from the spelling of the state id.
+    """
     id: str
+    terminal_outcome: str | None = None
 
 
 @dataclass(frozen=True)

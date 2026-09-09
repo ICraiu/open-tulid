@@ -99,6 +99,8 @@ class Statement:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class StateStatement(Statement):
+    terminal_outcome: str | None = None
+
     def accept(self, visitor: AstVisitor) -> object:
         return visitor.visit_state(self)
 

@@ -665,3 +665,35 @@ statements:
         d = wrong_type[0]
         assert d.line is not None and d.line >= 1, f"line should be populated, got {d.line}"
         assert d.column is not None and d.column >= 1, f"column should be populated, got {d.column}"
+
+
+class TestTerminalOutcome:
+    def test_state_carries_declared_terminal_outcome(self):
+        parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: state\n    id: Done\n    terminal_outcome: success\n")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is not None
+        stop = next(s for s in result.document.statements if s.id == "Done")
+        assert stop.terminal_outcome == "success"
+
+    def test_state_without_terminal_outcome_defaults_to_none(self):
+        parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: state\n    id: Todo\n")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is not None
+        stmt = result.document.statements[0]
+        assert stmt.terminal_outcome is None
+
+    def test_rejects_unknown_terminal_outcome(self):
+        parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: state\n    id: Done\n    terminal_outcome: maybe\n")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is None
+        assert any(d.code == "workflow.shape.unknown_terminal_outcome" for d in result.diagnostics)
+
+    def test_rejects_non_string_terminal_outcome(self):
+        parsed = parse_yaml("schema_version: 1\nstatements:\n  - kind: state\n    id: Done\n    terminal_outcome: true\n")
+        assert parsed.value is not None
+        result = build_ast(parsed.value)
+        assert result.document is None
+        assert any(d.code == "workflow.shape.wrong_type" for d in result.diagnostics)

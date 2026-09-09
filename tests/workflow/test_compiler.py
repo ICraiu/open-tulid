@@ -242,7 +242,9 @@ class TestCompilePositive:
         compile_result = compile_workflow(ast_result.document)
         assert compile_result.valid is True
         assert compile_result.definition is not None
-        assert compile_result.diagnostics == ()
+        # Legacy fixtures may carry ambiguous terminal states; those are
+        # migration warnings, not errors, so no error-severity diagnostics remain.
+        assert not any(d.severity == "error" for d in compile_result.diagnostics)
 
     def test_compile_valid_full_rejects_custom_types(self):
         result = workflow_engine.load_yaml(str(FIXTURES / "valid_full.yaml"))
@@ -1138,3 +1140,112 @@ statements:
         result = compile_workflow(doc)
         codes = {d.code for d in result.diagnostics}
         assert "workflow.compile.unsupported_worker" in codes
+
+
+def test_compiles_declared_terminal_outcome_into_domain_definition():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: Done
+    terminal_outcome: success
+  - kind: task_type
+    id: task
+  - kind: transition
+    id: Implement
+    task_type: task
+    from: Todo
+    to: Done
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is True
+    assert result.definition is not None
+    assert result.definition.states["Done"].terminal_outcome == "success"
+    assert result.definition.states["Todo"].terminal_outcome is None
+
+
+def test_migrated_terminals_declared_success_have_no_ambiguity_warning():
+    # A declared success terminal must not be flagged as a legacy ambiguous
+    # terminal (no migration warning emitted).
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Done
+    terminal_outcome: success
+""")
+
+    result = compile_workflow(doc)
+    assert result.valid is True
+    assert result.definition is not None
+    assert not any(d.code == "workflow.compile.ambiguous_terminal_state" for d in result.diagnostics)
+
+
+def test_ambiguous_terminal_state_is_a_warning_not_an_error():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Done
+""")
+
+    result = compile_workflow(doc)
+
+    # Legacy terminal state without a declaration compiles (backward compatible)
+    # but surfaces an explicit migration diagnostic.
+    assert result.valid is True
+    assert result.definition is not None
+    warning = next(
+        d for d in result.diagnostics
+        if d.code == "workflow.compile.ambiguous_terminal_state"
+    )
+    assert warning.severity == "warning"
+    assert "terminal_outcome" in warning.message
+
+
+def test_contradictory_terminal_with_outgoing_transition_is_rejected():
+    doc = _build_document("""
+schema_version: 1
+statements:
+  - kind: state
+    id: Todo
+  - kind: state
+    id: Done
+    terminal_outcome: success
+  - kind: task_type
+    id: task
+  - kind: transition
+    id: Implement
+    task_type: task
+    from: Todo
+    to: Done
+  - kind: transition
+    id: Reopen
+    task_type: task
+    from: Done
+    to: Todo
+""")
+
+    result = compile_workflow(doc)
+
+    assert result.valid is False
+    assert any(d.code == "workflow.compile.terminal_conflict" for d in result.diagnostics)
+
+
+def test_rejects_unknown_terminal_outcome_at_compile():
+    # Construct a document directly (bypassing the loader, which already rejects
+    # unknown outcomes) so the compiler's own validation is exercised.
+    from workflow_engine.ast import StateStatement, WorkflowDocument
+    doc = WorkflowDocument(
+        schema_version=1,
+        statements=(StateStatement(id="Done", terminal_outcome="maybe"),),
+    )
+
+    result = compile_workflow(doc)
+
+    assert result.valid is False
+    assert any(d.code == "workflow.compile.unknown_terminal_outcome" for d in result.diagnostics)

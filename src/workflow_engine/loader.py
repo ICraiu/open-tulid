@@ -348,7 +348,29 @@ def _build_statement(
                 field_spans[field_name] = fs
 
     if kind == "state":
-        return diagnostics, StateStatement(id=stmt_id, span=item_span)
+        terminal_outcome = raw.get("terminal_outcome")
+        if terminal_outcome is not None and not isinstance(terminal_outcome, str):
+            to_span = key_span(raw, "terminal_outcome", f"{item_path}.terminal_outcome")
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.wrong_type",
+                "terminal_outcome must be a string",
+                to_span,
+            ))
+            return diagnostics, None
+        if terminal_outcome is not None and terminal_outcome not in langdef.SUPPORTED_TERMINAL_OUTCOMES:
+            to_span = key_span(raw, "terminal_outcome", f"{item_path}.terminal_outcome")
+            diagnostics.append(_diag_from_span(
+                "workflow.shape.unknown_terminal_outcome",
+                f"unknown terminal_outcome: {terminal_outcome!r} "
+                f"(expected one of {sorted(langdef.SUPPORTED_TERMINAL_OUTCOMES)})",
+                to_span,
+            ))
+            return diagnostics, None
+        return diagnostics, StateStatement(
+            id=stmt_id,
+            terminal_outcome=terminal_outcome,
+            span=item_span,
+        )
 
     if kind == "artifact_type":
         template = raw.get("template")

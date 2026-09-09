@@ -22,6 +22,7 @@ from workflow_engine.ast import (
 from workflow_engine.diagnostics import SourceSpan
 
 from .builtins import get_builtin_registries
+from open_tulid.domain.completion import TERMINAL_OUTCOMES
 from open_tulid.domain.schema import (
     ArgDefinition,
     ArtifactTypeDefinition,
@@ -331,6 +332,45 @@ def _validate_storage_refs(
         seen_board_columns.add(board_column)
 
 
+def _validate_terminal_semantics(
+    states: dict[str, StateDefinition],
+    transitions: dict[str, TransitionDefinition],
+    diagnostics: list[WorkflowCompileDiagnostic],
+) -> None:
+    """Diagnose terminal-outcome contradictions and legacy ambiguous terminals.
+
+    - A state that declares a terminal outcome must not have an outgoing
+      transition (a supposedly terminal state must be genuinely terminal, or
+      dependents could advance against a contradictory state).
+    - A terminal state (no outgoing transitions) without a declaration is a
+      legacy ambiguous state needing an explicit migration diagnostic, so
+      historical readability is preserved without silently blessing an
+      undeclared state as success at runtime.
+    """
+    outgoing_from: set[str] = {
+        transition.from_state for transition in transitions.values()
+    }
+    for state_id, state in states.items():
+        if state.terminal_outcome is not None and state_id in outgoing_from:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.terminal_conflict",
+                message=(
+                    f"state {state_id!r} declares terminal outcome "
+                    f"{state.terminal_outcome!r} but still has an outgoing transition"
+                ),
+            ))
+        elif state_id not in outgoing_from and state.terminal_outcome is None:
+            diagnostics.append(WorkflowCompileDiagnostic(
+                code="workflow.compile.ambiguous_terminal_state",
+                severity="warning",
+                message=(
+                    f"state {state_id!r} has no outgoing transitions and no declared "
+                    "terminal_outcome; declare terminal_outcome (success|failure|cancelled) "
+                    "to migrate this legacy ambiguous terminal state"
+                ),
+            ))
+
+
 def _normalized_storage_config(config: Mapping[str, object]) -> Mapping[str, object]:
     obsidian_value = config.get("obsidian")
     if "boards" not in config and "state_mappings" not in config and isinstance(obsidian_value, Mapping):
@@ -377,7 +417,23 @@ def compile_workflow(
 
     for stmt in document.statements:
         if isinstance(stmt, StateStatement):
-            states[stmt.id] = StateDefinition(id=stmt.id)
+            if (
+                stmt.terminal_outcome is not None
+                and stmt.terminal_outcome not in TERMINAL_OUTCOMES
+            ):
+                path, line, column = _span_to_diag_fields(stmt.span)
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.unknown_terminal_outcome",
+                    message=(
+                        f"state {stmt.id!r} declares unknown terminal_outcome "
+                        f"{stmt.terminal_outcome!r}; expected one of {sorted(TERMINAL_OUTCOMES)}"
+                    ),
+                    path=path, line=line, column=column,
+                ))
+            states[stmt.id] = StateDefinition(
+                id=stmt.id,
+                terminal_outcome=stmt.terminal_outcome,
+            )
 
         elif isinstance(stmt, TaskTypeStatement):
             reqs: dict[str, RequirementDefinition] = {}
@@ -487,8 +543,9 @@ def compile_workflow(
         diagnostics,
     )
     _validate_storage_refs(document, states, diagnostics)
+    _validate_terminal_semantics(states, transitions, diagnostics)
 
-    if diagnostics:
+    if any(d.severity == "error" for d in diagnostics):
         return CompileResult(definition=None, diagnostics=tuple(diagnostics))
 
     definition = WorkflowDefinition(
@@ -502,4 +559,4 @@ def compile_workflow(
         transitions=_freeze_mapping(transitions),
         storage=_storage_to_def(document),
     )
-    return CompileResult(definition=definition, diagnostics=())
+    return CompileResult(definition=definition, diagnostics=tuple(diagnostics))
