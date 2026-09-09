@@ -168,10 +168,12 @@ def test_global_e2e_verifier_runs_commands_in_configured_dir_with_exit_expectati
     )
     assert compiled.accepted is True, [error.code for error in compiled.errors]
     assert compiled.contract is not None
-    assert [check.id for check in compiled.contract.resolved_checks] == ["build", "tests"]
-    build_check = compiled.contract.resolved_checks[0]
-    assert build_check.argv == ("python", "check_verify.py", "build")
-    assert build_check.working_directory == "backend"
+    # The declared contract order (tests before build) is preserved end to end;
+    # checks are never re-sorted alphabetically by id.
+    assert [check.id for check in compiled.contract.resolved_checks] == ["tests", "build"]
+    tests_check = compiled.contract.resolved_checks[0]
+    assert tests_check.argv == ("python", "check_verify.py", "tests")
+    assert tests_check.working_directory == "."
 
     result = DeterministicVerifier().verify(
         workspace=repo,
@@ -334,10 +336,10 @@ def test_every_implementation_task_inherits_the_same_global_commands(tmp_path):
     # same project global command set, independent of its body or scope.
     command_sets = {tuple(check.id for check in contract.resolved_checks) for contract in contracts}
     argv_sets = {tuple(check.argv for check in contract.resolved_checks) for contract in contracts}
-    assert command_sets == {("build", "tests")}
+    assert command_sets == {("tests", "build")}
     assert argv_sets == {(
-        ("python", "check_verify.py", "build"),
         ("python", "check_verify.py", "tests"),
+        ("python", "check_verify.py", "build"),
     )}
 
 
@@ -446,7 +448,7 @@ def test_legacy_per_task_artifact_remains_readable_but_new_run_uses_global_comma
     assert compiled.accepted is True
     assert compiled.contract is not None
     # The new run governs by the global commands, not the legacy file surface.
-    assert [check.id for check in compiled.contract.resolved_checks] == ["build", "tests"]
+    assert [check.id for check in compiled.contract.resolved_checks] == ["tests", "build"]
     assert compiled.contract.generated_contract.schema == "tulid.global_contract/v1"
 
 

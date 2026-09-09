@@ -112,6 +112,9 @@ def test_request_freezes_ordered_commands_ignoring_compile_reshuffle(tmp_path):
     assert request.environment_identity == "host:linux-x86_64"
     expected = [check.id for check in compiled.contract.resolved_checks]
     assert [c.name for c in request.commands] == expected
+    # The authored contract order (z_setup before a_tests) survives compilation
+    # and the frozen request; it is never re-sorted alphabetically.
+    assert [c.name for c in request.commands] == ["z_setup", "a_tests"]
     by_name = {command.name: command for command in request.commands}
     assert by_name["a_tests"].working_directory == "backend"
     assert by_name["a_tests"].timeout_seconds == 120

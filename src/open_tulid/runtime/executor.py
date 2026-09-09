@@ -695,7 +695,7 @@ class JobExecutor:
         contract = getattr(contract_result, "contract", None)
         if contract is None:
             return None
-        commands = sorted(
+        commands = tuple(
             (command.name, tuple(command.argv))
             for command in getattr(contract, "commands", ())
         )

@@ -214,10 +214,7 @@ def compile_standard_execution_contract(
         return ExecutionContractResult(errors=repository.errors)
 
     checks = tuple(
-        sorted(
-            (_global_command_check(cmd) for cmd in standard_contract.commands),
-            key=lambda check: check.id,
-        )
+        _global_command_check(cmd) for cmd in standard_contract.commands
     )
     context_excerpts, context_files, context_errors = _freeze_linked_context(
         project_root,

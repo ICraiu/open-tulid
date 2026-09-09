@@ -46,6 +46,7 @@ from open_tulid.runtime.executor import (
 )
 from open_tulid.runtime.prompts import normalize_ephemeral_completion_fields
 from open_tulid.runtime.observability import WorkerExited, WorkerObservability
+from open_tulid.runtime.standard_contracts import STANDARD_CONTRACT_FILENAME
 from open_tulid.workflow.implementations import VALIDATION_IMPLEMENTATIONS, WorkflowExecutionContext
 from socket_utils import can_bind_localhost
 
@@ -67,6 +68,60 @@ def test_contract_backed_job_never_falls_back_when_frozen_prompt_is_missing():
 
     with pytest.raises(ValueError, match="no immutable prompt packet"):
         _frozen_prompt_packet(job, object())
+
+
+_ORDERED_CONTRACT = """\
+schema: tulid.contract/v1
+commands:
+  - name: z_setup
+    argv: [python, check_verify.py, setup]
+    working_directory: .
+    timeout_seconds: 300
+  - name: a_tests
+    argv: [python, check_verify.py, tests]
+    working_directory: backend
+    timeout_seconds: 120
+"""
+
+_REORDERED_CONTRACT = """\
+schema: tulid.contract/v1
+commands:
+  - name: a_tests
+    argv: [python, check_verify.py, tests]
+    working_directory: backend
+    timeout_seconds: 120
+  - name: z_setup
+    argv: [python, check_verify.py, setup]
+    working_directory: .
+    timeout_seconds: 300
+"""
+
+
+def test_executor_command_policy_hash_preserves_declared_order(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    contract_path = repo_root / STANDARD_CONTRACT_FILENAME
+    contract_path.write_text(_ORDERED_CONTRACT, encoding="utf-8")
+    executor = JobExecutor(
+        workflow=_workflow(),
+        adapter=FakeAdapter(),
+        job_store=FileExecutionJobStore(tmp_path / "jobs"),
+        event_store=JsonlEventStore(tmp_path / "events"),
+        runtime=RuntimeConfig(completion_host="127.0.0.1", completion_container_host="127.0.0.1"),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent", repo_root=repo_root),
+    )
+    forward = executor._command_policy_hash()
+    assert forward is not None
+    # Relisting identical commands in a different order changes the frozen
+    # command-policy identity: declared order is part of the policy digest.
+    contract_path.write_text(_REORDERED_CONTRACT, encoding="utf-8")
+    assert executor._command_policy_hash() != forward
+    # An unchanged contract reproduces the same stable digest.
+    contract_path.write_text(_ORDERED_CONTRACT, encoding="utf-8")
+    assert executor._command_policy_hash() == forward
+    # Without a configured repo root there is no contract to freeze.
+    executor.project_config = ProjectConfig(name="Agent", tracker_path="Agent")
+    assert executor._command_policy_hash() is None
 
 
 @dataclass(frozen=True)
