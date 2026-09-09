@@ -994,6 +994,16 @@ class CompletionService:
         target_path = Path(str(effect.get("target_path", "")))
         target_existed = bool(effect.get("target_existed", False))
         if not target_existed and target_path.exists():
+            expected_after = effect.get("expected_after_sha256")
+            if (
+                isinstance(expected_after, str)
+                and _file_sha256(target_path) != expected_after
+            ):
+                return _EffectApplyResult(False, "artifact compensation blocked by intervening change", (_error(
+                    "artifact.compensation_conflict",
+                    f"Cannot compensate promoted artifact {target_path}: content changed since promotion.",
+                    str(target_path),
+                ),))
             try:
                 target_path.unlink()
             except OSError as exc:
@@ -1172,6 +1182,10 @@ def _promotion_plan(
             source_name = Path(file_name)
             file_name = f"{source_name.stem}-{content_hash}{source_name.suffix}"
         target = artifact_root / task_id / artifact.type / file_name
+        try:
+            expected_after_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        except OSError:
+            expected_after_sha256 = None
         planned.append({
             "artifact_type": artifact.type,
             "source_path": str(source),
@@ -1179,6 +1193,7 @@ def _promotion_plan(
             "link": _artifact_link(artifact_root, target),
             "target_existed": target.exists(),
             "previous_links": tuple(existing_task.artifact_links) if existing_task is not None else (),
+            "expected_after_sha256": expected_after_sha256,
         })
     return tuple(planned)
 
@@ -1239,6 +1254,7 @@ def _candidate_change_plan(
                 "type": "delete_changed_file",
                 "target_path": str(target),
                 "expected_after_listing": "absent",
+                "expected_before_sha256": change.before_sha256,
             })
         elif source.is_file():
             if target.is_file() and _same_file_content(source, target):
@@ -1247,6 +1263,7 @@ def _candidate_change_plan(
                 "type": "promote_changed_file",
                 "source_path": str(source),
                 "target_path": str(target),
+                "expected_after_sha256": change.after_sha256,
             })
     return tuple(planned)
 
@@ -1700,38 +1717,56 @@ def _record_submission(
     }
 
 
+_RECOVERABLE_EFFECT_TYPES = frozenset({
+    "promote_artifact",
+    "move_task",
+    "create_task",
+    "link_derived_tasks",
+    "promote_changed_file",
+    "delete_changed_file",
+    "commit_repo_changes",
+})
+
+
 def recover_completion_transactions(
     *,
     service: CompletionService,
     event_store: JsonlEventStore,
     journal_store: TransactionJournalStore,
 ) -> tuple[str, ...]:
+    """Roll a prepared completion journal forward without losing user work.
+
+    For each prepared journal the transaction's own after-identity is inspected
+    per effect: effects already applied are skipped, effects that can be proven
+    safe to apply are rolled forward, and any intervening user change blocks the
+    journal as an unresolved conflict while retaining the candidate/before images.
+    A crash after a Git commit is detected and verified instead of producing a
+    duplicate commit or blindly resetting branch history.
+    """
     recovered: list[str] = []
     existing_event_ids = {event.event_id for event in event_store.iter_events()}
     for record in journal_store.list_incomplete():
         effect_types = {effect.get("type") for effect in record.effects}
-        if not effect_types or not effect_types.issubset({"promote_artifact", "move_task", "create_task", "link_derived_tasks"}):
+        if not effect_types or not effect_types.issubset(_RECOVERABLE_EFFECT_TYPES):
             continue
         if record.task_id is None or record.transition_id is None:
             continue
-        all_effects_ok = True
+        expected_to_state = _expected_to_state(record)
+        if not expected_to_state:
+            continue
+        # An intervening user change anywhere in the intended change set must
+        # stop recovery with the journal left prepared, never overwritten.
+        if _recovery_has_conflict(service, record):
+            continue
+        applying_ok = True
         for effect in record.effects:
+            if _recovery_effect_applied(service, record, effect):
+                continue
             result = service._apply_effect(effect)
             if not result.accepted:
-                all_effects_ok = False
+                applying_ok = False
                 break
-        if not all_effects_ok:
-            continue
-        expected_to_state = next(
-            (
-                str(effect.get("to_state", ""))
-                for effect in record.effects
-                if effect.get("type") == "move_task"
-                and str(effect.get("task_id", "")) == record.task_id
-            ),
-            "",
-        )
-        if not expected_to_state:
+        if not applying_ok:
             continue
         final = service._validate_final_state(record.task_id, expected_to_state)
         if not final.accepted:
@@ -1746,3 +1781,128 @@ def recover_completion_transactions(
         if committed.accepted:
             recovered.append(record.journal_id)
     return tuple(recovered)
+
+
+def _expected_to_state(record) -> str:
+    return next(
+        (
+            str(effect.get("to_state", ""))
+            for effect in record.effects
+            if effect.get("type") == "move_task"
+            and str(effect.get("task_id", "")) == record.task_id
+        ),
+        "",
+    )
+
+
+def _recovery_effect_applied(
+    service: CompletionService,
+    record,
+    effect: Mapping[str, object],
+) -> bool:
+    """Whether the effect's after-identity is already present on disk/task."""
+    kind = effect.get("type")
+    if kind == "move_task":
+        loaded = service.adapter.read_task(str(effect.get("task_id", "")))
+        return (
+            loaded.accepted
+            and loaded.task is not None
+            and loaded.task.current_state == str(effect.get("to_state", ""))
+        )
+    if kind == "create_task":
+        payload = effect.get("task")
+        if not isinstance(payload, Mapping):
+            return False
+        loaded = service.adapter.read_task(str(payload.get("id", "")))
+        return loaded.accepted and loaded.task is not None
+    if kind in ("promote_artifact", "promote_changed_file"):
+        source = Path(str(effect.get("source_path", "")))
+        target = Path(str(effect.get("target_path", "")))
+        if not source.is_file() or not target.is_file():
+            return False
+        return _same_file_content(source, target)
+    if kind == "delete_changed_file":
+        target = Path(str(effect.get("target_path", "")))
+        return not target.exists()
+    if kind == "commit_repo_changes":
+        return _transaction_commit_exists(service, record, effect)
+    return False
+
+
+def _recovery_has_conflict(service: CompletionService, record) -> bool:
+    """Detect an intervening user change that blocks rollback/roll-forward.
+
+    A delete is admissible only when the file still matches the transaction's
+    own expected before-image; anything else is a user change we must not
+    overwrite. A Git commit effect whose branch tip is neither the recorded base
+    nor the transaction's own commit is likewise a conflict. The journal is left
+    prepared so the candidate/before images are retained for explicit conflict
+    resolution.
+    """
+    for effect in record.effects:
+        if effect.get("type") == "delete_changed_file":
+            target = Path(str(effect.get("target_path", "")))
+            expected_before = effect.get("expected_before_sha256")
+            if target.exists() and isinstance(expected_before, str):
+                if _file_sha256(target) != expected_before:
+                    return True
+        if effect.get("type") == "commit_repo_changes":
+            if _transaction_commit_exists(service, record, effect):
+                continue
+            base = str(record.context.get("repository_base_commit", ""))
+            runner = service.repo_command_runner or _run_repo_command
+            if service.repo_root is not None and base:
+                head = _git_rev(runner, service.repo_root, "HEAD")
+                if head and head != base:
+                    return True
+    return False
+
+
+def _transaction_commit_exists(
+    service: CompletionService,
+    record,
+    effect: Mapping[str, object],
+) -> bool:
+    """Locate and verify the already-created transaction commit.
+
+    Returns True only when the branch tip is the exact intended commit (matching
+    message and parent), so recovery neither creates a duplicate commit nor
+    resets branch history blindly. A different tip is an unresolved conflict.
+    """
+    if service.repo_root is None:
+        return False
+    runner = service.repo_command_runner or _run_repo_command
+    message = str(effect.get("message", ""))
+    base = str(record.context.get("repository_base_commit", ""))
+    head = _git_rev(runner, service.repo_root, "HEAD")
+    if not head:
+        return False
+    if base and head == base:
+        return False
+    parent = _git_parent(runner, service.repo_root, head)
+    if base and parent and parent != base:
+        return False
+    subject = _git_show(runner, service.repo_root, head)
+    return subject == message
+
+
+def _git_rev(runner, repo_root: Path, ref: str) -> str | None:
+    result = runner(("git", "rev-parse", "--short", ref), repo_root)
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
+def _git_parent(runner, repo_root: Path, commit: str) -> str | None:
+    result = runner(("git", "rev-parse", "--short", f"{commit}^"), repo_root)
+    if result.returncode != 0:
+        return None
+    parent = (result.stdout or "").strip()
+    return parent or None
+
+
+def _git_show(runner, repo_root: Path, commit: str) -> str | None:
+    result = runner(("git", "log", "-1", "--pretty=%s", commit), repo_root)
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()

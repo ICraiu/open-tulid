@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from types import MappingProxyType
@@ -1477,6 +1479,306 @@ def test_recover_completion_transactions_finishes_prepared_acceptance(tmp_path: 
     assert journals.load("01J00000000000000000000JRN").status.value == "committed"
 
 
+def _git_init(tmp_path: Path, files: dict[str, str]) -> str:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    subprocess.run(("git", "-C", str(repo), "init", "-q"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "config", "user.email", "test@example.com"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "config", "user.name", "Test"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "add", "--all"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "commit", "-qm", "base"), check=True, capture_output=True)
+    return subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _repo_sha256(path: Path) -> str:
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_recover_completion_transactions_rolls_forward_delivery_after_commit(tmp_path: Path):
+    base = _git_init(tmp_path, {
+        "src/main.ts": "export const answer = 1;\n",
+        "old.txt": "obsolete\n",
+    })
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "candidate"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+
+    # Simulate the crash-after-commit: the transaction commit already exists at HEAD.
+    (repo / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    (repo / "old.txt").unlink()
+    subprocess.run(("git", "-C", str(repo), "add", "--", "src/main.ts", "old.txt"), check=True, capture_output=True)
+    subprocess.run(
+        ("git", "-C", str(repo), "commit", "-qm", f"{TASK_ID}: Implement thing"),
+        check=True, capture_output=True,
+    )
+    before_head = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    journal = journals.prepare(
+        journal_id="01J00000000000000000000JDR",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        effects=(
+            {
+                "type": "promote_changed_file",
+                "source_path": str(workspace / "src" / "main.ts"),
+                "target_path": str(repo / "src" / "main.ts"),
+                "expected_after_sha256": _repo_sha256(workspace / "src" / "main.ts"),
+            },
+            {
+                "type": "delete_changed_file",
+                "target_path": str(repo / "old.txt"),
+                "expected_after_listing": "absent",
+                "expected_before_sha256": _repo_sha256(repo / "old.txt") if (repo / "old.txt").exists() else None,
+            },
+            {
+                "type": "commit_repo_changes",
+                "message": f"{TASK_ID}: Implement thing",
+                "paths": ("src/main.ts", "old.txt"),
+            },
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+        ),
+        events=(build_event(
+            project_id="Agent",
+            actor=EventActor(type="system", id="test"),
+            event_type=EventType.ExecutionFinished,
+            correlation_id="corr",
+            task_id=TASK_ID,
+            transition_id="code",
+        ),),
+        context={
+            "repository_base_commit": base,
+            "commit": {
+                "message": f"{TASK_ID}: Implement thing",
+                "paths": ("src/main.ts", "old.txt"),
+                "expected_outcome": "committed",
+            },
+        },
+    )
+    assert journal.accepted is True
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=_job_store(tmp_path),
+        event_store=events,
+        journal_store=journals,
+        repo_root=repo,
+    )
+
+    recovered = recover_completion_transactions(
+        service=service,
+        event_store=events,
+        journal_store=journals,
+    )
+
+    assert recovered == ("01J00000000000000000000JDR",)
+    assert journals.load("01J00000000000000000000JDR").status.value == "committed"
+    assert adapter.moved_to == "CodeReview"
+    assert not (repo / "old.txt").exists()
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
+
+    # The already-created transaction commit must be reused, not duplicated.
+    after_head = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert after_head == before_head
+    commits = subprocess.run(
+        ("git", "-C", str(repo), "rev-list", "--count", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert commits == "2"
+
+
+def test_recover_completion_transactions_creates_missing_commit(tmp_path: Path):
+    base = _git_init(tmp_path, {
+        "src/main.ts": "export const answer = 1;\n",
+        "old.txt": "obsolete\n",
+    })
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "candidate"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+
+    journal = journals.prepare(
+        journal_id="01J00000000000000000000JDF",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        effects=(
+            {
+                "type": "promote_changed_file",
+                "source_path": str(workspace / "src" / "main.ts"),
+                "target_path": str(repo / "src" / "main.ts"),
+                "expected_after_sha256": _repo_sha256(workspace / "src" / "main.ts"),
+            },
+            {
+                "type": "delete_changed_file",
+                "target_path": str(repo / "old.txt"),
+                "expected_after_listing": "absent",
+                "expected_before_sha256": _repo_sha256(repo / "old.txt"),
+            },
+            {
+                "type": "commit_repo_changes",
+                "message": f"{TASK_ID}: Implement thing",
+                "paths": ("src/main.ts", "old.txt"),
+            },
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+        ),
+        events=(build_event(
+            project_id="Agent",
+            actor=EventActor(type="system", id="test"),
+            event_type=EventType.ExecutionFinished,
+            correlation_id="corr",
+            task_id=TASK_ID,
+            transition_id="code",
+        ),),
+        context={"repository_base_commit": base},
+    )
+    assert journal.accepted is True
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=_job_store(tmp_path),
+        event_store=events,
+        journal_store=journals,
+        repo_root=repo,
+    )
+
+    recovered = recover_completion_transactions(
+        service=service,
+        event_store=events,
+        journal_store=journals,
+    )
+
+    assert recovered == ("01J00000000000000000000JDF",)
+    assert adapter.moved_to == "CodeReview"
+    assert not (repo / "old.txt").exists()
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
+    # One new commit was created by roll-forward; repetition adds none.
+    commits = subprocess.run(
+        ("git", "-C", str(repo), "rev-list", "--count", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert commits == "2"
+    assert recover_completion_transactions(
+        service=service,
+        event_store=events,
+        journal_store=journals,
+    ) == ()
+
+
+def test_recover_completion_transactions_blocks_on_intervening_delete_change(tmp_path: Path):
+    base = _git_init(tmp_path, {
+        "old.txt": "obsolete\n",
+    })
+    repo = tmp_path / "repo"
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+
+    journal = journals.prepare(
+        journal_id="01J00000000000000000000JDC",
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        effects=(
+            {
+                "type": "delete_changed_file",
+                "target_path": str(repo / "old.txt"),
+                "expected_after_listing": "absent",
+                "expected_before_sha256": _repo_sha256(repo / "old.txt"),
+            },
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+        ),
+        events=(),
+        context={"repository_base_commit": base},
+    )
+    assert journal.accepted is True
+    # A user change arrives between the journal prepare and recovery.
+    (repo / "old.txt").write_text("user replacement\n", encoding="utf-8")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=_job_store(tmp_path),
+        event_store=events,
+        journal_store=journals,
+        repo_root=repo,
+    )
+
+    recovered = recover_completion_transactions(
+        service=service,
+        event_store=events,
+        journal_store=journals,
+    )
+
+    assert recovered == ()
+    assert journals.load("01J00000000000000000000JDC").status.value == "prepared"
+    assert adapter.moved_to is None
+    assert (repo / "old.txt").read_text(encoding="utf-8") == "user replacement\n"
+
+
+def test_compensation_blocks_when_promoted_target_changed(tmp_path: Path):
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=adapter,
+        job_store=_job_store(tmp_path),
+        event_store=events,
+        journal_store=TransactionJournalStore(tmp_path / "events" / "journals"),
+        artifact_root=tmp_path / "artifacts",
+    )
+    source = tmp_path / "source.md"
+    source.write_text("verified\n", encoding="utf-8")
+    target = tmp_path / "artifacts" / TASK_ID / "doc" / "result.md"
+    target.parent.mkdir(parents=True)
+    shutil.copy2(source, target)
+    effect = {
+        "type": "promote_artifact",
+        "source_path": str(source),
+        "target_path": str(target),
+        "target_existed": False,
+        "expected_after_sha256": _repo_sha256(source),
+    }
+
+    # Compensating the verified target is safe and removes it.
+    assert service._compensate_effect(effect).accepted is True
+    assert not target.exists()
+
+    # A user change to the promoted target must block compensation, not delete it.
+    source.write_text("verified\n", encoding="utf-8")
+    (target.parent / "result.md").write_text("unverified user edit\n", encoding="utf-8")
+    blocked = service._compensate_effect({
+        "type": "promote_artifact",
+        "source_path": str(source),
+        "target_path": str(target),
+        "target_existed": False,
+        "expected_after_sha256": _repo_sha256(source),
+    })
+    assert blocked.accepted is False
+    assert blocked.errors[0].code == "artifact.compensation_conflict"
+    assert (target).read_text(encoding="utf-8") == "unverified user edit\n"
+
+
 def _workflow_with_requires(requires: RequirementDefinition) -> WorkflowDefinition:
     workflow = _workflow()
     return WorkflowDefinition(
@@ -1922,7 +2224,8 @@ commands:
     assert loaded.job is not None
     deleted = [item for item in loaded.job.metadata["promoted_files"] if item.get("type") == "delete_changed_file"]
     assert deleted == [{"type": "delete_changed_file", "target_path": str(repo / "app.py"),
-                        "expected_after_listing": "absent"}]
+                        "expected_after_listing": "absent",
+                        "expected_before_sha256": hashlib.sha256(b"gone\n").hexdigest()}]
 
 
 def test_apply_delete_changed_file_is_idempotent_when_already_absent(tmp_path: Path):
