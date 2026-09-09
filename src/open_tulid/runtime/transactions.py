@@ -51,6 +51,7 @@ class FileTransactionRuntime:
         journal_id: str | None = None,
         task_id: str | None = None,
         transition_id: str | None = None,
+        context: Mapping[str, object] | None = None,
     ) -> TransactionApplyResult:
         prepared = self.journals.prepare(
             journal_id=journal_id,
@@ -59,6 +60,7 @@ class FileTransactionRuntime:
             transition_id=transition_id,
             effects=effects,
             events=events,
+            context=context,
         )
         if not prepared.accepted:
             return TransactionApplyResult(

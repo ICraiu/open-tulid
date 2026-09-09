@@ -161,6 +161,7 @@ class TransactionJournalRecord:
     transition_id: str | None = None
     completed_at: str | None = None
     error: DomainError | None = None
+    context: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

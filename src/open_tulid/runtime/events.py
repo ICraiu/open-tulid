@@ -287,6 +287,7 @@ class TransactionJournalStore:
         events: tuple[EventEnvelope, ...],
         task_id: str | None = None,
         transition_id: str | None = None,
+        context: Mapping[str, Any] | None = None,
     ) -> JournalWriteResult:
         record = TransactionJournalRecord(
             journal_id=journal_id or new_ulid(),
@@ -297,6 +298,7 @@ class TransactionJournalStore:
             effects=tuple(MappingProxyType(dict(effect)) for effect in effects),
             events=events,
             status=JournalStatus.PREPARED,
+            context=dict(context or {}),
         )
         return self.write(record)
 
@@ -372,6 +374,8 @@ def journal_to_dict(record: TransactionJournalRecord) -> dict[str, Any]:
             payload[key] = value
     if record.error is not None:
         payload["error"] = asdict(record.error)
+    if record.context:
+        payload["context"] = record.context
     return payload
 
 
@@ -401,6 +405,9 @@ def journal_from_dict(payload: Mapping[str, Any]) -> TransactionJournalRecord:
             message=_required_string(error_raw, "message"),
             location=_optional_string(error_raw.get("location")),
         )
+    context_raw = payload.get("context", {})
+    if not isinstance(context_raw, Mapping):
+        raise ValueError("journal context must be an object")
     return TransactionJournalRecord(
         journal_id=_required_string(payload, "journal_id"),
         project_id=_required_string(payload, "project_id"),
@@ -412,6 +419,7 @@ def journal_from_dict(payload: Mapping[str, Any]) -> TransactionJournalRecord:
         status=status,
         completed_at=_optional_string(payload.get("completed_at")),
         error=error,
+        context=dict(context_raw),
     )
 
 
@@ -433,6 +441,7 @@ def _replace_record(
         status=status,
         completed_at=completed_at,
         error=error,
+        context=record.context,
     )
 
 

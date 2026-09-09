@@ -29,7 +29,11 @@ from .verifier import (
     normalize_artifacts,
 )
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
-from .candidate import capture_candidate
+from .candidate import (
+    KIND_DELETE,
+    CandidateChange,
+    capture_candidate,
+)
 from .verification_runtime import (
     ContainerCommandExecutor, VerificationEnvironment, environment_identity_of,
     prepare_verification_copy,
@@ -330,6 +334,7 @@ class CompletionService:
             )
 
         output_dir = Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output")))
+        output_relative = _relative_output_path(job, output_dir)
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         promoted_artifacts = _promotion_plan(
             artifact_root=self.artifact_root,
@@ -338,10 +343,11 @@ class CompletionService:
             artifacts=submitted_artifacts,
             existing_task=self.adapter.read_task(job.task_id).task,
         )
-        promoted_files = _changed_file_plan(
+        promoted_files = _candidate_change_plan(
             repo_root=self.repo_root,
-            workspace=captured.captured.storage_path if frozen.contract is not None else Path(job.workspace_path),
-            changed_files=submission.changed_files,
+            candidate_storage=captured.captured.storage_path if frozen.contract is not None else Path(job.workspace_path),
+            changes=candidate.changes,
+            output_relative=output_relative,
         )
         commit_effect = _commit_plan(
             repo_root=self.repo_root,
@@ -483,14 +489,7 @@ class CompletionService:
             ),
         )
         effects = (
-            *(
-                {
-                    "type": "promote_changed_file",
-                    "source_path": item["source_path"],
-                    "target_path": item["target_path"],
-                }
-                for item in promoted_files
-            ),
+            *(dict(item) for item in promoted_files),
             *((commit_effect,) if commit_effect is not None else ()),
             *(
                 {
@@ -523,8 +522,14 @@ class CompletionService:
             task_id=job.task_id,
             transition_id=job.transition_id,
             expected_to_state=effective_to_state,
+            expected_previous_state=transition.from_state,
             effects=effects,
             events=events,
+            journal_id=f"{job.job_id}-{submission_id}",
+            candidate=candidate,
+            commit_effect=commit_effect,
+            artifact_destinations=tuple(str(item["target_path"]) for item in promoted_artifacts),
+            output_relative=output_relative,
         )
         if not transaction.accepted:
             self.event_store.append(build_event(
@@ -801,9 +806,44 @@ class CompletionService:
         task_id: str,
         transition_id: str,
         expected_to_state: str,
+        expected_previous_state: str | None,
         effects: tuple[Mapping[str, object], ...],
         events: tuple[object, ...],
+        journal_id: str,
+        candidate: Candidate | None = None,
+        commit_effect: Mapping[str, object] | None = None,
+        artifact_destinations: tuple[str, ...] = (),
+        output_relative: str | None = None,
     ) -> _EffectApplyResult:
+        context: dict[str, object] = {}
+        if candidate is not None:
+            context.update({
+                "candidate_id": candidate.candidate_id,
+                "candidate_sha256": candidate.sha256,
+                "candidate_manifest_sha256": candidate.manifest_sha256,
+                "candidate_storage_path": candidate.storage_path,
+            })
+        context.update({
+            "expected_previous_state": str(expected_previous_state) if expected_previous_state is not None else None,
+            "expected_to_state": expected_to_state,
+            "artifact_destinations": tuple(artifact_destinations),
+        })
+        repo_identity = repository_identity(self.repo_root)
+        if repo_identity is not None:
+            context["repository_identity"] = repo_identity
+        if self.repo_root is not None:
+            snapshot = capture_repository_snapshot(self.repo_root)
+            base_commit = None
+            if snapshot.accepted and snapshot.snapshot is not None:
+                base_commit = snapshot.snapshot.facts.base_commit
+            context["repository_base_commit"] = base_commit
+        if commit_effect is not None:
+            context["commit"] = {
+                "message": str(commit_effect.get("message", "")),
+                "paths": tuple(str(path) for path in commit_effect.get("paths", ())),
+                "expected_outcome": "committed",
+            }
+
         if self.journal_store is None:
             for effect in effects:
                 result = self._apply_effect(effect)
@@ -822,6 +862,9 @@ class CompletionService:
             validate_final_state=lambda: self._validate_final_state(
                 task_id,
                 expected_to_state,
+                repo_root=self.repo_root,
+                candidate=candidate,
+                output_relative=output_relative,
             ),
         )
         applied = runtime.apply(
@@ -830,6 +873,8 @@ class CompletionService:
             transition_id=transition_id,
             effects=effects,
             events=events,
+            journal_id=journal_id,
+            context=context,
         )
         if not applied.accepted:
             error = applied.error or _error("transaction.failed", "Completion transaction failed.")
@@ -881,6 +926,24 @@ class CompletionService:
                     written = self.adapter.write_task(updated)
                     if not written.accepted:
                         return _EffectApplyResult(False, "artifact link update failed", written.errors)
+            return _EffectApplyResult(True)
+        if effect_type == "delete_changed_file":
+            target_path = Path(str(effect.get("target_path", "")))
+            try:
+                if target_path.exists():
+                    if not target_path.is_file():
+                        return _EffectApplyResult(False, "changed file delete conflict", (_error(
+                            "changed_file.delete_conflict",
+                            f"Cannot delete changed file {target_path}: target is not a file.",
+                            str(target_path),
+                        ),))
+                    target_path.unlink()
+            except OSError as exc:
+                return _EffectApplyResult(False, f"changed file delete failed: {exc}", (_error(
+                    "changed_file.delete_failed",
+                    f"Cannot delete changed file: {exc}",
+                    str(target_path),
+                ),))
             return _EffectApplyResult(True)
         if effect_type == "promote_changed_file":
             source_path = Path(str(effect.get("source_path", "")))
@@ -954,6 +1017,10 @@ class CompletionService:
         self,
         task_id: str,
         expected_to_state: str,
+        *,
+        repo_root: Path | None = None,
+        candidate: Candidate | None = None,
+        output_relative: str | None = None,
     ) -> _EffectApplyResult:
         loaded = self.adapter.read_task(task_id)
         if not loaded.accepted or loaded.task is None:
@@ -971,6 +1038,18 @@ class CompletionService:
                 ),
                 task_id,
             ),))
+        if repo_root is not None and candidate is not None:
+            integrated_errors = _validate_integrated_source(
+                repo_root=repo_root,
+                candidate=candidate,
+                output_relative=output_relative,
+            )
+            if integrated_errors:
+                return _EffectApplyResult(
+                    False,
+                    "integrated deliverable manifest does not match the verified candidate",
+                    tuple(integrated_errors),
+                )
         return _EffectApplyResult(True)
 
 
@@ -1047,6 +1126,22 @@ def _check_integration_target(
     )
 
 
+def _relative_output_path(job, output_dir: Path) -> str | None:
+    """Artifact output path as a source-root-relative path.
+
+    The artifact output subtree is transported separately by ``promote_artifact``,
+    so source promotion and integrated validation must exclude it consistently
+    whichever root (sealed candidate or repository) they resolve against.
+    """
+    workspace = Path(job.workspace_path).resolve()
+    try:
+        resolved = output_dir.resolve()
+        relative = resolved.relative_to(workspace).as_posix()
+    except ValueError:
+        return None
+    return relative if relative != "." else None
+
+
 def _error(code: str, message: str, location: str | None = None) -> DomainError:
     return DomainError(code=code, message=message, location=location)
 
@@ -1088,22 +1183,39 @@ def _promotion_plan(
     return tuple(planned)
 
 
-def _changed_file_plan(
+def _candidate_change_plan(
     *,
     repo_root: Path | None,
-    workspace: Path,
-    changed_files: tuple[str, ...],
+    candidate_storage: Path,
+    changes: tuple[CandidateChange, ...],
+    output_relative: str | None = None,
 ) -> tuple[Mapping[str, object], ...]:
+    # Source promotion is driven by the sealed candidate's authoritative change
+    # set (plan 5D), never the worker's submitted list, so an omitted or stale
+    # list cannot cause silent partial transport. Artifacts under the submission
+    # output directory are transported separately by promote_artifact, so they
+    # are excluded here; deletions are first-class.
     if repo_root is None:
         return ()
-    workspace_root = workspace.resolve()
+    workspace_root = candidate_storage.resolve()
     repository_root = repo_root.resolve()
+    artifact_source = (
+        (workspace_root / output_relative).resolve()
+        if output_relative is not None else None
+    )
+    artifact_target = (
+        (repository_root / output_relative).resolve()
+        if output_relative is not None else None
+    )
     planned: list[Mapping[str, object]] = []
-    for ref in changed_files:
-        relative = Path(ref)
+    seen: set[str] = set()
+    for change in changes:
+        relative = Path(change.path)
         if relative.is_absolute() or ".." in relative.parts:
             continue
         if any(part == ".open-tulid" for part in relative.parts):
+            continue
+        if change.path in seen:
             continue
         source = (workspace_root / relative).resolve()
         target = (repository_root / relative).resolve()
@@ -1111,14 +1223,78 @@ def _changed_file_plan(
             continue
         if target != repository_root and repository_root not in target.parents:
             continue
-        if source.is_file():
+        if (
+            artifact_source is not None
+            and (source == artifact_source or artifact_source in source.parents)
+        ):
+            continue
+        if (
+            artifact_target is not None
+            and (target == artifact_target or artifact_target in target.parents)
+        ):
+            continue
+        seen.add(change.path)
+        if change.kind == KIND_DELETE:
+            planned.append({
+                "type": "delete_changed_file",
+                "target_path": str(target),
+                "expected_after_listing": "absent",
+            })
+        elif source.is_file():
             if target.is_file() and _same_file_content(source, target):
                 continue
             planned.append({
+                "type": "promote_changed_file",
                 "source_path": str(source),
                 "target_path": str(target),
             })
     return tuple(planned)
+
+
+def _validate_integrated_source(
+    *,
+    repo_root: Path,
+    candidate: Candidate,
+    output_relative: str | None = None,
+) -> tuple[DomainError, ...]:
+    repository_root = repo_root.resolve()
+    artifact_target = (
+        (repository_root / output_relative).resolve()
+        if output_relative is not None else None
+    )
+    errors: list[DomainError] = []
+    for change in candidate.changes:
+        relative = Path(change.path)
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        if any(part == ".open-tulid" for part in relative.parts):
+            continue
+        target = (repository_root / relative).resolve()
+        if (
+            artifact_target is not None
+            and (target == artifact_target or artifact_target in target.parents)
+        ):
+            continue
+        if change.kind == KIND_DELETE:
+            if target.exists():
+                errors.append(_error(
+                    "transaction.integrated_delete_missed",
+                    f"Deleted change {change.path!r} still exists in the integrated repository.",
+                    str(target),
+                ))
+        elif not target.is_file():
+            errors.append(_error(
+                "transaction.integrated_source_missing",
+                f"Change {change.path!r} did not reach the integrated repository.",
+                str(target),
+            ))
+        elif change.after_sha256 and _file_sha256(target) != change.after_sha256:
+            errors.append(_error(
+                "transaction.integrated_source_mismatch",
+                f"Change {change.path!r} content differs from the verified candidate.",
+                str(target),
+            ))
+    return tuple(errors)
 
 
 def _same_file_content(left: Path, right: Path) -> bool:
@@ -1126,6 +1302,15 @@ def _same_file_content(left: Path, right: Path) -> bool:
         return left.read_bytes() == right.read_bytes()
     except OSError:
         return False
+
+
+def _file_sha256(path: Path) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _commit_plan(

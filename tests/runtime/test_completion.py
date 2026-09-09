@@ -642,8 +642,8 @@ def test_completion_skips_explicit_ignored_changed_files_for_commit(tmp_path: Pa
 
     assert result.accepted is True
     assert calls == [
-        (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "check-ignore", "-q", "--", "release/evidence/README.md"), repo),
+        (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
     ]
@@ -1827,3 +1827,176 @@ commands:
         ("git", "-C", str(repo), "log", "--oneline", "-1"), capture_output=True, text=True,
     ).stdout.strip()
     assert status.endswith(" init")
+
+
+def test_completion_promotes_full_candidate_set_even_when_worker_omits_a_path(tmp_path: Path):
+    # Plan 5D: source transport is driven by the sealed candidate's authoritative
+    # change set, so a stale/incomplete submitted list cannot silently omit a
+    # needed file (no partial acceptance).
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "a.py").write_text("a\n", encoding="utf-8")
+    (workspace / "src" / "b.py").write_text("b\n", encoding="utf-8")
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            artifacts=("result.md",),
+            changed_files=("src/a.py",),
+        ),
+    )
+
+    assert result.accepted is True
+    assert (repo / "src" / "a.py").read_text(encoding="utf-8") == "a\n"
+    assert (repo / "src" / "b.py").read_text(encoding="utf-8") == "b\n"
+
+
+def test_completion_promotes_deletion_from_sealed_candidate(tmp_path: Path):
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import (
+        compile_standard_execution_contract, execution_contract_to_dict,
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "contract.yaml").write_text('''schema: tulid.contract/v1
+commands:
+  - name: backend
+    argv: [python, -c, "print('ok')"]
+''')
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "app.py").write_text("gone\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("gone\n", encoding="utf-8")
+    workflow = _workflow()
+    transition = replace(workflow.transitions["code"], requires=RequirementDefinition())
+    workflow = replace(workflow, transitions={"code": transition})
+    compiled = compile_standard_execution_contract(
+        project_root=project, repo_root=repo, task=_task(), transition=transition,
+    ).contract
+    assert compiled
+    job_id = "01J00000000000000000000JOB"
+    assert store.update_status(job_id, "running", metadata={
+        "execution_contract": execution_contract_to_dict(compiled),
+        "execution_contract_sha256": compiled.sha256,
+    }).accepted is True
+    # The worker deletes the source file; the candidate delta is a deletion.
+    (workspace / "app.py").unlink()
+
+    class PassingVerifier:
+        def verify(self, **kwargs: object) -> VerificationResult:
+            return VerificationResult(True)
+
+    service = CompletionService(
+        workflow=workflow,
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=repo,
+        candidate_root=tmp_path / "candidates",
+        verifier=PassingVerifier(),
+    )
+
+    result = service.submit(
+        job_id=job_id,
+        token="secret",
+        submission=CompletionSubmission(summary="done", changed_files=("app.py",)),
+    )
+
+    assert result.accepted is True
+    assert not (repo / "app.py").exists()
+    loaded = store.get(job_id)
+    assert loaded.job is not None
+    deleted = [item for item in loaded.job.metadata["promoted_files"] if item.get("type") == "delete_changed_file"]
+    assert deleted == [{"type": "delete_changed_file", "target_path": str(repo / "app.py"),
+                        "expected_after_listing": "absent"}]
+
+
+def test_apply_delete_changed_file_is_idempotent_when_already_absent(tmp_path: Path):
+    store = _job_store(tmp_path)
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        repo_root=tmp_path / "repo",
+    )
+    target = tmp_path / "repo" / "gone.txt"
+    result = service._apply_effect({
+        "type": "delete_changed_file",
+        "target_path": str(target),
+        "expected_after_listing": "absent",
+    })
+    assert result.accepted is True
+    assert not target.exists()
+
+
+def test_completion_acceptance_journal_records_durable_context(tmp_path: Path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    calls: list[tuple[tuple[str, ...], Path | None]] = []
+    (repo / ".git").mkdir(parents=True)
+    (workspace / "output" / "result.md").write_text("done\n", encoding="utf-8")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+
+    def runner(command: tuple[str, ...], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        calls.append((command, cwd))
+        if command[:3] == ("git", "check-ignore", "-q"):
+            return subprocess.CompletedProcess(command, 1, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    service = CompletionService(
+        workflow=_workflow(),
+        adapter=FakeAdapter(_task()),
+        job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        journal_store=journals,
+        artifact_root=tmp_path / "artifacts",
+        repo_root=repo,
+        repo_command_runner=runner,
+    )
+
+    result = service.submit(
+        job_id="01J00000000000000000000JOB",
+        token="secret",
+        submission=CompletionSubmission(
+            summary="done",
+            submission_id="component-submission",
+            artifacts=("result.md",),
+            changed_files=("src/main.ts",),
+        ),
+    )
+
+    assert result.accepted is True
+    journal_id = "01J00000000000000000000JOB-component-submission"
+    record = journals.load(journal_id)
+    assert record.status.value == "committed"
+    context = record.context
+    assert context["candidate_id"] == "component-submission"
+    assert context["candidate_manifest_sha256"]
+    assert context["expected_previous_state"] == "Todo"
+    assert context["expected_to_state"] == "CodeReview"
+    assert context["repository_identity"]
+    assert context["artifact_destinations"] == [
+        str(tmp_path / "artifacts" / TASK_ID / "result.md" / "result.md"),
+    ]
+    commit = context["commit"]
+    assert commit["message"] == f"{TASK_ID}: Implement thing"
+    assert commit["paths"] == ["src/main.ts"]
+    assert commit["expected_outcome"] == "committed"
