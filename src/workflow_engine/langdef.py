@@ -21,7 +21,7 @@ STATEMENT_KEYS: Final = {
     "operation_type": frozenset({"kind", "id", "args"}),
     "transition": frozenset({
         "kind", "id", "task_type", "from", "to", "worker", "default_for_scheduler",
-        "requires", "transaction", "instructions", "derives",
+        "requires", "transaction", "instructions", "derives", "review",
     }),
 }
 

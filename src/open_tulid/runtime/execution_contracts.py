@@ -1098,6 +1098,7 @@ def _transition_to_dict(transition: TransitionDefinition) -> dict[str, object]:
             else None
         ),
         "default_for_scheduler": transition.default_for_scheduler,
+        **({"review": transition.review} if transition.review is not None else {}),
         "instructions": list(transition.instructions),
     }
 
@@ -1177,6 +1178,7 @@ def _transition_from_dict(raw: object) -> TransitionDefinition:
         transaction=transaction,
         derives=derives,
         default_for_scheduler=bool(payload.get("default_for_scheduler", False)),
+        review=payload.get("review"),
         instructions=_string_tuple(payload.get("instructions")),
     )
 

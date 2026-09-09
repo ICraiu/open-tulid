@@ -155,6 +155,7 @@ class TransitionStatement(Statement):
     worker: str | None = None
     instructions: tuple[str, ...] = ()
     default_for_scheduler: bool = False
+    review: bool | None = None
     requires: RequirementSet = dataclasses.field(default_factory=RequirementSet)
     transaction: TransactionPlan | None = None
     derives: DerivesSpec | None = None

@@ -588,6 +588,8 @@ def test_prompt_allows_user_content_that_looks_like_an_unrelated_sha256(tmp_path
 def test_review_transition_detection_uses_tokens_not_substrings():
     assert is_review_transition(replace(_transition(), id="SelfReview")) is True
     assert is_review_transition(replace(_transition(), id="PreviewChanges")) is False
+    assert is_review_transition(replace(_transition(), id="Audit", from_state="Checking", review=True))
+    assert not is_review_transition(replace(_transition(), id="SelfReview", review=False))
 
 
 def test_self_review_prompt_is_distinct_and_uses_prior_authoritative_evidence(tmp_path):

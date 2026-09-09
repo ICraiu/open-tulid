@@ -17,6 +17,23 @@ from workflow_engine import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.mark.parametrize("value, valid", [("true", True), ("false", True), ("audit", False)])
+def test_explicit_review_semantics_are_validated(value, valid):
+    parsed = parse_yaml(f"""schema_version: 1
+statements:
+  - kind: transition
+    id: Audit
+    task_type: Widget
+    from: Inspect
+    to: Shipped
+    review: {value}
+""")
+    result = build_ast(parsed.value)
+    assert (result.document is not None) == valid
+    if valid:
+        assert result.document.statements[0].review == (value == "true")
+
+
 class TestParseYaml:
     def test_parse_valid_minimal(self):
         result = parse_yaml("schema_version: 1\nstatements:\n  - kind: state\n    id: Todo\n")

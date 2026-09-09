@@ -700,6 +700,13 @@ def _build_transition(
     diagnostics.extend(inst_diags)
 
     default_for_scheduler = raw.get("default_for_scheduler", False)
+    review = raw.get("review")
+    if review is not None and not isinstance(review, bool):
+        diagnostics.append(_diag_from_span(
+            "workflow.shape.wrong_type", "review must be a boolean",
+            key_span(raw, "review", f"{item_path}.review"),
+        ))
+        return diagnostics, None
     if not isinstance(default_for_scheduler, bool):
         default_span = key_span(raw, "default_for_scheduler", f"{item_path}.default_for_scheduler")
         diagnostics.append(_diag_from_span(
@@ -804,6 +811,7 @@ def _build_transition(
         worker=worker,
         instructions=instructions,
         default_for_scheduler=default_for_scheduler,
+        review=review,
         requires=requires,
         transaction=transaction,
         derives=derives,

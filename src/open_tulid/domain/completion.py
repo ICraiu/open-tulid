@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Literal
 
 from open_tulid.domain.schema import WorkflowDefinition
@@ -140,3 +141,23 @@ def contradictory_terminal_states(workflow: WorkflowDefinition) -> tuple[str, ..
         for state_id, state in workflow.states.items()
         if state.terminal_outcome is not None and state_id in outgoing
     )
+
+
+def is_review_transition(transition: object) -> bool:
+    """Return whether a transition requires prior implementation evidence."""
+    declared = getattr(transition, "review", None)
+    if declared is not None:
+        return declared is True
+    # Historical frozen inputs retain the pre-declaration interpretation.
+    value = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        " ",
+        f"{getattr(transition, 'id', '')} "
+        f"{getattr(transition, 'from_state', '')}",
+    )
+    tokens = tuple(
+        token
+        for token in re.split(r"[^a-z0-9]+", value.casefold())
+        if token
+    )
+    return "review" in tokens

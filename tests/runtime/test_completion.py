@@ -49,6 +49,13 @@ from open_tulid.workflow.implementations import (
 TASK_ID = "01J00000000000000000000001"
 
 
+@pytest.mark.parametrize("blockers", ["missing API", {"reason": "missing API"}, None, 42])
+def test_review_rejects_malformed_blockers(blockers):
+    from open_tulid.runtime.verifier import _validate_review_result
+    errors = _validate_review_result({"behavior": "API", "evidence": "api.py", "remaining_blockers": blockers})
+    assert any(error.code == "completion.review_result_blocker_invalid" for error in errors)
+
+
 @pytest.mark.parametrize("intervening", ["user content", None])
 @pytest.mark.parametrize("kind", ["promote_changed_file", "promote_artifact"])
 def test_recovery_preserves_intervening_writes_and_deletions(tmp_path, intervening, kind):

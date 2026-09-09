@@ -22,7 +22,7 @@ from workflow_engine.ast import (
 from workflow_engine.diagnostics import SourceSpan
 
 from .builtins import get_builtin_registries
-from open_tulid.domain.completion import TERMINAL_OUTCOMES
+from open_tulid.domain.completion import TERMINAL_OUTCOMES, is_review_transition
 from open_tulid.domain.schema import (
     ArgDefinition,
     ArtifactTypeDefinition,
@@ -532,8 +532,14 @@ def compile_workflow(
                     parent_to_if_derived=stmt.derives.parent_to_if_derived,
                 ) if stmt.derives is not None else None,
                 default_for_scheduler=stmt.default_for_scheduler,
+                review=stmt.review if stmt.review is not None else (stmt.worker is not None and is_review_transition(stmt)),
                 instructions=stmt.instructions,
             )
+            if stmt.review is None and transitions[stmt.id].review:
+                diagnostics.append(WorkflowCompileDiagnostic(
+                    code="workflow.compile.legacy_review_semantics", severity="warning",
+                    message=f"Transition {stmt.id!r} uses legacy review detection; declare review: true explicitly.",
+                ))
             transition_stmts[stmt.id] = stmt
 
     _validate_cross_references_with_ast(

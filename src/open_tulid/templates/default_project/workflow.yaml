@@ -138,6 +138,7 @@ statements:
 
   - kind: transition
     id: DraftDirection
+    review: false
     task_type: ProductIdea
     from: Idea
     to: ReadyForQuestions
@@ -148,6 +149,7 @@ statements:
 
   - kind: transition
     id: GenerateQuestions
+    review: false
     task_type: ProductIdea
     from: ReadyForQuestions
     to: Done
@@ -160,18 +162,21 @@ statements:
 
   - kind: transition
     id: SubmitAnswers
+    review: false
     task_type: QuestionRound
     from: Questions
     to: AnswersReady
 
   - kind: transition
     id: ReopenAnswers
+    review: false
     task_type: QuestionRound
     from: AnswersReady
     to: Questions
 
   - kind: transition
     id: ReviewAnswers
+    review: false
     task_type: QuestionRound
     from: AnswersReady
     to: ReadyForSpec
@@ -188,6 +193,7 @@ statements:
 
   - kind: transition
     id: WriteImplementationSpec
+    review: false
     task_type: QuestionRound
     from: ReadyForSpec
     to: ReadyForBreakdown
@@ -198,6 +204,7 @@ statements:
 
   - kind: transition
     id: BreakDownImplementationSpec
+    review: false
     task_type: QuestionRound
     from: ReadyForBreakdown
     to: Done
@@ -212,6 +219,7 @@ statements:
   # There is no per-task PrepareExecutionContract/LLM contract-authoring step.
   - kind: transition
     id: ImplementTask
+    review: false
     task_type: ImplementationTask
     from: Todo
     to: SelfReview
@@ -226,6 +234,7 @@ statements:
   # directly to implementation under the global contract, skipping regeneration.
   - kind: transition
     id: ImplementFromReadyToImplement
+    review: false
     task_type: ImplementationTask
     from: ReadyToImplement
     to: SelfReview
@@ -237,12 +246,14 @@ statements:
 
   - kind: transition
     id: InvalidateReviewedExecutionContract
+    review: false
     task_type: ImplementationTask
     from: SelfReview
     to: Todo
 
   - kind: transition
     id: SelfReview
+    review: true
     task_type: ImplementationTask
     from: SelfReview
     to: Done

@@ -992,20 +992,8 @@ def _review_evidence_text(prior: Mapping[str, object]) -> str:
 
 
 def is_review_transition(transition: object) -> bool:
-    """Return whether a transition requires prior implementation evidence."""
-    value = re.sub(
-        r"(?<=[a-z0-9])(?=[A-Z])",
-        " ",
-        f"{getattr(transition, 'id', '')} "
-        f"{getattr(transition, 'from_state', '')}",
-    )
-    tokens = tuple(
-        token
-        for token in re.split(r"[^a-z0-9]+", value.casefold())
-        if token
-    )
-    return "review" in tokens
-
+    from open_tulid.domain.completion import is_review_transition as declared_review
+    return declared_review(transition)
 
 def _truncate(text: str, limit: int) -> str:
     marker = "\n[truncated by prompt budget]"

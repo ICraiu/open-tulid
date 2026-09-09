@@ -300,6 +300,7 @@ class TransitionDefinition:
     derives: "DerivesDefinition | None" = None
     default_for_scheduler: bool = False
     instructions: tuple[str, ...] = ()
+    review: bool | None = None
 
 
 @dataclass(frozen=True)

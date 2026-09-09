@@ -1088,6 +1088,12 @@ def _validate_review_result(
             "review_result.evidence",
         ))
     blockers = review_result.get("remaining_blockers", ())
+    if not isinstance(blockers, Sequence) or isinstance(blockers, (str, bytes)):
+        errors.append(_error(
+            "completion.review_result_blocker_invalid",
+            "remaining_blockers must be a list of non-empty strings.",
+            "review_result.remaining_blockers",
+        ))
     if isinstance(blockers, Sequence) and not isinstance(blockers, (str, bytes)):
         for raw in blockers:
             if not isinstance(raw, str) or not raw.strip():

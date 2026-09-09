@@ -87,6 +87,13 @@ At scheduling time a `Todo` `ImplementationTask` is selected directly for
 
 ### Lifecycle
 
+Transitions declare `review: true` when they audit an implementation; use
+`review: false` for other responsibilities. This flag is independent of state,
+task, transition, and worker names. New default workflows declare it explicitly.
+Legacy workflows receive a migration diagnostic and freeze their previous
+name-derived behavior into an explicit value. Historical frozen packets without
+the field retain their original interpretation and content identity.
+
 ```text
 Task (Todo) → ImplementTask (worker) → SelfReview (worker) → Done
 ```
