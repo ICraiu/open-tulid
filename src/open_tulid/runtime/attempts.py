@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping
 
 from open_tulid.domain import ExecutionJob, Task
 
-SEMANTIC_TASK_REVISION_SCHEMA = "tulid.task-revision/v1"
+SEMANTIC_TASK_REVISION_SCHEMA = "tulid.task-revision/v2"
 ATTEMPT_RECORD_SCHEMA = "tulid.attempt/v1"
 
 # The semantic body sections that carry meaning for task requirements. Board
@@ -245,10 +245,9 @@ def count_consumed_attempts(
     and transition whose semantic task revision matches ``task_revision``.
 
     It deliberately ignores job creation times and the current runtime session,
-    so a daemon restart cannot renew the total account. Jobs with no attempt
-    records (legacy jobs, or a task that has since been re-authored) contribute
-    nothing: the plan reads legacy history without inventing precise attempt
-    counts.
+    so a daemon restart cannot renew the total account. Historical frozen work is re-identified without changing saved records.
+    A started legacy job with matching frozen requirements contributes at least
+    one identifiable process; an unstarted pending job contributes nothing.
     """
     total = 0
     for job in jobs:
@@ -260,13 +259,25 @@ def count_consumed_attempts(
             records = attempt_records_from_metadata(job.metadata)
         except ValueError:
             continue
-        total += sum(1 for record in records if record.task_revision == task_revision)
+        # Re-identify historical frozen inputs with the current revision
+        # algorithm without rewriting their records or renewing their budget.
+        from .execution_contracts import load_job_execution_contract, source_content_identities
+        frozen = load_job_execution_contract(job)
+        same_frozen_work = bool(frozen.accepted and frozen.contract is not None and
+            task_semantic_revision(frozen.contract.source_task,
+                source_identities=source_content_identities(frozen.contract)) == task_revision)
+        if records:
+            total += sum(1 for record in records if record.task_revision == task_revision or same_frozen_work)
+        elif same_frozen_work and str(getattr(job.status, "value", job.status)) != "pending":
+            total += max(1, job.attempts)
     return total
 
 
 def _semantic_body_sections(body: str) -> dict[str, str]:
     """Extract the semantic sections (Why/What/How/Acceptance) from a task body."""
-    sections: dict[str, str] = {}
+    from open_tulid.vault.task_schema import parse_task_body
+    parsed = parse_task_body(body)
+    sections: dict[str, str] = {"description": _clean_section(list(parsed.description_lines))}
     current: str | None = None
     buffer: list[str] = []
     for raw in body.splitlines():

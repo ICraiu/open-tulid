@@ -129,6 +129,30 @@ def test_semantic_revision_changes_when_requirements_change():
     assert task_semantic_revision(base) != task_semantic_revision(changed)
 
 
+def test_semantic_revision_includes_the_description():
+    from dataclasses import replace
+    task = _task()
+    assert task_semantic_revision(task) != task_semantic_revision(replace(task, body=task.body.replace("Do work.", "Ship the API.")))
+
+
+def test_revision_upgrade_retains_attempts_from_historical_frozen_work(tmp_path):
+    from dataclasses import replace
+    from open_tulid.runtime.execution_contracts import compile_standard_execution_contract, execution_contract_to_dict
+    (tmp_path / "contract.yaml").write_text("schema: tulid.contract/v1\ncommands:\n  - name: tests\n    argv: [python, -c, pass]\n")
+    task = _task()
+    contract = compile_standard_execution_contract(project_root=tmp_path, repo_root=None,
+        task=task, transition=_workflow().transitions["code"]).contract
+    assert contract
+    job = replace(_job(), metadata={"execution_contract": execution_contract_to_dict(contract),
+        "execution_contract_sha256": contract.sha256,
+        "attempt_records": [attempt_record_to_dict(replace(_record(), task_revision="historical-v1-digest"))]})
+    assert count_consumed_attempts(jobs=[job], task_id=TASK_ID, transition_id="code",
+                                   task_revision=task_semantic_revision(task)) == 1
+    changed = replace(task, body=task.body.replace("Do work.", "Different required behavior."))
+    assert count_consumed_attempts(jobs=[job], task_id=TASK_ID, transition_id="code",
+                                   task_revision=task_semantic_revision(changed)) == 0
+
+
 def test_semantic_revision_changes_on_dependency_change():
     a = _task()
     b = _task()
