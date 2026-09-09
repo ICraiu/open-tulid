@@ -58,7 +58,7 @@ class RecoveryPolicy:
 
 def resolve_recovery_policy(
     *,
-    max_total_attempts_per_transition: int = 0,
+    max_total_attempts_per_transition: int = 3,
     max_failed_attempts_per_transition: int = 0,
     max_repair_attempts: int = 2,
 ) -> RecoveryPolicy:
@@ -69,7 +69,7 @@ def resolve_recovery_policy(
     configuration defect, not a silent override.
     """
     return RecoveryPolicy(
-        total_attempts=max_total_attempts_per_transition,
+        total_attempts=max_total_attempts_per_transition or max(3, max_failed_attempts_per_transition, max_repair_attempts + 1),
         failed_attempts_sub=max_failed_attempts_per_transition,
         repair_sub=max_repair_attempts,
     )
@@ -104,7 +104,7 @@ class Scheduler:
         serial_repo_execution: bool = True,
         failed_job_backoff_seconds: int = RECENT_FAILURE_BACKOFF_SECONDS,
         max_failed_attempts_per_transition: int = 0,
-        max_total_attempts_per_transition: int = 0,
+        max_total_attempts_per_transition: int = 3,
         runtime_session_started_at: datetime | None = None,
         event_store: JsonlEventStore | None = None,
         journal_store: TransactionJournalStore | None = None,
@@ -120,7 +120,7 @@ class Scheduler:
         self.serial_repo_execution = serial_repo_execution
         self.failed_job_backoff_seconds = failed_job_backoff_seconds
         self.max_failed_attempts_per_transition = max_failed_attempts_per_transition
-        self.max_total_attempts_per_transition = max_total_attempts_per_transition
+        self.max_total_attempts_per_transition = max_total_attempts_per_transition or max(3, max_failed_attempts_per_transition)
         self.runtime_session_started_at = (
             runtime_session_started_at.astimezone(timezone.utc)
             if runtime_session_started_at is not None

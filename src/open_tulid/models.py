@@ -28,8 +28,8 @@ class RuntimeConfig:
     # Counts every admitted worker process (fresh and repair) across jobs and
     # survives a daemon restart because it is derived from persisted attempt
     # records. The existing failed/repair sublimits remain valid sublimits that
-    # must never exceed this total. 0 disables the total account (unbounded).
-    max_total_attempts_per_transition: int = 0
+    # must never exceed this total. Legacy zero derives a finite bound.
+    max_total_attempts_per_transition: int = 3
     worker_images: dict[str, str] = field(default_factory=dict)
     worker_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
     worker_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -41,6 +41,14 @@ class RuntimeConfig:
     completion_container_host: str = "host.docker.internal"
     container_volume_relabel: bool = False
     worker_liveness_check_interval_seconds: float = 60.0
+
+
+    def __post_init__(self):
+        if self.max_total_attempts_per_transition < 0:
+            raise ValueError("total attempt limit must be positive")
+        if self.max_total_attempts_per_transition == 0:
+            object.__setattr__(self, "max_total_attempts_per_transition",
+                               max(3, self.max_failed_attempts_per_transition, self.max_repair_attempts + 1))
 
 
 @dataclass(frozen=True)

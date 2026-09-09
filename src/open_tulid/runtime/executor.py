@@ -787,7 +787,7 @@ class JobExecutor:
         self.job_store.record_attempt(job_id, attempt_record_to_dict(updated))
 
     def total_attempt_limit(self) -> int:
-        return int(getattr(self.runtime, "max_total_attempts_per_transition", 0))
+        return int(getattr(self.runtime, "max_total_attempts_per_transition", 3)) or 3
 
     def _task_revision(self, task, *, source_identities=(), contract=None) -> str:
         if contract is not None:

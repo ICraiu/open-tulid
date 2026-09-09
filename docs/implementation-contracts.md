@@ -106,6 +106,13 @@ the project's command-only global contract.
 
 ## Troubleshooting
 
+Managed execution has a finite total attempt budget: three processes by default,
+including the initial process and repairs. Legacy `max_total_attempts_per_transition: 0`
+is translated to `max(3, max_failed_attempts_per_transition, max_repair_attempts + 1)`;
+it no longer disables the bound. Set a positive total explicitly to change it.
+The runtime reports the resolved policy, and persisted attempts remain charged
+across restarts. Existing frozen job inputs and historical evidence are preserved.
+
 - `contract.missing`: implementation transitions require `contract.yaml`.
 - `contract.command_argv_empty` / `contract.command_argv_invalid`: fix the command
   definition in `contract.yaml`.

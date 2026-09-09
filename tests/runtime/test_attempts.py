@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+
+def test_default_and_legacy_retry_configuration_are_finite():
+    from open_tulid.models import RuntimeConfig
+    from open_tulid.runtime.scheduler import resolve_recovery_policy
+    assert RuntimeConfig().max_total_attempts_per_transition == 3
+    assert RuntimeConfig(max_total_attempts_per_transition=0).max_total_attempts_per_transition == 3
+    assert RuntimeConfig(max_total_attempts_per_transition=0, max_repair_attempts=4).max_total_attempts_per_transition == 5
+    assert resolve_recovery_policy(max_total_attempts_per_transition=0).total_attempts == 3
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType

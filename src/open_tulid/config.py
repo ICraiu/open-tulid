@@ -219,6 +219,8 @@ def _load_runtime_config(data: dict, config_dir: Path) -> RuntimeConfig:
         _fail("runtime.max_total_attempts_per_transition must be an integer")
     if max_total_attempts_per_transition < 0:
         _fail("runtime.max_total_attempts_per_transition must be zero or positive")
+    if max_total_attempts_per_transition == 0:
+        max_total_attempts_per_transition = max(3, max_failed_attempts_per_transition, max_repair_attempts + 1)
     if (
         max_total_attempts_per_transition > 0
         and max_failed_attempts_per_transition > 0
