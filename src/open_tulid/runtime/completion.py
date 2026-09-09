@@ -33,8 +33,10 @@ from .verifier import (
 from .repairs import DEFAULT_MAX_REPAIR_ATTEMPTS, plan_repair
 from .candidate import (
     KIND_DELETE,
+    Candidate,
     CandidateChange,
     capture_candidate,
+    capture_deliverable_manifest,
 )
 from .verification_runtime import (
     ContainerCommandExecutor, VerificationEnvironment, environment_identity_of,
@@ -504,6 +506,7 @@ class CompletionService:
             *((commit_effect,) if commit_effect is not None else ()),
             *(
                 {
+                    **dict(item),
                     "type": "promote_artifact",
                     "task_id": job.task_id,
                     "source_path": item["source_path"],
@@ -541,6 +544,22 @@ class CompletionService:
             commit_effect=commit_effect,
             artifact_destinations=tuple(str(item["target_path"]) for item in promoted_artifacts),
             output_relative=output_relative,
+            acceptance_context={
+                "job_id": job.job_id,
+                "submission_id": submission_id,
+                "output_relative": output_relative,
+                "acceptance_metadata": {
+                    "completed_submission_id": submission_id,
+                    "promoted_artifacts": tuple(promoted_artifacts),
+                    "promoted_files": tuple(promoted_files),
+                    "acceptance_transaction_id": f"{job.job_id}-{submission_id}",
+                    "acceptance_repository_identity": repository_identity(self.repo_root),
+                    **({"review_result": dict(submission.review_result)} if submission.review_result is not None else {}),
+                    "completion_submissions": _record_submission(
+                        job.metadata, submission_id, accepted=True, feedback=(),
+                    ),
+                },
+            },
         )
         if not transaction.accepted:
             self.event_store.append(build_event(
@@ -841,10 +860,12 @@ class CompletionService:
         commit_effect: Mapping[str, object] | None = None,
         artifact_destinations: tuple[str, ...] = (),
         output_relative: str | None = None,
+        acceptance_context: Mapping[str, object] | None = None,
     ) -> _EffectApplyResult:
-        context: dict[str, object] = {}
+        context: dict[str, object] = dict(acceptance_context or {})
         if candidate is not None:
             context.update({
+                "candidate": candidate.to_dict(),
                 "candidate_id": candidate.candidate_id,
                 "candidate_sha256": candidate.sha256,
                 "candidate_manifest_sha256": candidate.manifest_sha256,
@@ -1221,6 +1242,9 @@ def _promotion_plan(
             "target_existed": target.exists(),
             "previous_links": tuple(existing_task.artifact_links) if existing_task is not None else (),
             "expected_after_sha256": expected_after_sha256,
+            "expected_before_sha256": _file_sha256(target) if target.is_file() else None,
+            "expected_before_mode": target.stat().st_mode & 0o777 if target.is_file() else None,
+            "expected_after_mode": source.stat().st_mode & 0o777,
         })
     return tuple(planned)
 
@@ -1311,6 +1335,22 @@ def _validate_integrated_source(
         if output_relative is not None else None
     )
     errors: list[DomainError] = []
+    # Validate the complete source, including unchanged files. Verifying only
+    # the delta could bless an unrelated edit made during acceptance/recovery.
+    try:
+        def surface(root):
+            return {
+                entry.path: (entry.sha256, entry.mode)
+                for entry in capture_deliverable_manifest(root).entries
+                if output_relative is None or not (
+                    entry.path == output_relative or entry.path.startswith(output_relative + "/")
+                )
+            }
+        if surface(Path(candidate.storage_path)) != surface(repository_root):
+            errors.append(_error("transaction.integrated_manifest_mismatch",
+                "Integrated source differs from the complete verified candidate.", str(repository_root)))
+    except OSError as exc:
+        errors.append(_error("transaction.integrated_manifest_unreadable", str(exc), str(repository_root)))
     for change in candidate.changes:
         relative = Path(change.path)
         if relative.is_absolute() or ".." in relative.parts:
@@ -1795,15 +1835,30 @@ def recover_completion_transactions(
     """
     recovered: list[str] = []
     existing_event_ids = {event.event_id for event in event_store.iter_events()}
-    for record in journal_store.list_incomplete():
+    for record in journal_store.iter_journals():
         effect_types = {effect.get("type") for effect in record.effects}
         if not effect_types or not effect_types.issubset(_RECOVERABLE_EFFECT_TYPES):
             continue
         if record.task_id is None or record.transition_id is None:
             continue
+        if str(getattr(record.status, "value", record.status)) == "committed":
+            if _settle_recovered_acceptance(service, record):
+                recovered.append(record.journal_id)
+            continue
         expected_to_state = _expected_to_state(record)
         if not expected_to_state:
             continue
+        candidate = None
+        raw_candidate = record.context.get("candidate")
+        if isinstance(raw_candidate, Mapping):
+            try:
+                payload = dict(raw_candidate)
+                payload["changes"] = tuple(CandidateChange(**dict(change)) for change in payload["changes"])
+                candidate = Candidate(**payload)
+                if capture_deliverable_manifest(Path(candidate.storage_path)).sha256 != candidate.manifest_sha256:
+                    continue
+            except (OSError, TypeError, ValueError, KeyError):
+                continue
         # An intervening user change anywhere in the intended change set must
         # stop recovery with the journal left prepared, never overwritten.
         if _recovery_has_conflict(service, record):
@@ -1818,7 +1873,10 @@ def recover_completion_transactions(
                 break
         if not applying_ok:
             continue
-        final = service._validate_final_state(record.task_id, expected_to_state)
+        final = service._validate_final_state(
+            record.task_id, expected_to_state, repo_root=service.repo_root,
+            candidate=candidate, output_relative=record.context.get("output_relative"),
+        )
         if not final.accepted:
             continue
         missing_events = tuple(event for event in record.events if event.event_id not in existing_event_ids)
@@ -1829,8 +1887,32 @@ def recover_completion_transactions(
             existing_event_ids.update(event.event_id for event in missing_events)
         committed = journal_store.commit(record)
         if committed.accepted:
+            _settle_recovered_acceptance(service, committed.record or record)
             recovered.append(record.journal_id)
     return tuple(recovered)
+
+
+def _settle_recovered_acceptance(service: CompletionService, record) -> bool:
+    """Close the journal-commit/job-update crash window using saved evidence."""
+    job_id = record.context.get("job_id")
+    metadata = record.context.get("acceptance_metadata")
+    if not isinstance(job_id, str) or not isinstance(metadata, Mapping):
+        return False  # Historical journals do not invent missing acceptance.
+    loaded = service.job_store.get(job_id)
+    if not loaded.accepted or loaded.job is None:
+        return False
+    if _status(loaded.job.status) == ExecutionJobStatus.ACCEPTED.value:
+        return False
+    if loaded.job.task_id != record.task_id or loaded.job.transition_id != record.transition_id:
+        return False
+    restored = dict(metadata)
+    if record.context.get("commit"):
+        restored["acceptance_repository_commit"] = _accepted_commit_sha(
+            repo_root=service.repo_root, runner=service.repo_command_runner,
+        )
+    return service.job_store.update_status(
+        job_id, ExecutionJobStatus.ACCEPTED, metadata=restored,
+    ).accepted
 
 
 def _expected_to_state(record) -> str:
@@ -1890,6 +1972,33 @@ def _recovery_has_conflict(service: CompletionService, record) -> bool:
     resolution.
     """
     for effect in record.effects:
+        if effect.get("type") in {"promote_changed_file", "promote_artifact"}:
+            source = Path(str(effect.get("source_path", "")))
+            target = Path(str(effect.get("target_path", "")))
+            expected_after = effect.get("expected_after_sha256")
+            if not source.is_file():
+                return True
+            if isinstance(expected_after, str) and _file_sha256(source) != expected_after:
+                return True
+            if target.is_file() and _same_file_content(source, target):
+                continue
+            expected_before = effect.get("expected_before_sha256")
+            if target.exists():
+                if not target.is_file() or not isinstance(expected_before, str):
+                    return True
+                if _file_sha256(target) != expected_before:
+                    return True
+                before_mode = effect.get("expected_before_mode")
+                if before_mode is not None and target.stat().st_mode & 0o777 != before_mode:
+                    return True
+            elif expected_before is not None or effect.get("target_existed"):
+                return True
+        if effect.get("type") == "move_task":
+            loaded = service.adapter.read_task(str(effect.get("task_id", "")))
+            previous = record.context.get("expected_previous_state")
+            if previous is not None and (not loaded.accepted or loaded.task is None or
+                    loaded.task.current_state not in {previous, effect.get("to_state")}):
+                return True
         if effect.get("type") == "delete_changed_file":
             target = Path(str(effect.get("target_path", "")))
             expected_before = effect.get("expected_before_sha256")

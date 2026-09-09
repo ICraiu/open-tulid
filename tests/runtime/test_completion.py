@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import pytest
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -46,6 +47,59 @@ from open_tulid.workflow.implementations import (
 
 
 TASK_ID = "01J00000000000000000000001"
+
+
+@pytest.mark.parametrize("intervening", ["user content", None])
+@pytest.mark.parametrize("kind", ["promote_changed_file", "promote_artifact"])
+def test_recovery_preserves_intervening_writes_and_deletions(tmp_path, intervening, kind):
+    store = _job_store(tmp_path)
+    source = tmp_path / "candidate.py"
+    source.write_text("candidate")
+    target = tmp_path / "target.py"
+    if intervening is not None:
+        target.write_text(intervening)
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "journals")
+    journals.prepare(journal_id="crashed", project_id="Agent", task_id=TASK_ID,
+        transition_id="code", effects=({"type": kind,
+            "source_path": str(source), "target_path": str(target),
+            "expected_before_sha256": hashlib.sha256(b"before").hexdigest(),
+            "expected_after_sha256": hashlib.sha256(b"candidate").hexdigest()},
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"}), events=())
+    service = CompletionService(workflow=_workflow(), adapter=adapter, job_store=store,
+                                event_store=events, journal_store=journals)
+    assert not recover_completion_transactions(service=service, event_store=events, journal_store=journals)
+    assert (target.read_text() if target.exists() else None) == intervening
+    assert adapter.moved_to is None
+    assert journals.load("crashed").status.value == "prepared"
+
+
+@pytest.mark.parametrize("already_committed", [False, True])
+def test_recovery_restores_job_acceptance_across_commit_crash(tmp_path, already_committed):
+    store = _job_store(tmp_path)
+    job_id = "01J00000000000000000000JOB"
+    store.update_status(job_id, ExecutionJobStatus.COMPLETION_SUBMITTED)
+    adapter = FakeAdapter(_task())
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "journals")
+    prepared = journals.prepare(journal_id="accepted", project_id="Agent", task_id=TASK_ID,
+        transition_id="code", effects=({"type": "move_task", "task_id": TASK_ID,
+            "to_state": "CodeReview"},), events=(), context={
+            "job_id": job_id, "expected_previous_state": "Todo",
+            "acceptance_metadata": {"acceptance_transaction_id": "accepted",
+                "completed_submission_id": "submission", "review_result": {"evidence": "retained"}}})
+    if already_committed:
+        adapter.move_task(TASK_ID, "CodeReview")
+        journals.commit(prepared.record)
+    service = CompletionService(workflow=_workflow(), adapter=adapter, job_store=store,
+                                event_store=events, journal_store=journals)
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ("accepted",)
+    job = store.get(job_id).job
+    assert str(getattr(job.status, "value", job.status)) == "accepted"
+    assert job.metadata["acceptance_transaction_id"] == "accepted"
+    assert job.metadata["review_result"]["evidence"] == "retained"
+    assert not recover_completion_transactions(service=service, event_store=events, journal_store=journals)
 
 
 @dataclass
@@ -1654,6 +1708,7 @@ def test_recover_completion_transactions_creates_missing_commit(tmp_path: Path):
                 "source_path": str(workspace / "src" / "main.ts"),
                 "target_path": str(repo / "src" / "main.ts"),
                 "expected_after_sha256": _repo_sha256(workspace / "src" / "main.ts"),
+                "expected_before_sha256": _repo_sha256(repo / "src" / "main.ts"),
             },
             {
                 "type": "delete_changed_file",
