@@ -358,6 +358,8 @@ class CompletionService:
 
         output_dir = captured.captured.storage_path / output_relative
         submitted_artifacts = normalize_artifacts(submission.artifacts)
+        artifact_paths = tuple((Path(output_relative) / artifact.path).as_posix()
+                               for artifact in submitted_artifacts)
         promoted_artifacts = _promotion_plan(
             artifact_root=self.artifact_root,
             output_dir=output_dir,
@@ -370,6 +372,7 @@ class CompletionService:
             candidate_storage=captured.captured.storage_path,
             changes=candidate.changes,
             output_relative=output_relative,
+            artifact_paths=artifact_paths,
         )
         commit_effect = _commit_plan(
             repo_root=self.repo_root,
@@ -553,6 +556,7 @@ class CompletionService:
             commit_effect=commit_effect,
             artifact_destinations=tuple(str(item["target_path"]) for item in promoted_artifacts),
             output_relative=output_relative,
+            artifact_paths=artifact_paths,
             acceptance_context={
                 "job_id": job.job_id,
                 "task_revision": _acceptance_task_revision(job, frozen.contract, self.adapter),
@@ -560,6 +564,7 @@ class CompletionService:
                 "verification_report": verification.report.to_dict() if verification.report else None,
                 "submission_id": submission_id,
                 "output_relative": output_relative,
+                "artifact_paths": artifact_paths,
                 "acceptance_metadata": {
                     "completed_submission_id": submission_id,
                     "promoted_artifacts": tuple(promoted_artifacts),
@@ -872,6 +877,7 @@ class CompletionService:
         commit_effect: Mapping[str, object] | None = None,
         artifact_destinations: tuple[str, ...] = (),
         output_relative: str | None = None,
+        artifact_paths: tuple[str, ...] | None = None,
         acceptance_context: Mapping[str, object] | None = None,
     ) -> _EffectApplyResult:
         context: dict[str, object] = dict(acceptance_context or {})
@@ -925,6 +931,7 @@ class CompletionService:
                 repo_root=self.repo_root,
                 candidate=candidate,
                 output_relative=output_relative,
+                artifact_paths=artifact_paths,
             ),
         )
         applied = runtime.apply(
@@ -1091,6 +1098,7 @@ class CompletionService:
         repo_root: Path | None = None,
         candidate: Candidate | None = None,
         output_relative: str | None = None,
+        artifact_paths: tuple[str, ...] | None = None,
     ) -> _EffectApplyResult:
         loaded = self.adapter.read_task(task_id)
         if not loaded.accepted or loaded.task is None:
@@ -1113,6 +1121,7 @@ class CompletionService:
                 repo_root=repo_root,
                 candidate=candidate,
                 output_relative=output_relative,
+                artifact_paths=artifact_paths,
             )
             if integrated_errors:
                 return _EffectApplyResult(
@@ -1277,12 +1286,13 @@ def _candidate_change_plan(
     candidate_storage: Path,
     changes: tuple[CandidateChange, ...],
     output_relative: str | None = None,
+    artifact_paths: tuple[str, ...] | None = None,
 ) -> tuple[Mapping[str, object], ...]:
     # Source promotion is driven by the sealed candidate's authoritative change
     # set (plan 5D), never the worker's submitted list, so an omitted or stale
-    # list cannot cause silent partial transport. Artifacts under the submission
-    # output directory are transported separately by promote_artifact, so they
-    # are excluded here; deletions are first-class.
+    # list cannot cause silent partial transport. Only explicitly submitted
+    # artifact paths are transported separately by promote_artifact. Historical
+    # journals without an exact list retain their original subtree rule.
     if repo_root is None:
         return ()
     workspace_root = candidate_storage.resolve()
@@ -1298,6 +1308,8 @@ def _candidate_change_plan(
     planned: list[Mapping[str, object]] = []
     seen: set[str] = set()
     for change in changes:
+        if artifact_paths is not None and change.path in artifact_paths:
+            continue
         relative = Path(change.path)
         if relative.is_absolute() or ".." in relative.parts:
             continue
@@ -1312,12 +1324,12 @@ def _candidate_change_plan(
         if target != repository_root and repository_root not in target.parents:
             continue
         if (
-            artifact_source is not None
+            artifact_paths is None and artifact_source is not None
             and (source == artifact_source or artifact_source in source.parents)
         ):
             continue
         if (
-            artifact_target is not None
+            artifact_paths is None and artifact_target is not None
             and (target == artifact_target or artifact_target in target.parents)
         ):
             continue
@@ -1350,6 +1362,7 @@ def _validate_integrated_source(
     repo_root: Path,
     candidate: Candidate,
     output_relative: str | None = None,
+    artifact_paths: tuple[str, ...] | None = None,
 ) -> tuple[DomainError, ...]:
     repository_root = repo_root.resolve()
     artifact_target = (
@@ -1364,9 +1377,10 @@ def _validate_integrated_source(
             return {
                 entry.path: (entry.sha256, entry.mode)
                 for entry in capture_deliverable_manifest(root).entries
-                if output_relative is None or not (
-                    entry.path == output_relative or entry.path.startswith(output_relative + "/")
-                )
+                if (entry.path not in artifact_paths if artifact_paths is not None else
+                    output_relative is None or not (
+                        entry.path == output_relative or entry.path.startswith(output_relative + "/")
+                    ))
             }
         if surface(Path(candidate.storage_path)) != surface(repository_root):
             errors.append(_error("transaction.integrated_manifest_mismatch",
@@ -1374,6 +1388,8 @@ def _validate_integrated_source(
     except OSError as exc:
         errors.append(_error("transaction.integrated_manifest_unreadable", str(exc), str(repository_root)))
     for change in candidate.changes:
+        if artifact_paths is not None and change.path in artifact_paths:
+            continue
         relative = Path(change.path)
         if relative.is_absolute() or ".." in relative.parts:
             continue
@@ -1381,7 +1397,7 @@ def _validate_integrated_source(
             continue
         target = (repository_root / relative).resolve()
         if (
-            artifact_target is not None
+            artifact_paths is None and artifact_target is not None
             and (target == artifact_target or artifact_target in target.parents)
         ):
             continue
@@ -1896,6 +1912,7 @@ def recover_completion_transactions(
         final = service._validate_final_state(
             record.task_id, expected_to_state, repo_root=service.repo_root,
             candidate=candidate, output_relative=record.context.get("output_relative"),
+            artifact_paths=record.context.get("artifact_paths"),
         )
         if not final.accepted:
             continue

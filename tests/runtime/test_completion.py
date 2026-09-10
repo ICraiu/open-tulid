@@ -347,6 +347,28 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     ]
 
 
+def test_delivery_preserves_application_source_beside_submitted_output_artifacts(tmp_path):
+    store = _job_store(tmp_path)
+    workspace = tmp_path / "workspace"
+    repo = tmp_path / "repo"
+    (repo / "output").mkdir(parents=True)
+    (repo / "output" / "config.json").write_text('{"version": 1}')
+    (workspace / "output" / "config.json").write_text('{"version": 2}')
+    (workspace / "output" / "result.md").write_text("task evidence")
+    service = CompletionService(
+        workflow=_workflow(), adapter=FakeAdapter(_task()), job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"), repo_root=repo,
+        artifact_root=tmp_path / "artifacts",
+    )
+    result = service.submit(job_id="01J00000000000000000000JOB", token="secret",
+        submission=CompletionSubmission(summary="done", artifacts=("result.md",),
+                                        changed_files=("output/config.json",)))
+    assert result.accepted, result.errors
+    assert (repo / "output" / "config.json").read_text() == '{"version": 2}'
+    assert not (repo / "output" / "result.md").exists()
+    assert (tmp_path / "artifacts" / TASK_ID / "result.md" / "result.md").read_text() == "task evidence"
+
+
 def test_artifact_delivery_uses_sealed_bytes_when_worker_mutates_live_output(tmp_path):
     from open_tulid.runtime.verifier import DeterministicVerifier
     store = _job_store(tmp_path)
