@@ -250,8 +250,13 @@ def _repository_files(root: Path) -> Iterator[Path]:
             if name not in EXCLUDED_DIRECTORY_NAMES
         )
         current_path = Path(current)
+        for directory in directory_names:
+            if (current_path / directory).is_symlink():
+                raise OSError(f"Source symlink requires explicit snapshot support: {current_path / directory}")
         for file_name in sorted(file_names):
             path = current_path / file_name
+            if path.is_symlink():
+                raise OSError(f"Source symlink requires explicit snapshot support: {path}")
             if path.is_file():
                 yield path
 

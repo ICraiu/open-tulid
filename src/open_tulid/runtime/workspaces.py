@@ -18,6 +18,7 @@ from open_tulid.runtime.repository_facts import (
     baseline_manifest_to_dict,
     capture_repository_snapshot,
     repository_facts_to_dict,
+    _repository_files,
 )
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
 from .planning_inputs import load_planning_inputs
@@ -144,6 +145,8 @@ def cleanup_job_workspaces(jobs: tuple[ExecutionJob, ...]) -> WorkspaceCleanupRe
 
 
 def _copy_repo(source: Path, target: Path) -> None:
+    # Reject unsupported links before copytree can dereference external bytes.
+    tuple(_repository_files(source))
     for child in source.iterdir():
         if child.name in EXCLUDED_DIRECTORY_NAMES:
             continue

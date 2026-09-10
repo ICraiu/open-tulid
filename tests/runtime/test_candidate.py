@@ -53,6 +53,31 @@ def test_baseline_workspace_and_candidate_preserve_same_source_surface(tmp_path,
     ]
 
 
+@pytest.mark.parametrize("directory", [False, True])
+def test_snapshot_rejects_symlinks_instead_of_sealing_mutable_external_bytes(tmp_path, directory):
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    from open_tulid.runtime.workspaces import _copy_repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    external = tmp_path / "external"
+    if directory:
+        external.mkdir()
+        (external / "source.txt").write_text("outside source")
+    else:
+        external.write_text("outside source")
+    (repo / "linked").symlink_to(external, target_is_directory=directory)
+    baseline = capture_repository_snapshot(repo)
+    assert not baseline.accepted
+    assert "symlink" in baseline.errors[0].message
+    candidate = capture_candidate(workspace=repo, storage_root=tmp_path / "seals",
+                                   candidate_id="linked", baseline=None)
+    assert not candidate.accepted
+    assert not (tmp_path / "seals").exists()
+    with pytest.raises(OSError, match="symlink"):
+        _copy_repo(repo, tmp_path / "workspace")
+    assert not (tmp_path / "workspace").exists()
+
+
 def test_candidate_never_replaces_existing_evidence(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

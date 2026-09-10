@@ -33,6 +33,7 @@ from open_tulid.runtime.repository_facts import (
     BaselineManifest,
     canonical_sha256,
     EXCLUDED_DIRECTORY_NAMES,
+    _repository_files,
 )
 
 
@@ -267,16 +268,7 @@ def capture_deliverable_manifest(root: Path) -> BaselineManifest:
 
 def iter_deliverable_files(root: Path):
     """Walk source deterministically, excluding only declared ephemeral directories."""
-    import os
-    for current, directory_names, file_names in os.walk(root):
-        directory_names[:] = sorted(
-            name for name in directory_names if name not in CANDIDATE_EXCLUDED_DIRECTORY_NAMES
-        )
-        current_path = Path(current)
-        for file_name in sorted(file_names):
-            path = current_path / file_name
-            if path.is_file() or path.is_symlink():
-                yield path
+    yield from _repository_files(root)
 
 
 def _copy_deliverables(source: Path, target: Path) -> None:
