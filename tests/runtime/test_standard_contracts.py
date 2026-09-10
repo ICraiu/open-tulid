@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from open_tulid.runtime.verification_runtime import HostCommandExecutor
 
 import hashlib
@@ -566,6 +568,30 @@ def test_global_contract_freezes_linked_specification_into_context(tmp_path):
     compiled_prompt = compile_execution_prompt(compiled.contract)
     assert "HealthStatus" in compiled_prompt.text
     assert "docs/specification.md" in compiled_prompt.text
+
+
+def test_inline_budget_exhaustion_preserves_all_required_source_files(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    _contract(project_root)
+    refs = tuple(f"spec-{index}.md" for index in range(5))
+    contents = {}
+    for index, ref in enumerate(refs):
+        contents[ref] = f"# Specification {index}\n" + ("Binding requirement. " * 200) + f"TAIL-{index}"
+        (project_root / ref).write_text(contents[ref])
+    task = replace(_implementation_task(), artifact_links=refs)
+    compiled = compile_standard_execution_contract(
+        project_root=project_root, repo_root=_repo(tmp_path), task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted, compiled.errors
+    files = compiled.contract.context_files
+    assert len(files) == len(refs)
+    assert all(file.required for file in files)
+    assert {file.content for file in files} == set(contents.values())
+    prompt = compile_execution_prompt(compiled.contract)
+    for file in files:
+        assert file.workspace_path in prompt.text
 
 
 def test_global_contract_freezes_canonical_answer_history_from_parent_lineage(tmp_path):

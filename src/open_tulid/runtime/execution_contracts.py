@@ -665,7 +665,8 @@ def _freeze_linked_context(
                 workspace_path=workspace_path,
             )
             if not text:
-                break
+                # Exhausting inline space must not stop freezing later files.
+                continue
         excerpt_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if excerpt_hash in seen_excerpt_hashes:
             continue
