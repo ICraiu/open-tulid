@@ -162,9 +162,20 @@ def snapshot_working_tree(source: Path, dest: Path) -> str:
 
 
 def copy_tracker(source_vault: Path, dest: Path) -> None:
-    """Copy the whole tracker vault (projects + artifacts) into dest."""
+    """Copy tracker inputs while quarantining live recovery effects.
+
+    Historical events are retained beside the tracker, never in the runtime's
+    active journal directory: their absolute effect paths still name live data.
+    """
+    history = dest.parent / f"{dest.name}-history"
+    if history.exists():
+        raise FileExistsError(f"Preserving existing tracker history: {history}")
     shutil.copytree(source_vault, dest, dirs_exist_ok=False,
                     ignore=shutil.ignore_patterns(".git", "__pycache__", "*.lock"))
+    if (dest / "events").exists():
+        history.mkdir()
+        shutil.move(str(dest / "events"), str(history / "events"))
+        (dest / "events").mkdir()
 
 
 # --------------------------------------------------------------------------- ledger

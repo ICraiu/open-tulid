@@ -109,6 +109,19 @@ def test_isolation_produces_working_checkout_without_live_remote(tmp_path, monke
     assert (source / "app.py").read_text() == "dirty source"
 
 
+def test_tracker_copy_quarantines_historical_recovery_effects(tmp_path):
+    source = tmp_path / "live-tracker"
+    journals = source / "events" / "journals"
+    journals.mkdir(parents=True)
+    raw = '{"effects": [{"target_path": "/live/project/app.py"}]}'
+    (journals / "prepared.json").write_text(raw)
+    dest = tmp_path / "proof" / "tracker"
+    pw.copy_tracker(source, dest)
+    assert not list((dest / "events").iterdir())
+    assert (dest.parent / "tracker-history/events/journals/prepared.json").read_text() == raw
+    assert (journals / "prepared.json").read_text() == raw
+
+
 def test_config_override_keeps_runtime_state_in_isolated_directory(tmp_path, monkeypatch):
     from open_tulid.config import load_config
     vault = tmp_path / "vault"
