@@ -851,6 +851,7 @@ def _dependency_error(
                     job_store, project_id, dependency_id, task=dependency,
                     workflow=workflow, journals=journal_store,
                     source_identities_for=source_identities_for,
+                    repo_root=repo_root,
                 )
                 if not accepted:
                     return _error(
@@ -881,7 +882,7 @@ def _dependency_accepted_repo_identity(
     job_store: FileExecutionJobStore,
     project_id: str,
     task_id: str,
-    *, task, workflow, journals, source_identities_for=None,
+    *, task, workflow, journals, source_identities_for=None, repo_root=None,
 ) -> tuple[str | None, bool]:
     """Recorded accepted repository identity for a dependency.
 
@@ -904,6 +905,7 @@ def _dependency_accepted_repo_identity(
     from .acceptance import accepted_task_evidence
     accepted_jobs = tuple(job for job in accepted_jobs if accepted_task_evidence(
         job, task=task, workflow=workflow, journals=journals,
+        repo_root=repo_root,
         source_identities=(source_identities_for(task, workflow.transitions[job.transition_id])
             if source_identities_for is not None and job.transition_id in workflow.transitions else ()),
     ))

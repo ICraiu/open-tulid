@@ -658,7 +658,7 @@ def test_completion_skips_commit_when_changed_files_match_repo_root(tmp_path: Pa
     )
 
     assert result.accepted is True
-    assert calls == []
+    assert calls == [(("git", "rev-parse", "--short", "HEAD"), repo)]
     loaded = store.get("01J00000000000000000000JOB")
     assert loaded.job is not None
     assert loaded.job.metadata["promoted_files"] == []

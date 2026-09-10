@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import Mapping
+import re
+import subprocess
 
 from open_tulid.domain.completion import SuccessfulCompletionCriteria, is_review_transition
 from .attempts import task_semantic_revision
@@ -9,7 +11,7 @@ from .task_contracts import task_uses_global_contract
 from .verifier import _validate_review_result
 
 
-def accepted_task_evidence(job, *, task, workflow, journals, source_identities=(), target_state=None) -> bool:
+def accepted_task_evidence(job, *, task, workflow, journals, source_identities=(), target_state=None, repo_root=None) -> bool:
     if str(getattr(job.status, "value", job.status)) != "accepted":
         return False
     transition = workflow.transitions.get(job.transition_id)
@@ -29,6 +31,19 @@ def accepted_task_evidence(job, *, task, workflow, journals, source_identities=(
     if context.get("task_revision") != revision or context.get("job_id") != job.job_id:
         return False
     code_task = task_uses_global_contract(task, workflow)
+    if code_task and context.get("repository_base_commit"):
+        commit = job.metadata.get("acceptance_repository_commit")
+        if repo_root is None or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+            return False
+        try:
+            ancestry = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+                cwd=repo_root, capture_output=True, timeout=10,
+            )
+            if ancestry.returncode != 0:
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     report = context.get("verification_report")
     verified = context.get("verification_accepted") is True
     if code_task:

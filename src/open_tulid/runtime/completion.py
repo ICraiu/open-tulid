@@ -609,7 +609,7 @@ class CompletionService:
                         repo_root=self.repo_root,
                         runner=self.repo_command_runner,
                     )}
-                    if commit_effect is not None else {}
+                    if self.repo_root is not None else {}
                 ),
                 **({"review_result": dict(submission.review_result)} if submission.review_result is not None else {}),
                 "completion_submissions": _record_submission(
@@ -1411,10 +1411,8 @@ def _validate_integrated_source(
 def _accepted_commit_sha(*, repo_root: Path | None, runner) -> str | None:
     """The integration commit identity recorded on an accepted completion.
 
-    Returns the repository HEAD short sha when the target is a Git repository
-    whose automatic commit ran; otherwise ``None`` when there is no Git repo or
-    no verifier-driven commit to point to. Review/no-change completions that
-    produced no commit therefore record ``None`` rather than a fabricated id.
+    Includes no-change reviews: their existing verified HEAD is still the
+    integrated identity, even when no new commit was needed.
     """
     if repo_root is None or not (repo_root / ".git").exists():
         return None
@@ -1932,6 +1930,8 @@ def _settle_recovered_acceptance(service: CompletionService, record) -> bool:
         restored["acceptance_repository_commit"] = _accepted_commit_sha(
             repo_root=service.repo_root, runner=service.repo_command_runner,
         )
+    elif record.context.get("repository_base_commit"):
+        restored["acceptance_repository_commit"] = record.context["repository_base_commit"]
     return service.job_store.update_status(
         job_id, ExecutionJobStatus.ACCEPTED, metadata=restored,
     ).accepted

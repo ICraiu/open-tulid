@@ -177,6 +177,7 @@ class TaskManager:
             task=task,
             project_root=self.project_root,
             adapter=self.adapter,
+            repo_root=self.repo_root,
         )
         if acceptance_error is not None:
             return CommandResult(accepted=False, errors=(acceptance_error,))
@@ -314,6 +315,7 @@ class TaskManager:
                     task_id=task.id,
                     review_transition=transition,
                     current_contract=frozen_contract,
+                    repo_root=self.repo_root,
                     workflow=self.workflow,
                     journals=TransactionJournalStore(
                         self.project_root / "events" / "journals"
@@ -492,6 +494,7 @@ def _manual_implementation_acceptance_error(
     task,
     project_root,
     adapter,
+    repo_root=None,
 ) -> DomainError | None:
     """Align a manual request with the runtime acceptance path.
 
@@ -544,7 +547,7 @@ def _manual_implementation_acceptance_error(
         and _job_status_value(job.status) == ExecutionJobStatus.ACCEPTED.value
         and job.metadata.get("acceptance_transaction_id")
         and accepted_task_evidence(job, task=task, workflow=workflow, journals=journals,
-            source_identities=sources, target_state=transition.to_state)
+            source_identities=sources, target_state=transition.to_state, repo_root=repo_root)
     )
     if accepted:
         return None

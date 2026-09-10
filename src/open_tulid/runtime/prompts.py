@@ -146,6 +146,7 @@ def find_review_evidence(
     current_contract=None,
     workflow=None,
     journals=None,
+    repo_root=None,
 ) -> ReviewEvidence | None:
     """Select the newest accepted job that produced the review transition's source state."""
     from_state = str(getattr(review_transition, "from_state", ""))
@@ -157,6 +158,7 @@ def find_review_evidence(
             if not accepted_task_evidence(
                 job, task=current_contract.source_task, workflow=workflow, journals=journals,
                 source_identities=source_content_identities(current_contract),
+                repo_root=repo_root,
             ):
                 continue
         status = job.status.value if hasattr(job.status, "value") else str(job.status)

@@ -1432,6 +1432,7 @@ def _render_prompt_preview(
             current_contract=execution_contract,
             workflow=workflow,
             journals=TransactionJournalStore(project_path / "events" / "journals"),
+            repo_root=_project_config(config, project).repo_root,
         )
         if evidence is None:
             _print_domain_errors((DomainError(
@@ -1764,6 +1765,8 @@ def transition_task(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
         history_job_store=ctx["job_store"],
+        project_root=ctx["project_path"],
+        repo_root=ctx["project_config"].repo_root,
     )
     checked = manager.request_transition(RequestTransition(
         project_id=project,
