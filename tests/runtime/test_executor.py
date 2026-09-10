@@ -683,6 +683,45 @@ def test_executor_retries_rejected_local_completion_with_feedback_until_accepted
     assert adapter.moved_to == "CodeReview"
 
 
+@pytest.mark.parametrize("history", ["exhausted", "corrupt"])
+def test_direct_executor_launch_cannot_bypass_durable_attempt_history(tmp_path, monkeypatch, history):
+    from open_tulid.runtime.attempts import task_semantic_revision
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    revision = task_semantic_revision(_task())
+    for index in range(3):
+        record = {"attempt_id": f"old-{index}", "job_id": f"old-{index}",
+                  "attempt_number": 1, "task_revision": revision,
+                  "transition_id": "code", "worker_id": "codex", "status": "ended"}
+        assert store.create(ExecutionJob(job_id=f"old-{index}", project_id="Agent", task_id=TASK_ID,
+            transition_id="code", worker_id="codex", workspace_path=str(tmp_path / f"old-{index}"),
+            status="failed", attempts=1,
+            metadata={"attempt_records": [record] if history == "exhausted" else "corrupt"})).accepted
+    assert store.create(ExecutionJob(job_id=JOB_ID, project_id="Agent", task_id=TASK_ID,
+        transition_id="code", worker_id="codex", workspace_path=str(tmp_path / "workspace"))).accepted
+    executor = JobExecutor(workflow=_workflow(), adapter=FakeAdapter(), job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"), runtime=RuntimeConfig(),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"))
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("Exhausted or unreadable history must fail before preparing execution")
+    monkeypatch.setattr(executor, "_start_completion_endpoint", unexpected_launch)
+    result = executor.run(JOB_ID)
+    assert not result.accepted
+    assert result.errors[0].code == ("job.total_attempt_limit_reached" if history == "exhausted" else "job.attempt_history_unreadable")
+    assert not (tmp_path / "workspace").exists()
+
+
+def test_second_executor_cannot_prepare_a_job_owned_by_another_executor(tmp_path):
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    executor = JobExecutor(workflow=_workflow(), adapter=FakeAdapter(), job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"), runtime=RuntimeConfig(),
+        project_config=ProjectConfig(name="Agent", tracker_path="Agent"))
+    with store.execution_lock(JOB_ID) as acquired:
+        assert acquired
+        result = executor.run(JOB_ID)
+    assert not result.accepted
+    assert result.errors[0].code == "job.executor_active"
+
+
 def test_executor_refuses_repair_when_total_attempt_account_exhausted(
     tmp_path: Path,
     monkeypatch,

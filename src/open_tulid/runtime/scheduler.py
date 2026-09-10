@@ -761,14 +761,17 @@ def _total_attempt_exhausted(
         return None
     listed = job_store.list()
     if not listed.accepted:
-        return None
-    consumed = count_consumed_attempts(
-        jobs=listed.jobs,
-        project_id=project_id,
-        task_id=task.id,
-        transition_id=transition.id,
-        task_revision=revision,
-    )
+        return _error("job.attempt_history_unreadable", "Cannot read durable attempt history.", task.id)
+    try:
+        consumed = count_consumed_attempts(
+            jobs=listed.jobs,
+            project_id=project_id,
+            task_id=task.id,
+            transition_id=transition.id,
+            task_revision=revision,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        return _error("job.attempt_history_unreadable", str(exc), task.id)
     if consumed < total_limit:
         return None
     return _error(

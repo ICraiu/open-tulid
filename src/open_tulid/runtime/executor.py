@@ -308,6 +308,14 @@ class JobExecutor:
         self.liveness_probe = liveness_probe
 
     def run(self, job_id: str) -> ExecutorRunResult:
+        with self.job_store.execution_lock(job_id) as acquired:
+            if not acquired:
+                return ExecutorRunResult(False, errors=(_error(
+                    "job.executor_active", "Another executor already owns this job.", job_id,
+                ),))
+            return self._run_claimed(job_id)
+
+    def _run_claimed(self, job_id: str) -> ExecutorRunResult:
         loaded = self.job_store.get(job_id)
         if not loaded.accepted or loaded.job is None:
             return ExecutorRunResult(False, errors=(loaded.error or _error("job.not_found", "Job was not found."),))
@@ -346,6 +354,18 @@ class JobExecutor:
             if frozen.contract is not None
             else planning.source_task if planning is not None else task_result.task
         )
+
+        sources = (source_content_identities(frozen.contract) if frozen.contract is not None
+                   else planning.source_identities if planning is not None else ())
+        try:
+            within_budget = self._repair_within_total_account(job, execution_task, source_identities=sources)
+        except (ValueError, TypeError, KeyError) as exc:
+            return self._fail_before_run(job, _error("job.attempt_history_unreadable", str(exc), job.job_id))
+        if not within_budget:
+            self._fail_at_total_attempt_bound(job, revision=self._task_revision(execution_task, source_identities=sources))
+            return ExecutorRunResult(False, errors=(_error(
+                "job.total_attempt_limit_reached", "The durable attempt account is exhausted.", job.job_id,
+            ),))
 
         required_resources = self.runtime.worker_resources.get(job.worker_id, ())
         lease_acquired = False
@@ -605,7 +625,7 @@ class JobExecutor:
                         # Restart the same frozen job in its preserved workspace so
                         # the worker receives the structured repair packet and can
                         # submit a new completion without a daemon tick/manual run.
-                        return self.run(job.job_id)
+                        return self._run_claimed(job.job_id)
                     # The durable total attempt account is exhausted; a repair
                     # would exceed the bounded budget, so settle the job instead
                     # of starting another worker process.
@@ -818,7 +838,7 @@ class JobExecutor:
     def _consumed_attempts(self, job, task, *, source_identities=()) -> int:
         listed = self.job_store.list()
         if not listed.accepted:
-            return 0
+            raise ValueError("Cannot read durable attempt history; refusing to renew the account.")
         return count_consumed_attempts(
             jobs=listed.jobs,
             project_id=job.project_id,

@@ -257,8 +257,8 @@ def count_consumed_attempts(
             continue
         try:
             records = attempt_records_from_metadata(job.metadata)
-        except ValueError:
-            continue
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise ValueError(f"Cannot read attempt history for job {job.job_id!r}") from exc
         # Re-identify historical frozen inputs with the current revision
         # algorithm without rewriting their records or renewing their budget.
         from .execution_contracts import load_job_execution_contract, source_content_identities

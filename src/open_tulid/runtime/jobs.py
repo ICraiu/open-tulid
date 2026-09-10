@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 from contextlib import contextmanager
@@ -33,6 +34,7 @@ ACTIVE_JOB_STATUSES = frozenset({
 })
 
 IMMUTABLE_JOB_METADATA_KEYS = frozenset({
+    "planning_inputs",
     "verification_environment",
     "execution_contract",
     "execution_contract_sha256",
@@ -307,6 +309,23 @@ class FileExecutionJobStore:
 
     def path_for(self, job_id: str) -> Path:
         return self._path_for(job_id)
+
+    @contextmanager
+    def execution_lock(self, job_id: str):
+        """Only one executor may prepare or run a job, including its repairs."""
+        root = self.root / ".execution-locks"
+        root.mkdir(parents=True, exist_ok=True)
+        identity = hashlib.sha256(job_id.encode()).hexdigest()
+        with (root / identity).open("a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @contextmanager
     def _locked(self):
