@@ -7,7 +7,17 @@ import sys
 
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
-if name == "node":
+if name == "mongod":
+    # Lifecycle stand-in for the private DB wrapper. Component behavior remains
+    # scripted here; real persistence is checked separately in the project image.
+    import socket
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", int(args[args.index("--port") + 1])))
+        listener.listen()
+        while True:
+            connection, _ = listener.accept()
+            connection.close()
+elif name == "node":
     path = Path(args[-1])
     behavior = path.read_text().strip()
     if behavior == "broken":

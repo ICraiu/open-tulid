@@ -44,7 +44,7 @@ def project(tmp_path, monkeypatch):
     toolchain = tmp_path / "bin"
     toolchain.mkdir()
     script = (ROOT / "tests/fixtures/project_components/tool.py").read_text()
-    for name in ("node", "npm", "uv"):
+    for name in ("node", "npm", "uv", "mongod"):
         path = toolchain / name
         path.write_text("#!" + sys.executable + "\n" + script.split("\n", 1)[1])
         path.chmod(0o755)

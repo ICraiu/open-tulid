@@ -41,9 +41,12 @@ Before admitting dependent tasks, on an **isolated application/tracker copy**:
 2. Extend the project's `Docker.tulid` from each configured worker image with
    Node/npm, Python 3.12, and uv. Pin tool versions in that project image recipe;
    put pytest and research dependencies in the committed uv lock. Provide a
-   writable cache/home for the declared UID. Verification starts no services and
-   receives no model/completion credentials. Its dependencies must be reachable
-   from the declared project environment.
+   writable cache/home for the declared UID. The supplied `Docker.tulid` also
+   includes MongoDB 7. `tools/with_test_database.py` starts a private loopback
+   database in a temporary directory, overrides any inherited `MONGO_URI`, and
+   removes it after verification. Persistence checks must execute rather than
+   skip when no database is available. Verification receives no model/completion
+   credentials and never connects to the live application database.
 3. Run `python3 tools/verify_project.py --inventory` in the isolated copy; it
    must report every expected suite. Build the project image and run the ordered commands in this `contract.yaml`
    against a clean candidate in that image. `npm ci` and `uv sync --locked` must
@@ -67,6 +70,7 @@ Evidence is in the verifier's complete command logs and the entry point's
 and frontend build log. Routine acceptance must use deterministic fixtures;
 backend tests do not establish browser usability or production provider behavior.
 
-No application files, tracker configuration, services, images, or containers were
-changed to prepare this migration. The application baseline is currently blocked
-by the missing setup above; no clean-container product pass is claimed.
+The isolated 2026-09-10 backend baseline executed 226 tests with zero skips in the
+project image using its private MongoDB and disabled external networking. This
+establishes the existing backend baseline only; it does not establish the missing
+cross-language components or the complete product acceptance inventory.

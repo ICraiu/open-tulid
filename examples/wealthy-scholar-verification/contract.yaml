@@ -19,7 +19,7 @@ commands:
     argv: [uv, sync, --locked, --project, research, --all-extras]
     timeout_seconds: 600
   - name: project_components
-    argv: [python3, tools/verify_project.py]
+    argv: [python3, tools/with_test_database.py, python3, tools/verify_project.py]
     timeout_seconds: 3600
 retry:
   max_attempts: 3
