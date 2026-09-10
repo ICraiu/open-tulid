@@ -32,6 +32,7 @@ from open_tulid.runtime.repository_facts import (
     FileManifestEntry,
     BaselineManifest,
     canonical_sha256,
+    EXCLUDED_DIRECTORY_NAMES,
 )
 
 
@@ -41,19 +42,7 @@ CANDIDATE_SCHEMA = "tulid.candidate/v1"
 # ephemeral dependency/cache directories are never deliverables (plan 5A).
 # Intentional source under a name like `build`/`output`/`dist` is deliberately
 # NOT excluded by name, so a tracking of versioned source there is retained.
-CANDIDATE_EXCLUDED_DIRECTORY_NAMES = frozenset({
-    ".git",
-    ".open-tulid",
-    ".mypy_cache",
-    ".nox",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "node_modules",
-    "venv",
-})
+CANDIDATE_EXCLUDED_DIRECTORY_NAMES = EXCLUDED_DIRECTORY_NAMES
 
 # Change kinds modeled on the plan's change entry vocabulary. Renames are
 # represented safely as delete+add; rename detection is explanatory and never

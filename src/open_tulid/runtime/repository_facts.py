@@ -28,12 +28,7 @@ EXCLUDED_DIRECTORY_NAMES = frozenset({
     ".tox",
     ".venv",
     "__pycache__",
-    "build",
-    "dist",
-    "htmlcov",
     "node_modules",
-    "output",
-    "target",
     "venv",
 })
 

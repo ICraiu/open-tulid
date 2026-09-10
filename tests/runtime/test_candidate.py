@@ -27,6 +27,32 @@ def test_candidate_rejects_path_identities(tmp_path, identity):
     assert result.errors[0].code == "candidate.invalid_identity"
 
 
+@pytest.mark.parametrize("directory", ["build", "dist", "output", "target", "htmlcov"])
+def test_baseline_workspace_and_candidate_preserve_same_source_surface(tmp_path, directory):
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    from open_tulid.runtime.workspaces import _copy_repo
+    repo, workspace = tmp_path / "repo", tmp_path / "workspace"
+    source = repo / directory / "source.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("original source")
+    baseline = capture_repository_snapshot(repo).snapshot.baseline
+    assert [entry.path for entry in baseline.entries] == [f"{directory}/source.txt"]
+    workspace.mkdir()
+    _copy_repo(repo, workspace)
+    assert (workspace / directory / "source.txt").read_text() == "original source"
+    captured = capture_candidate(workspace=workspace, storage_root=tmp_path / "candidates",
+                                 candidate_id="unchanged", baseline=baseline)
+    assert captured.accepted, captured.errors
+    assert captured.captured.candidate.changes == ()
+    (workspace / directory / "source.txt").write_text("changed source")
+    changed = capture_candidate(workspace=workspace, storage_root=tmp_path / "candidates",
+                                candidate_id="changed", baseline=baseline)
+    assert changed.accepted, changed.errors
+    assert [(change.path, change.kind) for change in changed.captured.candidate.changes] == [
+        (f"{directory}/source.txt", KIND_EDIT),
+    ]
+
+
 def test_candidate_never_replaces_existing_evidence(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
