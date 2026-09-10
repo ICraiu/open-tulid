@@ -203,6 +203,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Durable isolated reliability experiments may contain private tracker/config data.
+.reliability-proof/
+
 # Ruff stuff:
 .ruff_cache/
 

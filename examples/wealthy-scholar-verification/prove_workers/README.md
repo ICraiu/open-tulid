@@ -64,6 +64,11 @@ Prepare isolation and identity, then drive the real chain:
 
 Set `TULID_CONFIG` to the isolated configuration file to keep jobs, leases, logs,
 and daemon state under its parent directory without changing the process home.
+Keep the ledger, configuration, checkout, and logs on persistent storage, such as
+the Git-ignored `.reliability-proof/` directory. A temporary filesystem can lose
+the entire experiment on a host restart. Historical tracker events are retained
+in a sibling `tracker-history/` archive so their live recovery paths cannot run
+inside the experiment.
 
 Then run the real chain with the configured worker assignments against
 the isolated tracker copy via the existing CLI, and call the tool again with a
