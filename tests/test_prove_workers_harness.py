@@ -83,6 +83,11 @@ def test_isolation_produces_working_checkout_without_live_remote(tmp_path, monke
     (source / "app.py").write_text("original")
     subprocess.run(["git", "-C", str(source), "add", "app.py"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "baseline"], check=True)
+    (source / "app.py").write_text("dirty source")
+    (source / "new.py").write_text("untracked source")
+    (source / ".gitignore").write_text(".env\n")
+    (source / ".env").write_text("private value")
+    before = subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"])
     tracker = tmp_path / "vault"
     tracker.mkdir()
     (tracker / "task.md").write_text("task")
@@ -91,13 +96,17 @@ def test_isolation_produces_working_checkout_without_live_remote(tmp_path, monke
     args = pw.build_arg_parser().parse_args(["--source-repo", str(source), "--source-tracker", str(tracker), "--ledger-dir", str(tmp_path / "proof")])
     workspace, ledger, identity = pw.isolate_inputs(args)
     checkout = workspace / "project"
-    assert (checkout / "app.py").read_text() == "original"
+    assert (checkout / "app.py").read_text() == "dirty source"
+    assert (checkout / "new.py").read_text() == "untracked source"
+    assert not (checkout / ".env").exists()
+    assert subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain"]) == b""
+    assert subprocess.check_output(["git", "-C", str(source), "status", "--porcelain"]) == before
     assert subprocess.check_output(["git", "-C", str(checkout), "remote"], text=True) == ""
     ledger.note("failed attempt remains visible")
     ledger.write()
     assert pw.Ledger(ledger.root).record["notes"] == ["failed attempt remains visible"]
     (checkout / "app.py").write_text("isolated edit")
-    assert (source / "app.py").read_text() == "original"
+    assert (source / "app.py").read_text() == "dirty source"
 
 
 def test_config_override_keeps_runtime_state_in_isolated_directory(tmp_path, monkeypatch):

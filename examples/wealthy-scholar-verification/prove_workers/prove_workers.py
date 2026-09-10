@@ -25,6 +25,8 @@ model slot. Real worker execution is reserved for the operator's sustained run.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import json
 import re
 import shutil
@@ -123,6 +125,40 @@ def copy_repo(source_repo: Path, dest: Path) -> None:
                    check=True, capture_output=True)
     subprocess.run(["git", "-C", str(dest), "remote", "remove", "origin"],
                    check=True, capture_output=True)
+    snapshot_working_tree(source_repo, dest)
+
+
+def snapshot_working_tree(source: Path, dest: Path) -> str:
+    """Include staged, unstaged and nonignored source without copying secrets/caches.
+
+    Git's working tree can contain substantial original work not present in
+    HEAD. Preserve it in the isolated baseline, leaving the source index alone.
+    """
+    raw = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+    paths = sorted(set(os.fsdecode(name) for name in raw.split(b"\0") if name))
+    evidence = []
+    for name in paths:
+        origin, target = source / name, dest / name
+        if origin.is_symlink():
+            raise ValueError(f"Explicit symlink handling required for baseline path: {name}")
+        if not origin.exists():
+            target.unlink(missing_ok=True)
+            evidence.append((name, None))
+            continue
+        before = origin.read_bytes()
+        mode = origin.stat().st_mode & 0o777
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(before)
+        target.chmod(mode)
+        if origin.read_bytes() != before or origin.stat().st_mode & 0o777 != mode:
+            raise ValueError(f"Source changed during isolation: {name}")
+        evidence.append((name, hashlib.sha256(before).hexdigest(), mode))
+    digest = hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+    subprocess.run(["git", "-C", str(dest), "add", "--all"], check=True, capture_output=True)
+    if subprocess.run(["git", "-C", str(dest), "diff", "--cached", "--quiet"]).returncode:
+        subprocess.run(["git", "-C", str(dest), "-c", "user.name=Tulid proof", "-c", "user.email=proof@localhost",
+                        "commit", "-qm", f"Preserve isolated working baseline {digest}"], check=True, capture_output=True)
+    return digest
 
 
 def copy_tracker(source_vault: Path, dest: Path) -> None:
