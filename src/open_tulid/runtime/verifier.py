@@ -576,7 +576,8 @@ class DeterministicVerifier:
                     f"Changed file path escapes the workspace: {changed_file}",
                     changed_file,
                 ))
-            elif not changed_path.exists() and not authoritative_candidate:
+            elif (not changed_path.exists() and not authoritative_candidate
+                  and ".open-tulid" not in Path(changed_file).parts):
                 errors.append(_error(
                     "completion.changed_file_not_found",
                     f"Changed file does not exist: {changed_file}",

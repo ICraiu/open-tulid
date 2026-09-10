@@ -292,15 +292,19 @@ class CompletionService:
             },
         ))
         try:
-            verification_workspace = Path(job.workspace_path)
+            output_relative = _relative_output_path(
+                job, Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
+            )
+            if output_relative is None:
+                raise ValueError("Artifact output must be a directory within the captured workspace.")
+            verification_workspace = prepare_verification_copy(
+                candidate_path=captured.captured.storage_path,
+                writable_root=captured.captured.storage_path.parent / "verification",
+                copy_id=candidate.candidate_id,
+            )
             executor = self.verification_executor
             environment_identity = self.verification_environment_identity
             if frozen.contract is not None:
-                verification_workspace = prepare_verification_copy(
-                    candidate_path=captured.captured.storage_path,
-                    writable_root=captured.captured.storage_path.parent / "verification",
-                    copy_id=candidate.candidate_id,
-                )
                 if executor is None:
                     # Durable, sanitized environment frozen before the worker
                     # starts. CLI submission/recovery uses the same identity.
@@ -311,7 +315,7 @@ class CompletionService:
                     environment_identity = environment_identity_of(environment)
             verification = self.verifier.verify(
                 workspace=verification_workspace,
-                output_dir=Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output"))),
+                output_dir=verification_workspace / output_relative,
                 transition=transition,
                 submission=submission,
                 execution_contract=frozen.contract,
@@ -352,8 +356,7 @@ class CompletionService:
                 message=verification.message,
             )
 
-        output_dir = Path(str(job.metadata.get("output_path", Path(job.workspace_path) / "output")))
-        output_relative = _relative_output_path(job, output_dir)
+        output_dir = captured.captured.storage_path / output_relative
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         promoted_artifacts = _promotion_plan(
             artifact_root=self.artifact_root,
@@ -364,7 +367,7 @@ class CompletionService:
         )
         promoted_files = _candidate_change_plan(
             repo_root=self.repo_root,
-            candidate_storage=captured.captured.storage_path if frozen.contract is not None else Path(job.workspace_path),
+            candidate_storage=captured.captured.storage_path,
             changes=candidate.changes,
             output_relative=output_relative,
         )

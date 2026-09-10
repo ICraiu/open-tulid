@@ -347,6 +347,32 @@ def test_completion_accepts_evidence_and_moves_task(tmp_path: Path):
     ]
 
 
+def test_artifact_delivery_uses_sealed_bytes_when_worker_mutates_live_output(tmp_path):
+    from open_tulid.runtime.verifier import DeterministicVerifier
+    store = _job_store(tmp_path)
+    original = tmp_path / "workspace" / "output" / "result.md"
+    original.write_text("The verified artifact.")
+
+    class RacingVerifier(DeterministicVerifier):
+        def verify(self, **kwargs):
+            assert kwargs["output_dir"] != original.parent
+            result = super().verify(**kwargs)
+            assert result.accepted, result.errors
+            original.write_text("A late unverified replacement.")
+            return result
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=FakeAdapter(_task()), job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"),
+        artifact_root=tmp_path / "artifacts", verifier=RacingVerifier(),
+    )
+    result = service.submit(job_id="01J00000000000000000000JOB", token="secret",
+                            submission=CompletionSubmission(summary="done", artifacts=("result.md",)))
+    assert result.accepted, result.errors
+    assert (tmp_path / "artifacts" / TASK_ID / "result.md" / "result.md").read_text() == "The verified artifact."
+    assert original.read_text() == "A late unverified replacement."
+
+
 def test_completion_marks_job_as_submitted_before_expensive_verification(tmp_path: Path):
     store = _job_store(tmp_path)
     events = JsonlEventStore(tmp_path / "events")
