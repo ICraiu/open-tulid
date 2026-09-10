@@ -152,6 +152,18 @@ class FileExecutionJobStore:
         metadata: Mapping[str, Any] | None = None,
         increment_attempts: bool = False,
     ) -> JobStoreResult:
+        with self._locked():
+            return self._update_status_unlocked(job_id, status, metadata=metadata,
+                                                increment_attempts=increment_attempts)
+
+    def _update_status_unlocked(
+        self,
+        job_id: str,
+        status: ExecutionJobStatus | str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        increment_attempts: bool = False,
+    ) -> JobStoreResult:
         loaded = self.get(job_id)
         if not loaded.accepted or loaded.job is None:
             return loaded
@@ -217,6 +229,10 @@ class FileExecutionJobStore:
         return JobStoreResult(jobs=jobs)
 
     def record_attempt(self, job_id: str, payload: Mapping[str, Any]) -> JobStoreResult:
+        with self._locked():
+            return self._record_attempt_unlocked(job_id, payload)
+
+    def _record_attempt_unlocked(self, job_id: str, payload: Mapping[str, Any]) -> JobStoreResult:
         """Admit or update one versioned attempt record for a job.
 
         The record is upserted by ``attempt_id`` under the existing job record
@@ -251,7 +267,7 @@ class FileExecutionJobStore:
         ]
         surviving.append(attempt_record_to_dict(incoming))
         surviving.sort(key=lambda item: int(item.get("attempt_number", 0)))
-        return self.update_status(
+        return self._update_status_unlocked(
             job_id,
             job.status,
             metadata={ATTEMPT_RECORD_METADATA_KEY: surviving},
