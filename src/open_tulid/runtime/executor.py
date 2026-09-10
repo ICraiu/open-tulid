@@ -32,7 +32,9 @@ from open_tulid.runtime.execution_contracts import (
     ExecutionContract,
     load_job_execution_contract,
     source_content_identities,
+    _freeze_linked_context,
 )
+from .planning_inputs import INLINE_CHARACTER_LIMIT, load_planning_inputs
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.instructions import AgentInstructionResolver, PromptPacket
 from open_tulid.runtime.prompts import (
@@ -43,7 +45,6 @@ from open_tulid.runtime.prompts import (
     compiled_prompt_from_metadata,
 )
 from open_tulid.runtime.context import (
-    LinkedContextResolver,
     load_parent_tasks,
     sanitize_task_body_for_runtime,
     task_for_context,
@@ -105,6 +106,7 @@ class PromptRenderResult:
     execution_contract_sha256: str | None = None
     compiled_prompt: CompiledPrompt | None = None
     errors: tuple[DomainError, ...] = ()
+    context_files: tuple = ()
 
     @property
     def accepted(self) -> bool:
@@ -122,6 +124,7 @@ def render_execution_prompt(
     completion_endpoint: str,
     execution_contract: ExecutionContract | None = None,
     review_evidence: ReviewEvidence | None = None,
+    project_root: Path | None = None,
 ) -> PromptRenderResult:
     """Render the exact model prompt for an execution job without running it."""
     if execution_contract is not None:
@@ -162,9 +165,10 @@ def render_execution_prompt(
     )
     prompt_packet = None
     parent_tasks: tuple[Task, ...] = ()
-    context_packet = None
+    context_files = ()
+    context_excerpts = ()
     context_task = task
-    project_root = _adapter_project_root(adapter)
+    project_root = project_root or _adapter_project_root(adapter)
     if project_root is not None:
         parent_tasks = load_parent_tasks(adapter, task)
         context_task = task_for_context(task, transition)
@@ -181,13 +185,12 @@ def render_execution_prompt(
         prompt_packet = prompt_result.packet
         if prompt_packet is not None:
             prompt_text = f"{prompt_text}\n\n{prompt_packet.text}"
-        context_result = LinkedContextResolver(project_root).build_context_packet(
-            context_task,
+        context_excerpts, context_files, context_errors = _freeze_linked_context(
+            project_root, task, transition,
             parent_tasks=parent_tasks,
         )
-        if not context_result.accepted:
-            return PromptRenderResult(errors=context_result.errors)
-        context_packet = context_result.packet
+        if context_errors:
+            return PromptRenderResult(errors=context_errors)
     prompt_text = _append_completion_submission(
         prompt_text,
         required_artifacts=transition.requires.artifacts,
@@ -219,11 +222,24 @@ def render_execution_prompt(
     # very large parent and linked-reference context so the model sees the
     # entire execution contract before it begins acting on background material.
     prompt_text = _append_parent_tasks(prompt_text, parent_tasks)
-    if context_packet is not None and context_packet.text:
-        prompt_text = f"{prompt_text}\n\n{context_packet.text}"
+    if context_files:
+        reading = "\n".join(
+            f"- {'Required' if file.required else 'Background'}: {file.workspace_path} "
+            f"({', '.join(file.refs)}). {file.reason}"
+            for file in context_files
+        )
+        prompt_text += f"\n\n## Frozen source reading\nRead the complete required files before working.\n{reading}"
+        prompt_text += "\n\n" + "\n\n".join(excerpt.text for excerpt in context_excerpts)
+    if len(prompt_text) > INLINE_CHARACTER_LIMIT:
+        return PromptRenderResult(errors=(_error(
+            "prompt.budget_exceeded",
+            f"Planning task and mandatory inputs exceed the {INLINE_CHARACTER_LIMIT}-character inline budget.",
+            task.id,
+        ),))
     return PromptRenderResult(
         text=prompt_text,
         instruction_packet=prompt_packet,
+        context_files=context_files,
         execution_contract_sha256=(
             execution_contract.sha256
             if execution_contract is not None
@@ -306,9 +322,14 @@ class JobExecutor:
         frozen = load_job_execution_contract(job)
         if not frozen.accepted:
             return self._fail_before_run(job, frozen.errors[0])
+        try:
+            planning = load_planning_inputs(job)
+        except (ValueError, TypeError, KeyError) as exc:
+            return self._fail_before_run(job, _error("prompt.frozen_invalid", str(exc), job.job_id))
         transition = (
             frozen.contract.transition
             if frozen.contract is not None
+            else planning.transition if planning is not None
             else self.workflow.transitions.get(job.transition_id)
         )
         if transition is None:
@@ -323,7 +344,7 @@ class JobExecutor:
         execution_task = (
             frozen.contract.source_task
             if frozen.contract is not None
-            else task_result.task
+            else planning.source_task if planning is not None else task_result.task
         )
 
         required_resources = self.runtime.worker_resources.get(job.worker_id, ())
@@ -409,7 +430,7 @@ class JobExecutor:
                 workspace=prepared.workspace,
                 source_identities=source_content_identities(frozen.contract)
                 if frozen.contract is not None
-                else (),
+                else planning.source_identities if planning is not None else (),
             )
             settled_attempt_id = attempt_record.attempt_id
             self.job_store.update_status(
@@ -577,7 +598,7 @@ class JobExecutor:
                         source_identities=(
                             source_content_identities(frozen.contract)
                             if frozen.contract is not None
-                            else ()
+                            else planning.source_identities if planning is not None else ()
                         ),
                     ):
                         # A rejected completion is feedback, not task completion.
@@ -1570,7 +1591,8 @@ def _write_prompt_manifest_payload(workspace: Path, manifest: Mapping[str, objec
 
 def _frozen_prompt_packet(job, contract: ExecutionContract | None) -> str | None:
     if contract is None:
-        return None
+        planning = load_planning_inputs(job)
+        return planning.prompt if planning is not None else None
     if (
         not isinstance(job.metadata.get("prompt_packet"), str)
         or not isinstance(job.metadata.get("prompt_packet_sha256"), str)

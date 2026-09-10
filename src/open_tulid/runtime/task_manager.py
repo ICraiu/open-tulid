@@ -250,6 +250,11 @@ class TaskManager:
             ),))
         frozen_contract = None
         compiled_prompt = None
+        planning_metadata = {}
+        job_id = command.job_id or new_ulid()
+        lineage_errors = _validate_parent_lineage(self.adapter, task)
+        if lineage_errors:
+            return CommandResult(accepted=False, errors=tuple(lineage_errors))
         uses_global_contract = task_uses_global_contract(task, self.workflow)
         if self.project_root is None:
             if uses_global_contract:
@@ -337,7 +342,19 @@ class TaskManager:
                     str(exc),
                     task.id,
                 ),))
-        job_id = command.job_id or new_ulid()
+        if frozen_contract is None:
+            from .executor import render_execution_prompt
+            from .planning_inputs import freeze_planning_inputs
+            rendered = render_execution_prompt(
+                workflow=self.workflow, adapter=self.adapter, task=task,
+                transition=transition, worker_id=transition.worker,
+                job_id=job_id, completion_endpoint="", project_root=self.project_root,
+            )
+            if not rendered.accepted:
+                return CommandResult(accepted=False, errors=rendered.errors)
+            planning_metadata = {"planning_inputs": freeze_planning_inputs(
+                task, transition, rendered.text, rendered.context_files,
+            )}
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
         job = ExecutionJob(
@@ -348,6 +365,7 @@ class TaskManager:
             worker_id=transition.worker,
             workspace_path=str(workspace),
             metadata={
+                **planning_metadata,
                 "completion_token": secrets.token_urlsafe(24),
                 "output_path": str(output_path),
                 **(

@@ -1386,8 +1386,11 @@ def test_review_answers_includes_three_round_canonical_answer_history(tmp_path: 
     rendered = render_execution_prompt(workflow=workflow, adapter=ProjectAdapter(), task=round_3, transition=review, worker_id="codex_clarity", job_id="review-answers", completion_endpoint="http://example.invalid/complete")
 
     assert rendered.accepted is True
-    assert all(answer in rendered.text for answer in answers)
-    assert rendered.text.index(answers[0]) < rendered.text.index(answers[1]) < rendered.text.index(answers[2])
+    assert len(rendered.context_files) == 3
+    for file, answer in zip(rendered.context_files, answers, strict=True):
+        assert answer in file.content
+        assert file.required
+        assert file.workspace_path in rendered.text
     assert "Who should the first version serve?" in rendered.text
     assert "do not create another question round that repeats a settled question" in rendered.text
 

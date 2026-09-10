@@ -1278,6 +1278,14 @@ def _compare_preview_to_scheduled(project: str, job_id: str, rendered: PromptRen
         _print_domain_errors((loaded.error,) if loaded.error is not None else ())
         raise typer.Exit(1)
     scheduled_packet = loaded.job.metadata.get("prompt_packet")
+    from open_tulid.runtime.planning_inputs import load_planning_inputs
+    try:
+        planning = load_planning_inputs(loaded.job)
+    except (ValueError, TypeError, KeyError) as exc:
+        _print_domain_errors((DomainError("prompt.history_corrupt", str(exc), job_id),))
+        raise typer.Exit(1)
+    if planning is not None:
+        scheduled_packet = planning.prompt
     if not isinstance(scheduled_packet, str):
         _print_domain_errors((DomainError(
             "prompt.compare_frozen_packet_missing",
@@ -1513,8 +1521,20 @@ def show_job_prompt(
         _print_domain_errors((loaded.error,) if loaded.error is not None else ())
         raise typer.Exit(1)
     try:
+        from open_tulid.runtime.planning_inputs import load_planning_inputs, INLINE_CHARACTER_LIMIT
+        planning = load_planning_inputs(loaded.job)
+        if planning is not None:
+            if explain:
+                typer.echo(f"mode: historical job {job_id}\npacket_type: planning")
+                typer.echo(f"characters: {len(planning.prompt)}/{INLINE_CHARACTER_LIMIT}")
+                typer.echo(f"inputs_sha256: {loaded.job.metadata['planning_inputs']['sha256']}")
+                for file in planning.context_files:
+                    typer.echo(f"{file.workspace_path}: {file.sha256}, {file.byte_count} bytes, required={file.required}")
+            else:
+                typer.echo(planning.prompt)
+            return
         compiled = compiled_prompt_from_metadata(loaded.job.metadata)
-    except ValueError as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         _print_domain_errors((DomainError(
             "prompt.history_corrupt",
             str(exc),

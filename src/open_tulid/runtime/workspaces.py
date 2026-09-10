@@ -20,6 +20,7 @@ from open_tulid.runtime.repository_facts import (
     repository_facts_to_dict,
 )
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
+from .planning_inputs import load_planning_inputs
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,9 @@ class WorkspacePreparer:
         if not frozen.accepted:
             return WorkspacePrepareResult(error=frozen.errors[0])
         try:
+            planning = load_planning_inputs(job)
+            if planning is not None:
+                task, transition = planning.source_task, planning.transition
             workspace.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
             if self.repo_root is not None and not preserve_workspace:
@@ -105,7 +109,9 @@ class WorkspacePreparer:
                 completion_endpoint=completion_endpoint,
                 execution_contract=frozen.contract,
             )
-        except OSError as exc:
+            if planning is not None:
+                _write_frozen_context_files(workspace, planning)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             return WorkspacePrepareResult(error=DomainError(
                 code="workspace.prepare_failed",
                 message=f"Cannot prepare workspace: {exc}",

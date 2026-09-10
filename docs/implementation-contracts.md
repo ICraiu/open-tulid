@@ -73,6 +73,15 @@ At scheduling time a `Todo` `ImplementationTask` is selected directly for
 `ImplementTask` under the project global contract — no `codex_contract`, no
 `PrepareExecutionContract`, no regeneration loop.
 
+New artifact-producing planning jobs also freeze their task, transition,
+resolved instructions, repository/inventory text, reference bytes, and rendered
+packet at admission (`tulid.planning-inputs/v1`). Their shared context resolver
+uses the same complete source files as implementation jobs. Inline excerpts may
+be shortened; required workspace files remain complete. Planning has an explicit
+64,000-character inline limit and rejects oversized mandatory inputs before
+creating a runnable job. `tulid prompts show-job` reads these saved inputs;
+historical jobs without them remain identifiable as legacy records.
+
 1. Tulid captures the completed source and runs every frozen global command in
    a writable copy, inside the same resolved project image as the worker. Missing
    image/environment evidence is a blocker; production never falls back to host execution.

@@ -17,6 +17,7 @@ from open_tulid.adapters.base import StorageAdapter
 from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobStatus, Task, WorkflowDefinition
 from open_tulid.runtime.events import JsonlEventStore, build_event, new_ulid, utc_now
 from open_tulid.runtime.execution_contracts import load_job_execution_contract
+from .planning_inputs import load_planning_inputs
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
@@ -191,9 +192,14 @@ class CompletionService:
         frozen = load_job_execution_contract(job)
         if not frozen.accepted:
             return CompletionResult(False, errors=frozen.errors)
+        try:
+            planning = load_planning_inputs(job)
+        except (ValueError, TypeError, KeyError) as exc:
+            return CompletionResult(False, errors=(_error("prompt.frozen_invalid", str(exc), job.job_id),))
         transition = (
             frozen.contract.transition
             if frozen.contract is not None
+            else planning.transition if planning is not None
             else self.workflow.transitions.get(job.transition_id)
         )
         if transition is None:
@@ -1121,6 +1127,9 @@ def _format_errors(errors: tuple[DomainError, ...]) -> str:
 def _acceptance_task_revision(job, contract, adapter):
     from .attempts import task_semantic_revision
     from .execution_contracts import source_content_identities
+    planning = load_planning_inputs(job)
+    if contract is None and planning is not None:
+        return task_semantic_revision(planning.source_task, source_identities=planning.source_identities)
     task = contract.source_task if contract is not None else adapter.read_task(job.task_id).task
     return task_semantic_revision(task, source_identities=source_content_identities(contract) if contract else ())
 

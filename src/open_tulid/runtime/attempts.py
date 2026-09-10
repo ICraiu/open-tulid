@@ -266,6 +266,12 @@ def count_consumed_attempts(
         same_frozen_work = bool(frozen.accepted and frozen.contract is not None and
             task_semantic_revision(frozen.contract.source_task,
                 source_identities=source_content_identities(frozen.contract)) == task_revision)
+        from .planning_inputs import load_planning_inputs
+        planning = load_planning_inputs(job)
+        if planning is not None:
+            same_frozen_work = task_semantic_revision(
+                planning.source_task, source_identities=planning.source_identities,
+            ) == task_revision
         if records:
             total += sum(1 for record in records if record.task_revision == task_revision or same_frozen_work)
         elif same_frozen_work and str(getattr(job.status, "value", job.status)) != "pending":

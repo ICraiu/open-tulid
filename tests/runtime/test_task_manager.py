@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -414,6 +414,76 @@ def test_create_execution_job_uses_transition_worker_and_workspace(tmp_path: Pat
     assert result.job.workspace_path.startswith(str(tmp_path))
     assert [event.event_type for event in result.events] == ["ExecutionJobCreated"]
     assert result.effects[0]["type"] == "create_execution_job"
+
+
+def test_planning_job_preserves_task_instructions_and_sources_after_vault_edits(tmp_path):
+    from open_tulid.runtime.executor import _frozen_prompt_packet
+    from open_tulid.runtime.planning_inputs import load_planning_inputs
+    from open_tulid.runtime.workspaces import WorkspacePreparer
+    from open_tulid.runtime.jobs import FileExecutionJobStore
+
+    tracker = tmp_path / "tracker"
+    (tracker / "agents").mkdir(parents=True)
+    instructions = tracker / "agents" / "default.agent.md"
+    instructions.write_text("Keep the original planning procedure.")
+    reference = tracker / "spec.md"
+    reference.write_text("# Decisions\nThe original decision is immutable.")
+    task = replace(_snapshot().tasks[TASK_ID], artifact_links=("spec.md",))
+    adapter = FakeAdapter(_snapshot(task))
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    manager = TaskManager(workflow=_workflow(), adapter=adapter, project_root=tracker, job_store=store)
+    result = manager.create_execution_job(CreateExecutionJob(
+        project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path / "workspaces",
+    ))
+    assert result.accepted, result.errors
+    reference.write_text("The live decision has changed.")
+    instructions.write_text("The live procedure has changed.")
+    changed_task = replace(task, title="A different outcome")
+    adapter.snapshot = _snapshot(changed_task)
+    job = store.get(result.job.job_id).job
+    saved = load_planning_inputs(job)
+    assert saved.source_task.title == task.title
+    assert "original planning procedure" in _frozen_prompt_packet(job, None)
+    assert "live procedure" not in saved.prompt
+    prepared = WorkspacePreparer().prepare(job=job, task=changed_task, transition=_workflow().transitions["code"])
+    assert prepared.accepted, prepared.error
+    assert len(saved.context_files) == 1
+    file = saved.context_files[0]
+    assert file.workspace_path in saved.prompt
+    assert (prepared.workspace / ".open-tulid" / file.workspace_path).read_text() == "# Decisions\nThe original decision is immutable."
+    task_context = __import__("json").loads((prepared.workspace / ".open-tulid" / "job-context.json").read_text())
+    assert task_context["task"]["title"] == task.title
+
+
+def test_planning_job_rejects_missing_source_before_persistence(tmp_path):
+    from open_tulid.runtime.jobs import FileExecutionJobStore
+    task = replace(_snapshot().tasks[TASK_ID], artifact_links=("missing-spec.md",))
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    manager = TaskManager(workflow=_workflow(), adapter=FakeAdapter(_snapshot(task)), project_root=tmp_path, job_store=store)
+    result = manager.create_execution_job(CreateExecutionJob(
+        project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path / "workspaces",
+    ))
+    assert not result.accepted
+    assert any(error.code == "context.link_not_found" for error in result.errors)
+    assert not store.list().jobs
+
+
+def test_planning_workspace_rejects_corrupt_frozen_packet(tmp_path):
+    from open_tulid.runtime.workspaces import WorkspacePreparer
+    manager = TaskManager(workflow=_workflow(), adapter=FakeAdapter(_snapshot()))
+    result = manager.create_execution_job(CreateExecutionJob(
+        project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path,
+    ))
+    assert result.accepted
+    metadata = dict(result.job.metadata)
+    metadata["planning_inputs"] = {**metadata["planning_inputs"], "prompt": "Tampered requirements"}
+    job = replace(result.job, metadata=metadata)
+    prepared = WorkspacePreparer().prepare(
+        job=job, task=_snapshot().tasks[TASK_ID], transition=_workflow().transitions["code"],
+    )
+    assert not prepared.accepted
+    assert "digest mismatch" in prepared.error.message
+    assert not Path(job.workspace_path).exists()
 
 
 def test_create_execution_job_defers_target_state_artifact_requirements_to_completion(tmp_path: Path):

@@ -1095,6 +1095,28 @@ def test_prompts_render_compare_job_reports_mismatch(tmp_path: Path, monkeypatch
     assert "Preview does not match scheduled job" in result.output
 
 
+def test_prompts_show_job_reads_frozen_planning_without_live_tracker(tmp_path):
+    from open_tulid.domain import Task, TransitionDefinition, RequirementDefinition
+    from open_tulid.runtime.planning_inputs import freeze_planning_inputs
+    _write_config(tmp_path)
+    task = Task(id="1", title="Plan", path="tasks/1.md", current_state="Todo", task_type="Planning")
+    transition = TransitionDefinition(id="Plan", task_type="Planning", from_state="Todo", to_state="Done", worker="planner", requires=RequirementDefinition(), transaction=None)
+    text = "The original planning packet."
+    store = FileExecutionJobStore(tmp_path / CONFIG_DIRNAME / "jobs" / "Agent")
+    assert store.create(ExecutionJob(
+        job_id="planning-job", project_id="Agent", task_id="1", transition_id="Plan",
+        worker_id="planner", workspace_path=str(tmp_path / "workspace"),
+        metadata={"planning_inputs": freeze_planning_inputs(task, transition, text, ())},
+    )).accepted
+    with _with_cwd(tmp_path):
+        shown = runner.invoke(app, ["prompts", "show-job", "Agent", "planning-job"])
+        explained = runner.invoke(app, ["prompts", "show-job", "Agent", "planning-job", "--explain"])
+    assert shown.exit_code == 0, shown.output
+    assert shown.output == text + "\n"
+    assert explained.exit_code == 0, explained.output
+    assert "packet_type: planning" in explained.output
+
+
 def test_prompts_show_job_reads_immutable_packet_and_explains_manifest(tmp_path: Path):
     _write_config(tmp_path)
     text = "## Completion Submission\n\ncurl -sS -X POST"
