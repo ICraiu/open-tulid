@@ -132,7 +132,7 @@ def _workflow(*, ambiguous: bool = False, review: bool = False) -> WorkflowDefin
         states=MappingProxyType({
             "Todo": StateDefinition(id="Todo"),
             "Review": StateDefinition(id="Review"),
-            "Done": StateDefinition(id="Done"),
+            "Done": StateDefinition(id="Done", terminal_outcome="success"),
         }),
         task_types=MappingProxyType({
             "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
@@ -183,7 +183,7 @@ def _global_contract_workflow(*, review: bool = False) -> WorkflowDefinition:
         states=MappingProxyType({
             "Todo": StateDefinition(id="Todo"),
             "SelfReview": StateDefinition(id="SelfReview"),
-            "Done": StateDefinition(id="Done"),
+            "Done": StateDefinition(id="Done", terminal_outcome="success"),
         }),
         task_types=MappingProxyType({
             "ImplementationTask": TaskTypeDefinition(

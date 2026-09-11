@@ -12,10 +12,9 @@ CANCELLED = "cancelled"
 
 TERMINAL_OUTCOMES: tuple[str, ...] = (SUCCESS, FAILURE, CANCELLED)
 
-# Backward-compatible legacy outcome used when a terminal state has no explicit
-# declaration (see ``dependency_outcome``); never reinterprets a declared
-# failure/cancelled state as success.
-LEGACY_AMBIGUOUS_OUTCOME = SUCCESS
+# Historical workflows remain readable, but undeclared outcomes cannot prove
+# dependency success. An explicit workflow migration resolves the ambiguity.
+LEGACY_AMBIGUOUS_OUTCOME = "ambiguous"
 
 
 @dataclass(frozen=True)
@@ -104,9 +103,9 @@ def dependency_outcome(workflow, task_type: str, state_id: str) -> str:
       finished.
     - ``failure`` / ``cancelled``: the dependency reached a declared
       non-success terminal state.
-    - ``success``: the dependency reached a declared success terminal, or a
-      legacy terminal state with no declaration (backward compatible during
-      migration; never reinterprets a declared failure/cancelled state).
+    - ``success``: the dependency reached a declared success terminal.
+    - ``ambiguous``: no terminal outcome was declared; migration is required
+      before this dependency can release work.
     """
     if has_outgoing_transition(workflow, task_type, state_id):
         return "unmet"

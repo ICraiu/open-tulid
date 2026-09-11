@@ -503,6 +503,7 @@ def create_job(
         workflow=ctx["workflow"],
         adapter=ctx["adapter"],
         job_store=None,
+        history_job_store=ctx["job_store"],
         project_root=ctx.get("project_path"),
         repo_root=getattr(ctx.get("project_config"), "repo_root", None),
     )

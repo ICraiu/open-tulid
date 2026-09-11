@@ -416,6 +416,34 @@ def test_create_execution_job_uses_transition_worker_and_workspace(tmp_path: Pat
     assert result.effects[0]["type"] == "create_execution_job"
 
 
+def _declared_success_code_review_workflow() -> WorkflowDefinition:
+    return WorkflowDefinition(
+        schema_version=1,
+        states=MappingProxyType({
+            "Todo": StateDefinition(id="Todo"),
+            "CodeReview": StateDefinition(id="CodeReview", terminal_outcome="success"),
+        }),
+        task_types=MappingProxyType({
+            "task": TaskTypeDefinition(id="task", requirements_by_state=MappingProxyType({})),
+        }),
+        artifact_types=MappingProxyType({}),
+        validation_types=MappingProxyType({}),
+        operation_types=MappingProxyType({}),
+        workers=MappingProxyType({}),
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code",
+                task_type="task",
+                from_state="Todo",
+                to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(),
+                transaction=None,
+            ),
+        }),
+    )
+
+
 def test_direct_job_creation_checks_dependency_acceptance(tmp_path):
     from open_tulid.runtime.jobs import FileExecutionJobStore
     task = replace(_snapshot().tasks[TASK_ID], dependencies=("dependency",))
@@ -425,7 +453,7 @@ def test_direct_job_creation_checks_dependency_acceptance(tmp_path):
     for state, expected in (("Todo", "task.dependency_unmet"), ("CodeReview", "task.dependency_not_accepted")):
         dependency = replace(task, id="dependency", dependencies=(), current_state=state)
         snapshot = replace(_snapshot(task), tasks={task.id: task, dependency.id: dependency})
-        manager = TaskManager(workflow=_workflow(), adapter=FakeAdapter(snapshot), job_store=store,
+        manager = TaskManager(workflow=_declared_success_code_review_workflow(), adapter=FakeAdapter(snapshot), job_store=store,
                               history_job_store=store, project_root=tmp_path, repo_root=repo)
         result = manager.create_execution_job(CreateExecutionJob(
             project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path / "workspaces",

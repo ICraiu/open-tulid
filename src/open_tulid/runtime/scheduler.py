@@ -825,6 +825,14 @@ def _dependency_error(
         dependency_semantic = dependency_outcome(
             workflow, dependency.task_type, dependency.current_state
         )
+        if dependency_semantic == "ambiguous":
+            return _error(
+                "task.dependency_outcome_ambiguous",
+                f"Dependency {dependency_id!r} is in state {dependency.current_state!r} "
+                "without a declared terminal outcome; declare terminal_outcome "
+                "(success|failure|cancelled) before admitting dependent work.",
+                task.id,
+            )
         if dependency_semantic == "unmet":
             return _error(
                 "task.dependency_unmet",
@@ -847,37 +855,68 @@ def _dependency_error(
         # manual board move) must not admit an integration, and a dependency
         # accepted into a repository identity that no longer matches the current
         # target must not bless a stale candidate.
-        if job_store is not None and repo_root is not None and project_id is not None:
-            current_identity = repository_identity(repo_root)
-            if current_identity is not None:
-                recorded, accepted = _dependency_accepted_repo_identity(
-                    job_store, project_id, dependency_id, task=dependency,
-                    workflow=workflow, journals=journal_store,
-                    source_identities_for=source_identities_for,
-                    repo_root=repo_root,
+        #
+        # A declared success must be backed by committed acceptance evidence on
+        # every admission route, including a non-Git source root. If the required
+        # stores/context are unavailable the admission is blocked with the
+        # missing-evidence reason rather than silently dropping the check.
+        if job_store is None or project_id is None or journal_store is None:
+            missing = [
+                name
+                for name, present in (
+                    ("job store", job_store is not None),
+                    ("project context", project_id is not None),
+                    ("transaction journal", journal_store is not None),
                 )
-                if not accepted:
-                    return _error(
-                        "task.dependency_not_accepted",
-                        (
-                            f"Task {task.id!r} depends on task {dependency_id!r} which "
-                            "reached its terminal state without a recorded accepted "
-                            "completion; refusing to admit a dependent against a "
-                            "board-column-only state change."
-                        ),
-                        task.id,
-                    )
-                if recorded != current_identity:
-                    return _error(
-                        "task.dependency_repo_moved",
-                        (
-                            f"Dependency {dependency_id!r} was accepted into repository "
-                            f"identity {recorded}, but the integration target now resolves "
-                            f"to {current_identity}; refusing to admit a dependent against "
-                            "a stale source identity."
-                        ),
-                        task.id,
-                    )
+                if not present
+            ]
+            return _error(
+                "task.dependency_evidence_unavailable",
+                (
+                    f"Task {task.id!r} depends on task {dependency_id!r} which finished "
+                    f"in a declared {dependency_semantic!r} terminal, but required "
+                    f"acceptance evidence is unavailable (missing: {', '.join(missing)}); "
+                    "refusing to admit dependent work without committed evidence."
+                ),
+                task.id,
+            )
+        current_identity = repository_identity(repo_root) if repo_root is not None else None
+        recorded, accepted = _dependency_accepted_repo_identity(
+            job_store, project_id, dependency_id, task=dependency,
+            workflow=workflow, journals=journal_store,
+            source_identities_for=source_identities_for,
+            repo_root=repo_root,
+        )
+        if not accepted:
+            return _error(
+                "task.dependency_not_accepted",
+                (
+                    f"Task {task.id!r} depends on task {dependency_id!r} which "
+                    "reached its declared success terminal without a recorded accepted "
+                    "completion; refusing to admit a dependent against a "
+                    "board-column-only or stale state change."
+                ),
+                task.id,
+            )
+        # A recorded repository identity is compared only when the acceptance
+        # actually captured one (a source-backing commit). Non-Git acceptance
+        # evidence carries no repository identity and must not be misread as a
+        # stale/moved identity.
+        if (
+            recorded is not None
+            and current_identity is not None
+            and recorded != current_identity
+        ):
+            return _error(
+                "task.dependency_repo_moved",
+                (
+                    f"Dependency {dependency_id!r} was accepted into repository "
+                    f"identity {recorded}, but the integration target now resolves "
+                    f"to {current_identity}; refusing to admit a dependent against "
+                    "a stale source identity."
+                ),
+                task.id,
+            )
     return None
 
 

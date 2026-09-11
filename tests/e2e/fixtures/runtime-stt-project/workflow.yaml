@@ -44,6 +44,7 @@ statements:
     id: SelfReview
   - kind: state
     id: Done
+    terminal_outcome: success
   - kind: task_type
     id: ProductIdea
     instructions: [default]
