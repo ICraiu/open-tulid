@@ -459,6 +459,26 @@ def test_delivery_preserves_application_source_beside_submitted_output_artifacts
     assert (tmp_path / "artifacts" / TASK_ID / "result.md" / "result.md").read_text() == "task evidence"
 
 
+def test_artifact_cannot_hide_an_existing_application_source_path(tmp_path):
+    store = _job_store(tmp_path)
+    repo = tmp_path / "repo"
+    (repo / "output").mkdir(parents=True)
+    source = repo / "output" / "result.md"
+    source.write_text("application content")
+    (tmp_path / "workspace" / "output" / "result.md").write_text("replacement")
+    adapter = FakeAdapter(_task())
+    service = CompletionService(workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=JsonlEventStore(tmp_path / "events"), repo_root=repo,
+        artifact_root=tmp_path / "artifacts")
+    result = service.submit(job_id="01J00000000000000000000JOB", token="secret",
+        submission=CompletionSubmission(summary="done", artifacts=("result.md",)))
+    assert not result.accepted
+    assert {error.code for error in result.errors} == {"completion.artifact_source_conflict"}
+    assert source.read_text() == "application content"
+    assert adapter.moved_to is None
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_artifact_delivery_uses_sealed_bytes_when_worker_mutates_live_output(tmp_path):
     from open_tulid.runtime.verifier import DeterministicVerifier
     store = _job_store(tmp_path)

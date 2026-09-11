@@ -361,6 +361,21 @@ class CompletionService:
         submitted_artifacts = normalize_artifacts(submission.artifacts)
         artifact_paths = tuple((Path(output_relative) / artifact.path).as_posix()
                                for artifact in submitted_artifacts)
+        baseline_paths = ({entry.path for entry in frozen.contract.baseline_manifest.entries}
+                          if frozen.contract is not None else set())
+        shadowed = tuple(path for path in artifact_paths
+                         if path in baseline_paths or
+                         (self.repo_root is not None and (self.repo_root / path).exists()))
+        if shadowed:
+            errors = (_error(
+                "completion.artifact_source_conflict",
+                "Submitted artifacts overlap repository source; use separate artifact paths: "
+                + ", ".join(shadowed),
+            ),)
+            return self._reject_completion(
+                job=job, submission_id=submission_id, verification=verification,
+                errors=errors, message=_format_errors(errors),
+            )
         promoted_artifacts = _promotion_plan(
             artifact_root=self.artifact_root,
             output_dir=output_dir,
