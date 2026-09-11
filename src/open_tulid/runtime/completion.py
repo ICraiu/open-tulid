@@ -1884,10 +1884,7 @@ def recover_completion_transactions(
             continue
         if record.task_id is None or record.transition_id is None:
             continue
-        if str(getattr(record.status, "value", record.status)) == "committed":
-            if _settle_recovered_acceptance(service, record):
-                recovered.append(record.journal_id)
-            continue
+        is_committed = str(getattr(record.status, "value", record.status)) == "committed"
         expected_to_state = _expected_to_state(record)
         if not expected_to_state:
             continue
@@ -1905,6 +1902,24 @@ def recover_completion_transactions(
         # An intervening user change anywhere in the intended change set must
         # stop recovery with the journal left prepared, never overwritten.
         if _recovery_has_conflict(service, record):
+            continue
+        if is_committed:
+            # The journal/job crash window does not authorize replaying a
+            # completed delivery or accepting a surface that has since drifted.
+            identity_effects = {"create_task", "move_task", "promote_artifact",
+                                "promote_changed_file", "delete_changed_file",
+                                "commit_repo_changes"}
+            if any(effect.get("type") in identity_effects
+                   and not _recovery_effect_applied(service, record, effect)
+                   for effect in record.effects):
+                continue
+            final = service._validate_final_state(
+                record.task_id, expected_to_state, repo_root=service.repo_root,
+                candidate=candidate, output_relative=record.context.get("output_relative"),
+                artifact_paths=record.context.get("artifact_paths"),
+            )
+            if final.accepted and _settle_recovered_acceptance(service, record):
+                recovered.append(record.journal_id)
             continue
         applying_ok = True
         for effect in record.effects:

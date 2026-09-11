@@ -157,6 +157,48 @@ def test_recovery_checks_existing_child_identity_before_any_effect(tmp_path, cha
     assert journals.load("child-crash").status.value == ("prepared" if change else "committed")
 
 
+@pytest.mark.parametrize("drift", ["task", "artifact", "missing_artifact", "sealed_artifact"])
+def test_committed_recovery_rechecks_delivery_before_accepting_job(tmp_path, drift):
+    store = _job_store(tmp_path)
+    job_id = "01J00000000000000000000JOB"
+    store.update_status(job_id, ExecutionJobStatus.COMPLETION_SUBMITTED)
+    adapter = FakeAdapter(_task())
+    adapter.move_task(TASK_ID, "CodeReview")
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "journals")
+    source = tmp_path / "sealed.txt"
+    target = tmp_path / "delivered.txt"
+    source.write_text("accepted artifact")
+    target.write_text("accepted artifact")
+    prepared = journals.prepare(journal_id="committed-crash", project_id="Agent",
+        task_id=TASK_ID, transition_id="code", effects=(
+            {"type": "promote_artifact", "source_path": str(source),
+             "target_path": str(target),
+             "expected_after_sha256": hashlib.sha256(b"accepted artifact").hexdigest()},
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+        ), events=(), context={"job_id": job_id, "expected_previous_state": "Todo",
+            "acceptance_metadata": {"acceptance_transaction_id": "committed-crash"}})
+    journals.commit(prepared.record)
+    if drift == "task":
+        adapter.move_task(TASK_ID, "Todo")
+    elif drift == "artifact":
+        target.write_text("user edit")
+    elif drift == "missing_artifact":
+        target.unlink()
+    else:
+        source.write_text("tampered evidence")
+    service = CompletionService(workflow=_workflow(), adapter=adapter, job_store=store,
+                                event_store=events, journal_store=journals)
+    assert not recover_completion_transactions(service=service, event_store=events,
+                                               journal_store=journals)
+    assert store.get(job_id).job.status == ExecutionJobStatus.COMPLETION_SUBMITTED
+    assert journals.load("committed-crash").status.value == "committed"
+    assert adapter.moved_to == ("Todo" if drift == "task" else "CodeReview")
+    assert (target.read_text() if target.exists() else None) == {
+        "artifact": "user edit", "missing_artifact": None,
+    }.get(drift, "accepted artifact")
+
+
 @dataclass
 class FakeAdapter:
     task: Task
