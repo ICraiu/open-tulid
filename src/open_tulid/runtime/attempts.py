@@ -23,9 +23,12 @@ from open_tulid.domain import ExecutionJob, Task
 SEMANTIC_TASK_REVISION_SCHEMA = "tulid.task-revision/v2"
 ATTEMPT_RECORD_SCHEMA = "tulid.attempt/v1"
 
-# The semantic body sections that carry meaning for task requirements. Board
-# location, current workflow state, generated audit links, and timestamps are
-# deliberately excluded from the revision.
+# The familiar semantic body headings. They are used by prompt/template
+# tooling to describe the canonical task shape; the revision itself is computed
+# from every ``## `` section so a behavior-binding requirement expressed in any
+# other heading (Constraints, Interface, Non-goals, ...) still changes the
+# revision. Board location, current workflow state, generated audit links, and
+# timestamps are deliberately excluded from the revision.
 SEMANTIC_BODY_HEADINGS = ("why", "what", "how", "acceptance")
 
 ATTEMPT_RECORD_METADATA_KEY = "attempt_records"
@@ -236,6 +239,7 @@ def count_consumed_attempts(
     transition_id: str,
     task_revision: str,
     project_id: str | None = None,
+    diagnostics: list[str] | None = None,
 ) -> int:
     """Durable count of worker attempts already consumed for a task revision.
 
@@ -245,9 +249,24 @@ def count_consumed_attempts(
     and transition whose semantic task revision matches ``task_revision``.
 
     It deliberately ignores job creation times and the current runtime session,
-    so a daemon restart cannot renew the total account. Historical frozen work is re-identified without changing saved records.
-    A started legacy job with matching frozen requirements contributes at least
-    one identifiable process; an unstarted pending job contributes nothing.
+    so a daemon restart cannot renew the total account. Historical frozen work
+    is re-identified without changing saved records.
+
+    Conservative historical accounting
+    -----------------
+    A legacy job (created before versioned attempt records or frozen inputs
+    existed) carries no attempt record. The account must never assume zero
+    merely because the modern field is absent:
+
+    - A job still in the ``pending`` state is provably never launched and
+      consumes no worker execution.
+    - Any legacy job that left ``pending`` is provably started. If its frozen
+      inputs (when present) match ``task_revision`` it contributes at least one
+      identifiable process; if no frozen identity exists to map, it is still
+      conservatively accounted with ``max(1, attempts)`` so an unreadable or
+      absent input cannot replenish a consumed budget. Each conservative
+      accounting records an explicit diagnostic naming the job when
+      ``diagnostics`` is supplied.
     """
     total = 0
     for job in jobs:
@@ -274,37 +293,45 @@ def count_consumed_attempts(
             ) == task_revision
         if records:
             total += sum(1 for record in records if record.task_revision == task_revision or same_frozen_work)
-        elif same_frozen_work and str(getattr(job.status, "value", job.status)) != "pending":
-            total += max(1, job.attempts)
+            continue
+        status = str(getattr(job.status, "value", job.status))
+        if status == "pending":
+            # Proven never-launched: no worker process was ever admitted for
+            # this job, so it consumes no worker execution.
+            continue
+        accounted = max(1, int(job.attempts))
+        total += accounted
+        if diagnostics is not None:
+            diagnostics.append(
+                f"Job {job.job_id!r} for task {task_id!r} transition {transition_id!r} "
+                f"has no versioned attempt record and is not pending; "
+                "execution history is ambiguous, so it is conservatively "
+                f"accounted as at least {accounted} worker execution(s) "
+                "against the current revision."
+            )
     return total
 
 
 def _semantic_body_sections(body: str) -> dict[str, str]:
-    """Extract the semantic sections (Why/What/How/Acceptance) from a task body."""
+    """Extract every behavior-binding section from a task body.
+
+    The semantic revision must include every behavior-binding requirement, not
+    only the familiar Why/What/How/Acceptance headings. A requirement may be
+    expressed in any ``## `` section (for example Constraints, Interface,
+    Non-goals, or a project-specific binding heading), so every named section
+    and the leading description contribute to the revision. Editing one of
+    those binding sections therefore creates a new revision; generated history
+    lives outside the body (in metadata, current state, path, audit links) and
+    is excluded by the caller.
+    """
     from open_tulid.vault.task_schema import parse_task_body
     parsed = parse_task_body(body)
     sections: dict[str, str] = {"description": _clean_section(list(parsed.description_lines))}
-    current: str | None = None
-    buffer: list[str] = []
-    for raw in body.splitlines():
-        stripped = raw.strip()
-        if stripped.startswith("## "):
-            if current is not None:
-                sections[current] = _clean_section(buffer)
-            name = stripped[3:].strip().lower()
-            current = name if name in SEMANTIC_BODY_HEADINGS else None
-            buffer = []
+    for section in parsed.sections:
+        name = section.name.strip().lower()
+        if not name:
             continue
-        if stripped.startswith("# "):
-            if current is not None:
-                sections[current] = _clean_section(buffer)
-            current = None
-            buffer = []
-            continue
-        if current is not None:
-            buffer.append(stripped)
-    if current is not None:
-        sections[current] = _clean_section(buffer)
+        sections[name] = _clean_section(list(section.content))
     return sections
 
 
