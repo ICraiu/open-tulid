@@ -21,7 +21,8 @@ from .planning_inputs import load_planning_inputs
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
-from open_tulid.vault.task_schema import validate_task_structure
+from open_tulid.vault.task_schema import validate_task_structure, validate_task_schema
+from .task_contracts import task_uses_global_contract
 
 from .verifier import (
     ArtifactSubmission,
@@ -407,6 +408,7 @@ class CompletionService:
             artifacts=submitted_artifacts,
             parent_id=job.task_id,
             existing_task_ids=existing_task_ids,
+            workflow=self.workflow,
             promoted_artifact_links={
                 (artifact.type, artifact.path): str(plan["link"])
                 for artifact, plan in zip(submitted_artifacts, promoted_artifacts)
@@ -1621,6 +1623,7 @@ def _derived_task_plan(
     parent_id: str,
     existing_task_ids: tuple[str, ...] = (),
     promoted_artifact_links: Mapping[tuple[str, str], str] | None = None,
+    workflow: WorkflowDefinition | None = None,
 ) -> tuple[tuple[Mapping[str, object], ...], tuple[DomainError, ...]]:
     if transition.derives is None:
         return (), ()
@@ -1702,7 +1705,11 @@ def _derived_task_plan(
             parent_id=parent_id,
             body=body,
         )
+        if workflow is not None and task_uses_global_contract(task, workflow):
+            errors.extend(validate_task_schema(body, location=_path))
         planned.append({"task": task, "link": f"{task_id}-{_slugify(title)}"})
+    if errors:
+        return (), tuple(errors)
     return tuple(planned), tuple(errors)
 
 

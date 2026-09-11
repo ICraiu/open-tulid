@@ -1277,6 +1277,34 @@ def _derived_service(tmp_path: Path):
     return service, adapter, events
 
 
+@pytest.mark.parametrize("defect", ["missing_sections", "task_command_selector"])
+def test_new_implementation_batch_validates_schema_before_any_promotion(tmp_path, defect):
+    from dataclasses import replace
+    service, adapter, events = _derived_service(tmp_path)
+    service.workflow = replace(service.workflow, transitions={
+        **dict(service.workflow.transitions),
+        "InspectChunk": TransitionDefinition(id="InspectChunk", task_type="chunk", from_state="CodeReview",
+            to_state="Done", worker="reviewer", review=True, requires=RequirementDefinition(), transaction=None),
+    })
+    service.artifact_root = tmp_path / "promoted-artifacts"
+    output = tmp_path / "workspace/output"
+    valid = "# Deliver behavior\n\nImplement the agreed API.\n\n## Why\nClients need it.\n\n## What\nExpose the behavior.\n\n## How\nUse the existing service.\n\n## Acceptance\n- The agreed behavior works.\n"
+    invalid = "# Missing details\n\nImplement something.\n" if defect == "missing_sections" else valid + "accepts: [custom_command]\n"
+    (output / "valid.md").write_text("---\nlocal_id: valid\n---\n" + valid)
+    (output / "invalid.md").write_text("---\nlocal_id: invalid\n---\n" + invalid)
+    result = service.submit(job_id="01J00000000000000000000JOB", token="secret",
+        submission=CompletionSubmission(summary="planned", artifacts=(
+            ArtifactSubmission(type="child_task", path="valid.md"),
+            ArtifactSubmission(type="child_task", path="invalid.md"),
+        )))
+    assert not result.accepted
+    expected = "task.section_missing" if defect == "missing_sections" else "task.acceptance_run_forbidden"
+    assert expected in {error.code for error in result.errors}
+    assert adapter.moved_to is None
+    assert not service.artifact_root.exists()
+    assert "TaskDerived" not in {event.event_type for event in events.iter_events()}
+
+
 def test_completion_rejects_derived_task_with_self_dependency(tmp_path: Path):
     service, adapter, events = _derived_service(tmp_path)
     output = tmp_path / "workspace" / "output"
