@@ -78,6 +78,45 @@ def test_snapshot_rejects_symlinks_instead_of_sealing_mutable_external_bytes(tmp
     assert not (tmp_path / "workspace").exists()
 
 
+@pytest.mark.parametrize("kind", ["fifo", "socket", "unreadable_directory"])
+def test_snapshot_rejects_unsupported_or_unreadable_source(tmp_path, monkeypatch, kind):
+    import os
+    import socket
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    from open_tulid.runtime.workspaces import _copy_repo
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    entry = repo / "unsealable"
+    handle = None
+    if kind == "fifo":
+        os.mkfifo(entry)
+    elif kind == "socket":
+        handle = socket.socket(socket.AF_UNIX)
+        handle.bind(str(entry))
+    else:
+        def failed_walk(root, *, onerror):
+            onerror(PermissionError(f"Cannot read directory: {entry}"))
+            return iter(())
+        monkeypatch.setattr("open_tulid.runtime.repository_facts.os.walk", failed_walk)
+    try:
+        baseline = capture_repository_snapshot(repo)
+        assert not baseline.accepted
+        assert baseline.errors[0].code == "repository.scan_failed"
+        assert str(entry) in baseline.errors[0].message
+        candidate = capture_candidate(workspace=repo, storage_root=tmp_path / "seals",
+                                      candidate_id="unsupported", baseline=None)
+        assert not candidate.accepted
+        assert candidate.errors[0].code == "candidate.capture_failed"
+        assert not (tmp_path / "seals").exists()
+        with pytest.raises(OSError):
+            _copy_repo(repo, tmp_path / "workspace")
+        assert not (tmp_path / "workspace").exists()
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 def test_candidate_never_replaces_existing_evidence(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

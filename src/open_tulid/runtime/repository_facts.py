@@ -243,7 +243,10 @@ def _resolve_repository_root(root: Path) -> Path:
 
 
 def _repository_files(root: Path) -> Iterator[Path]:
-    for current, directory_names, file_names in os.walk(root):
+    def scan_failed(error: OSError) -> None:
+        raise error
+
+    for current, directory_names, file_names in os.walk(root, onerror=scan_failed):
         directory_names[:] = sorted(
             name
             for name in directory_names
@@ -257,8 +260,9 @@ def _repository_files(root: Path) -> Iterator[Path]:
             path = current_path / file_name
             if path.is_symlink():
                 raise OSError(f"Source symlink requires explicit snapshot support: {path}")
-            if path.is_file():
-                yield path
+            if not path.is_file():
+                raise OSError(f"Unsupported source filesystem entry (expected a regular file): {path}")
+            yield path
 
 
 def _file_sha256(path: Path) -> str:
