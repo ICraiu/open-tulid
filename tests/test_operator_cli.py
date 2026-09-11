@@ -720,11 +720,10 @@ def test_runtime_stop_waits_for_scheduler_before_proxy_decision(tmp_path: Path, 
 
 def test_runtime_stop_refuses_to_claim_success_when_scheduler_does_not_exit(tmp_path: Path, monkeypatch):
     _write_config(tmp_path)
-    state_path = tmp_path / CONFIG_DIRNAME / "runtime" / "Agent.json"
-    state_path.parent.mkdir()
-    state_path.write_text('{"scheduler_pid": 4321, "project": "Agent"}', encoding="utf-8")
+    state_path = _write_scheduler_state(tmp_path, "Agent", 4321)
     (tmp_path / CONFIG_DIRNAME / "model-proxy-runtime.json").write_text('{"proxy_pid": 9876}', encoding="utf-8")
     monkeypatch.setattr("open_tulid.cli.main._pid_is_running", lambda value: value in {4321, 9876})
+    _patch_start_time(monkeypatch)
     monkeypatch.setattr("open_tulid.cli.main._wait_for_pid_exit", lambda pid: False)
     monkeypatch.setattr("open_tulid.cli.main.os.kill", lambda pid, sig: None)
 
