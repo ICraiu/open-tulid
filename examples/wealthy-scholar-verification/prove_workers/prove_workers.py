@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -181,7 +182,7 @@ def copy_tracker(source_vault: Path, dest: Path) -> None:
 # --------------------------------------------------------------------------- ledger
 
 class Ledger:
-    """Append-only truth for one isolated real-worker experiment."""
+    """Cumulative evidence for one isolated experiment; snapshots replace atomically."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -239,8 +240,8 @@ class Ledger:
         self.root.mkdir(parents=True, exist_ok=True)
         json_path = self.root / f"run-ledger{suffix}.json"
         md_path = self.root / f"run-ledger{suffix}.md"
-        json_path.write_text(json.dumps(self.record, indent=2))
-        md_path.write_text(self.to_markdown())
+        _atomic_write(json_path, json.dumps(self.record, indent=2))
+        _atomic_write(md_path, self.to_markdown())
         return {"json": str(json_path), "markdown": str(md_path)}
 
     def to_markdown(self) -> str:
@@ -283,6 +284,26 @@ class Ledger:
 DEFAULT_PHASES = ["planning", "implementation", "review", "delivery"]
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def run_chain(ledger: Ledger, task_specs, runner, targets: dict, retry_budget: dict,
               phases=DEFAULT_PHASES, max_retries=2):
     """Drive dependent tasks through the declared phases via `runner`.
@@ -292,24 +313,53 @@ def run_chain(ledger: Ledger, task_specs, runner, targets: dict, retry_budget: d
     duration_seconds, manual bool. A task advances only when its terminal
     (delivery) status is "delivered"; otherwise it retries within budget.
     """
+    if not phases:
+        raise ValueError("A chain requires at least one phase")
+    delivered = set()
     for spec in task_specs:
         task_id = ledger.start_task(spec)
-        for retry_index in range(max_retries + 1):
+        missing = set(spec.get("depends", ())) - delivered
+        if missing:
+            ledger.record_attempt(task_id, {
+                "phase": "admission", "status": "blocked", "duration_seconds": 0.0,
+                "evidence": [f"Dependencies lack delivery: {sorted(missing, key=str)}"],
+            })
+            ledger.write()
+            continue
+        retries = retry_budget.get(spec["id"], max_retries)
+        if not isinstance(retries, int) or retries < 0:
+            raise ValueError("Retry budget must be a nonnegative integer")
+        ledger.write()
+        for retry_index in range(retries + 1):
             outcomes = []
             for phase in phases:
-                result = runner(dict(spec), phase, targets, retry_index)
+                try:
+                    result = runner(dict(spec), phase, targets, retry_index)
+                except BaseException as exc:
+                    ledger.record_attempt(task_id, {
+                        "phase": phase, "status": "interrupted", "retry_index": retry_index,
+                        "evidence": [f"Runner interrupted: {type(exc).__name__}"],
+                        "duration_seconds": 0.0,
+                    })
+                    ledger.write()
+                    raise
                 result.setdefault("retry_index", retry_index)
                 result["phase"] = phase
                 outcomes.append(result)
                 ledger.record_attempt(task_id, result)
+                ledger.write()
+                if result.get("status") not in {"ok", "delivered"}:
+                    break
             terminal = outcomes[-1]
-            if terminal.get("status") == "delivered":
+            if len(outcomes) == len(phases) and terminal.get("status") == "delivered":
+                delivered.add(spec["id"])
                 break
-            if retry_index < max_retries:
+            if retry_index < retries:
                 ledger.record_attempt(task_id, {
                     "phase": "retry", "status": "retry", "retry_index": retry_index,
                     "evidence": ["retry budget: continuing within retry budget"],
                     "duration_seconds": 0.0, "manual": False})
+                ledger.write()
     return ledger
 
 

@@ -159,7 +159,7 @@ class LedgerTests(unittest.TestCase):
             statuses = [a["status"] for e in record["chain"]
                         for a in e["attempts"] if e["task"]["id"] == 1]
             self.assertIn("failure", statuses)
-            self.assertIn("blocked", statuses)
+            self.assertNotIn("blocked", statuses)
 
             self.assertTrue(Path(outputs["markdown"]).is_file())
             self.assertIn("shield violations: 0", Path(outputs["markdown"]).read_text())
@@ -169,6 +169,55 @@ class LedgerTests(unittest.TestCase):
             delivered = [a["phase"] for e in record["chain"]
                          for a in e["attempts"] if a.get("status") == "delivered"]
             self.assertEqual(len([d for d in delivered if d == "delivery"]), 3)
+
+
+def test_failed_phase_stops_review_delivery_and_dependents(tmp_path):
+    ledger = pw.Ledger(tmp_path)
+    calls = []
+
+    def runner(task, phase, targets, retry_index):
+        calls.append((task["id"], phase, retry_index))
+        return {"status": "failure" if phase == "implementation" else "ok"}
+
+    pw.run_chain(ledger, [{"id": 1}, {"id": 2, "depends": [1]}], runner, {}, {1: 0})
+    assert calls == [(1, "planning", 0), (1, "implementation", 0)]
+    restored = pw.Ledger(tmp_path).record
+    assert restored["chain"][1]["attempts"][0]["status"] == "blocked"
+    assert restored["summary"]["completed"] == 0
+    assert restored["summary"]["failed"] == 1
+
+
+def test_interrupted_runner_preserves_completed_phases(tmp_path):
+    import pytest
+    ledger = pw.Ledger(tmp_path)
+
+    def runner(task, phase, targets, retry_index):
+        if phase == "implementation":
+            raise KeyboardInterrupt
+        return {"status": "ok"}
+
+    with pytest.raises(KeyboardInterrupt):
+        pw.run_chain(ledger, [{"id": 1}], runner, {}, {})
+    attempts = pw.Ledger(tmp_path).record["chain"][0]["attempts"]
+    assert [(a["phase"], a["status"]) for a in attempts] == [
+        ("planning", "ok"), ("implementation", "interrupted")]
+
+
+def test_failed_snapshot_replace_preserves_previous_ledger(tmp_path, monkeypatch):
+    import pytest
+    ledger = pw.Ledger(tmp_path)
+    ledger.note("retained")
+    ledger.write()
+    ledger.note("not committed")
+
+    def fail_replace(*args):
+        raise OSError("injected disk failure")
+
+    monkeypatch.setattr(pw.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk failure"):
+        ledger.write()
+    assert pw.Ledger(tmp_path).record["notes"] == ["retained"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["run-ledger.json", "run-ledger.md"]
 
 
 if __name__ == "__main__":
