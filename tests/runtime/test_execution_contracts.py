@@ -1101,6 +1101,72 @@ def test_prompt_lint_rejects_unresolved_and_missing_reading_paths(tmp_path):
     assert "prompt.unresolved_reading_path" in codes
 
 
+def test_prompt_lint_rejects_saved_byte_hash_mismatch_for_implementation_route(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    section = PromptSection(
+        "assigned_task", "Assigned Task", task.body,
+        "execution_contract", "generated_contract", "Assigned outcome.",
+    )
+    compiled = _manual_compiled((section,), compiled_contract.contract)
+    # A stored packet whose manifest declares a different hash than its own
+    # bytes must be flagged as a saved-byte/hash mismatch.
+    wrong_manifest = replace(
+        compiled.manifest,
+        packet_sha256="0" * 64,
+    )
+    corrupted = type(compiled)(compiled.text, compiled.sections, wrong_manifest)
+
+    issues = lint_compiled_prompt(corrupted, contract=compiled_contract.contract)
+    codes = {issue.code for issue in issues}
+    assert "prompt.packet_hash_mismatch" in codes
+
+
+def test_prompt_lint_rejects_mismatched_context_excerpt_hash_for_implementation_route(tmp_path):
+    from open_tulid.runtime.execution_contracts import FrozenContextExcerpt
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled_contract = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=_repo(tmp_path),
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled_contract.contract is not None
+    excerpt_text = "# Required Detail\n\nbinding reference text "
+    excerpt = FrozenContextExcerpt(
+        artifact="artifacts/task-1/spec.md",
+        heading="Required Detail",
+        reason="Defines required behavior.",
+        text=excerpt_text,
+        sha256="0" * 64,  # deliberate mismatch
+        context_file_path="context/spec.md",
+    )
+    contract = replace(compiled_contract.contract, context_excerpts=(excerpt,))
+    compiled = _manual_compiled((
+        PromptSection(
+            "assigned_task", "Assigned Task", task.body,
+            "execution_contract", "generated_contract", "Assigned outcome.",
+        ),
+        PromptSection(
+            "completion_submission", "Completion Submission",
+            "```sh\ncurl -sS -X POST\n```", "runtime", "completion_api", "Completion mechanism.",
+        ),
+    ), contract)
+
+    issues = lint_compiled_prompt(compiled, contract=contract)
+    assert any(issue.code == "prompt.context_hash_mismatch" for issue in issues)
+
+
 def test_prompt_manifest_optional_omissions_round_trip(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()

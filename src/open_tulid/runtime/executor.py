@@ -125,6 +125,7 @@ def render_execution_prompt(
     execution_contract: ExecutionContract | None = None,
     review_evidence: ReviewEvidence | None = None,
     project_root: Path | None = None,
+    repository_facts: object | None = None,
 ) -> PromptRenderResult:
     """Render the exact model prompt for an execution job without running it."""
     if execution_contract is not None:
@@ -215,6 +216,7 @@ def render_execution_prompt(
         transition,
         context_task,
         parent_tasks,
+        repository_facts,
     )
     if planning_inputs:
         prompt_text = f"{prompt_text}\n\n{planning_inputs}"
@@ -2094,20 +2096,32 @@ def _planning_inputs_text(
     transition: TransitionDefinition,
     task: Task,
     parent_tasks: tuple[Task, ...],
+    repository_facts: object | None = None,
 ) -> str:
     """Render repository facts and the unfinished task set for planning workers.
 
-    Only specification and breakdown transitions receive these inputs. Both are
-    derived from the live adapter/project root at render time, which is already
-    how the legacy planning prompt resolves its linked context.
+    Only specification and breakdown transitions receive these inputs. When a
+    resolved source repository has already been captured at admission
+    (``repository_facts``), that frozen snapshot is used so the planning facts
+    describe the same source baseline supplied at launch. Otherwise the facts
+    fall back to the live adapter/project root, preserving the historical
+    legacy-planning interpretation.
     """
     from open_tulid.runtime.planning_input import build_planning_inputs, requires_planning_inputs
 
     if project_root is None or not requires_planning_inputs(transition):
         return ""
-    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    from open_tulid.runtime.repository_facts import RepositorySnapshotResult
 
-    repository = capture_repository_snapshot(project_root)
+    repository = (
+        repository_facts
+        if isinstance(repository_facts, RepositorySnapshotResult)
+        else None
+    )
+    if repository is None:
+        from open_tulid.runtime.repository_facts import capture_repository_snapshot
+
+        repository = capture_repository_snapshot(project_root)
     project = adapter.load_project()
     return build_planning_inputs(
         repository=repository,

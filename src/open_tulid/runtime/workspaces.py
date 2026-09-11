@@ -78,16 +78,33 @@ class WorkspacePreparer:
                         message=f"Repository root does not exist: {self.repo_root}",
                         location=str(self.repo_root),
                     ))
-                selection = (
-                    frozen.contract.repository_facts.source_selection
-                    if frozen.contract is not None
-                    else discover_source_selection(self.repo_root)
+                planning = load_planning_inputs(job) if planning is None else planning
+                planning_baseline = (
+                    planning.repository_baseline if planning is not None else None
                 )
+                if planning_baseline is not None and planning_baseline.source_selection is not None:
+                    selection = planning_baseline.source_selection
+                else:
+                    selection = (
+                        frozen.contract.repository_facts.source_selection
+                        if frozen.contract is not None
+                        else discover_source_selection(self.repo_root)
+                    )
                 _copy_repo(self.repo_root, workspace, selection)
-            if frozen.contract is not None and not preserve_workspace:
+            if not preserve_workspace and self.repo_root is not None:
+                captured_selection = (
+                    planning.repository_baseline.source_selection
+                    if planning is not None and planning.repository_baseline is not None
+                    and planning.repository_baseline.source_selection is not None
+                    else (
+                        frozen.contract.repository_facts.source_selection
+                        if frozen.contract is not None
+                        else discover_source_selection(self.repo_root)
+                    )
+                )
                 copied = capture_repository_snapshot(
                     workspace,
-                    selection=frozen.contract.repository_facts.source_selection,
+                    selection=captured_selection,
                 )
                 if not copied.accepted or copied.snapshot is None:
                     return WorkspacePrepareResult(error=(
@@ -99,8 +116,26 @@ class WorkspacePreparer:
                             location=str(workspace),
                         )
                     ))
+                planning_baseline = (
+                    planning.repository_baseline if planning is not None else None
+                )
                 if (
-                    copied.snapshot.baseline.sha256
+                    planning_baseline is not None
+                    and copied.snapshot.baseline.sha256
+                    != planning_baseline.baseline_manifest_sha256
+                ):
+                    return WorkspacePrepareResult(error=DomainError(
+                        code="workspace.baseline_mismatch",
+                        message=(
+                            "Repository contents changed after this planning job "
+                            "was admitted; the frozen planning baseline no longer "
+                            "matches the current repository."
+                        ),
+                        location=str(workspace),
+                    ))
+                if (
+                    frozen.contract is not None
+                    and copied.snapshot.baseline.sha256
                     != frozen.contract.baseline_manifest.sha256
                 ):
                     return WorkspacePrepareResult(error=DomainError(

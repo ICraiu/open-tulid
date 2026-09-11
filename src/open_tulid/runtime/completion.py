@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -77,6 +79,29 @@ class _EffectApplyResult:
     accepted: bool
     message: str = ""
     errors: tuple[DomainError, ...] = ()
+
+
+@contextlib.contextmanager
+def _publication_lock(root: object):
+    """Serialize derived-task batch publication within one shared event store.
+
+    Two concurrent ``submit`` calls that derive children both read the same
+    tracker snapshot to choose the next numeric task IDs. Reading and applying
+    must be atomic, otherwise two batches can allocate overlapping IDs or leak a
+    cross-parent link. This lock is keyed on the shared event-store root so
+    sibling batches in the same project serialize at the allocation boundary,
+    while unrelated batches in other projects remain independent.
+    """
+    from pathlib import Path as _Path
+
+    lock_path = _Path(str(root)) / "derived-batch.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class CompletionService:
@@ -422,193 +447,194 @@ class CompletionService:
                 errors=target_check.errors,
                 message=_format_errors(target_check.errors),
             )
-        existing_task_ids, existing_task_errors = self._existing_task_ids(job.task_id) if transition.derives is not None else ((), ())
-        if existing_task_errors:
-            return self._reject_completion(
-                job=job,
-                submission_id=submission_id,
-                verification=verification,
-                errors=existing_task_errors,
-                message=_format_errors(existing_task_errors),
-            )
-        derived_tasks, derivation_errors = _derived_task_plan(
-            output_dir=output_dir,
-            transition=transition,
-            artifacts=submitted_artifacts,
-            parent_id=job.task_id,
-            existing_task_ids=existing_task_ids,
-            workflow=self.workflow,
-            promoted_artifact_links={
-                (artifact.type, artifact.path): str(plan["link"])
-                for artifact, plan in zip(submitted_artifacts, promoted_artifacts)
-            },
-        )
-        if derivation_errors:
-            return self._reject_completion(
-                job=job,
-                submission_id=submission_id,
-                verification=verification,
-                errors=derivation_errors,
-                message=_format_errors(derivation_errors),
-            )
-        effective_to_state = transition.to_state
-        if (
-            derived_tasks
-            and transition.derives is not None
-            and transition.derives.parent_to_if_derived is not None
-        ):
-            effective_to_state = transition.derives.parent_to_if_derived
-        events = (
-            build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="completion-verifier"),
-                event_type=EventType.TransitionAccepted,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
-                submission_id=submission_id,
-                data={"from_state": transition.from_state, "to_state": effective_to_state},
-            ),
-            build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="task-manager-runtime"),
-                event_type=EventType.TaskMoved,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
-                submission_id=submission_id,
-                data={
-                    "from_state": transition.from_state,
-                    "to_state": effective_to_state,
-                    "reason": "completion_accepted",
+        with _publication_lock(self.event_store.root):
+            existing_task_ids, existing_task_errors = self._existing_task_ids(job.task_id) if transition.derives is not None else ((), ())
+            if existing_task_errors:
+                return self._reject_completion(
+                    job=job,
+                    submission_id=submission_id,
+                    verification=verification,
+                    errors=existing_task_errors,
+                    message=_format_errors(existing_task_errors),
+                )
+            derived_tasks, derivation_errors = _derived_task_plan(
+                output_dir=output_dir,
+                transition=transition,
+                artifacts=submitted_artifacts,
+                parent_id=job.task_id,
+                existing_task_ids=existing_task_ids,
+                workflow=self.workflow,
+                promoted_artifact_links={
+                    (artifact.type, artifact.path): str(plan["link"])
+                    for artifact, plan in zip(submitted_artifacts, promoted_artifacts)
                 },
-            ),
-            *(
+            )
+            if derivation_errors:
+                return self._reject_completion(
+                    job=job,
+                    submission_id=submission_id,
+                    verification=verification,
+                    errors=derivation_errors,
+                    message=_format_errors(derivation_errors),
+                )
+            effective_to_state = transition.to_state
+            if (
+                derived_tasks
+                and transition.derives is not None
+                and transition.derives.parent_to_if_derived is not None
+            ):
+                effective_to_state = transition.derives.parent_to_if_derived
+            events = (
+                build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="system", id="completion-verifier"),
+                    event_type=EventType.TransitionAccepted,
+                    correlation_id=job.job_id,
+                    task_id=job.task_id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    submission_id=submission_id,
+                    data={"from_state": transition.from_state, "to_state": effective_to_state},
+                ),
                 build_event(
                     project_id=job.project_id,
                     actor=EventActor(type="system", id="task-manager-runtime"),
-                    event_type=EventType.ArtifactWritten,
+                    event_type=EventType.TaskMoved,
                     correlation_id=job.job_id,
                     task_id=job.task_id,
                     job_id=job.job_id,
                     transition_id=job.transition_id,
                     submission_id=submission_id,
                     data={
-                        "artifact_type": item["artifact_type"],
-                        "source_path": item["source_path"],
-                        "target_path": item["target_path"],
+                        "from_state": transition.from_state,
+                        "to_state": effective_to_state,
+                        "reason": "completion_accepted",
                     },
-                )
-                for item in promoted_artifacts
-            ),
-            *(
+                ),
+                *(
+                    build_event(
+                        project_id=job.project_id,
+                        actor=EventActor(type="system", id="task-manager-runtime"),
+                        event_type=EventType.ArtifactWritten,
+                        correlation_id=job.job_id,
+                        task_id=job.task_id,
+                        job_id=job.job_id,
+                        transition_id=job.transition_id,
+                        submission_id=submission_id,
+                        data={
+                            "artifact_type": item["artifact_type"],
+                            "source_path": item["source_path"],
+                            "target_path": item["target_path"],
+                        },
+                    )
+                    for item in promoted_artifacts
+                ),
+                *(
+                    build_event(
+                        project_id=job.project_id,
+                        actor=EventActor(type="system", id="task-manager-runtime"),
+                        event_type=EventType.TaskDerived,
+                        correlation_id=job.job_id,
+                        task_id=item["task"].id,
+                        job_id=job.job_id,
+                        transition_id=job.transition_id,
+                        submission_id=submission_id,
+                        data={
+                            "parent_id": job.task_id,
+                            "state": item["task"].current_state,
+                            "task_type": item["task"].task_type,
+                        },
+                    )
+                    for item in derived_tasks
+                ),
                 build_event(
                     project_id=job.project_id,
                     actor=EventActor(type="system", id="task-manager-runtime"),
-                    event_type=EventType.TaskDerived,
+                    event_type=EventType.ReviewRequested,
                     correlation_id=job.job_id,
-                    task_id=item["task"].id,
+                    task_id=job.task_id,
                     job_id=job.job_id,
                     transition_id=job.transition_id,
                     submission_id=submission_id,
-                    data={
+                    data={"summary": submission.summary},
+                ),
+                build_event(
+                    project_id=job.project_id,
+                    actor=EventActor(type="system", id="task-manager-runtime"),
+                    event_type=EventType.ExecutionFinished,
+                    correlation_id=job.job_id,
+                    task_id=job.task_id,
+                    job_id=job.job_id,
+                    transition_id=job.transition_id,
+                    submission_id=submission_id,
+                    data={"accepted": True},
+                ),
+            )
+            effects = (
+                *(dict(item) for item in promoted_files),
+                *((commit_effect,) if commit_effect is not None else ()),
+                *(
+                    {
+                        **dict(item),
+                        "type": "promote_artifact",
+                        "task_id": job.task_id,
+                        "source_path": item["source_path"],
+                        "target_path": item["target_path"],
+                        "link": item["link"],
+                    }
+                    for item in promoted_artifacts
+                ),
+                *(
+                    {
+                        "type": "create_task",
+                        "task": _task_to_dict(item["task"]),
+                    }
+                    for item in derived_tasks
+                ),
+                *(
+                    ({
+                        "type": "link_derived_tasks",
                         "parent_id": job.task_id,
-                        "state": item["task"].current_state,
-                        "task_type": item["task"].task_type,
+                        "child_links": tuple(item["link"] for item in derived_tasks),
+                    },) if derived_tasks else ()
+                ),
+                {"type": "move_task", "task_id": job.task_id, "to_state": effective_to_state},
+            )
+            transaction = self._apply_acceptance(
+                project_id=job.project_id,
+                task_id=job.task_id,
+                transition_id=job.transition_id,
+                expected_to_state=effective_to_state,
+                expected_previous_state=transition.from_state,
+                effects=effects,
+                events=events,
+                journal_id=f"{job.job_id}-{submission_id}",
+                candidate=candidate,
+                commit_effect=commit_effect,
+                artifact_destinations=tuple(str(item["target_path"]) for item in promoted_artifacts),
+                output_relative=output_relative,
+                artifact_paths=artifact_paths,
+                acceptance_context={
+                    "job_id": job.job_id,
+                    "task_revision": _acceptance_task_revision(job, frozen.contract, self.adapter),
+                    "verification_accepted": verification.accepted,
+                    "verification_report": verification.report.to_dict() if verification.report else None,
+                    "submission_id": submission_id,
+                    "output_relative": output_relative,
+                    "artifact_paths": artifact_paths,
+                    "acceptance_metadata": {
+                        "completed_submission_id": submission_id,
+                        "promoted_artifacts": tuple(promoted_artifacts),
+                        "promoted_files": tuple(promoted_files),
+                        "acceptance_transaction_id": f"{job.job_id}-{submission_id}",
+                        "acceptance_repository_identity": repository_identity(self.repo_root),
+                        **({"review_result": dict(submission.review_result)} if submission.review_result is not None else {}),
+                        "completion_submissions": _record_submission(
+                            job.metadata, submission_id, accepted=True, feedback=(),
+                        ),
                     },
-                )
-                for item in derived_tasks
-            ),
-            build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="task-manager-runtime"),
-                event_type=EventType.ReviewRequested,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
-                submission_id=submission_id,
-                data={"summary": submission.summary},
-            ),
-            build_event(
-                project_id=job.project_id,
-                actor=EventActor(type="system", id="task-manager-runtime"),
-                event_type=EventType.ExecutionFinished,
-                correlation_id=job.job_id,
-                task_id=job.task_id,
-                job_id=job.job_id,
-                transition_id=job.transition_id,
-                submission_id=submission_id,
-                data={"accepted": True},
-            ),
-        )
-        effects = (
-            *(dict(item) for item in promoted_files),
-            *((commit_effect,) if commit_effect is not None else ()),
-            *(
-                {
-                    **dict(item),
-                    "type": "promote_artifact",
-                    "task_id": job.task_id,
-                    "source_path": item["source_path"],
-                    "target_path": item["target_path"],
-                    "link": item["link"],
-                }
-                for item in promoted_artifacts
-            ),
-            *(
-                {
-                    "type": "create_task",
-                    "task": _task_to_dict(item["task"]),
-                }
-                for item in derived_tasks
-            ),
-            *(
-                ({
-                    "type": "link_derived_tasks",
-                    "parent_id": job.task_id,
-                    "child_links": tuple(item["link"] for item in derived_tasks),
-                },) if derived_tasks else ()
-            ),
-            {"type": "move_task", "task_id": job.task_id, "to_state": effective_to_state},
-        )
-        transaction = self._apply_acceptance(
-            project_id=job.project_id,
-            task_id=job.task_id,
-            transition_id=job.transition_id,
-            expected_to_state=effective_to_state,
-            expected_previous_state=transition.from_state,
-            effects=effects,
-            events=events,
-            journal_id=f"{job.job_id}-{submission_id}",
-            candidate=candidate,
-            commit_effect=commit_effect,
-            artifact_destinations=tuple(str(item["target_path"]) for item in promoted_artifacts),
-            output_relative=output_relative,
-            artifact_paths=artifact_paths,
-            acceptance_context={
-                "job_id": job.job_id,
-                "task_revision": _acceptance_task_revision(job, frozen.contract, self.adapter),
-                "verification_accepted": verification.accepted,
-                "verification_report": verification.report.to_dict() if verification.report else None,
-                "submission_id": submission_id,
-                "output_relative": output_relative,
-                "artifact_paths": artifact_paths,
-                "acceptance_metadata": {
-                    "completed_submission_id": submission_id,
-                    "promoted_artifacts": tuple(promoted_artifacts),
-                    "promoted_files": tuple(promoted_files),
-                    "acceptance_transaction_id": f"{job.job_id}-{submission_id}",
-                    "acceptance_repository_identity": repository_identity(self.repo_root),
-                    **({"review_result": dict(submission.review_result)} if submission.review_result is not None else {}),
-                    "completion_submissions": _record_submission(
-                        job.metadata, submission_id, accepted=True, feedback=(),
-                    ),
                 },
-            },
-        )
+            )
         if not transaction.accepted:
             self.event_store.append(build_event(
                 project_id=job.project_id,
@@ -1880,8 +1906,18 @@ def _derived_task_plan(
     if errors:
         return (), tuple(errors)
 
+    existing_id_set = set(existing_task_ids)
     by_local_id = {item[0]: item for item in parsed}
     for local_id, _title, dependencies, _body, _path, _link in parsed:
+        if local_id in existing_id_set:
+            # A local_id colliding with a persisted task would fabricate a second
+            # owner of existing work. Stop publication with a precise blocker.
+            errors.append(_error(
+                "task.derived_existing_prerequisite_collision",
+                f"Derived local_id {local_id!r} collides with an existing task; "
+                "existing unfinished work must be reused, not duplicated.",
+                local_id,
+            ))
         for dep in dependencies:
             if dep == local_id:
                 errors.append(_error(
@@ -1890,11 +1926,27 @@ def _derived_task_plan(
                     local_id,
                 ))
             elif dep not in by_local_id:
-                errors.append(_error(
-                    "task.derived_unknown_dependency",
-                    f"Derived task {local_id!r} references unknown local dependency: {dep}",
-                    local_id,
-                ))
+                if dep in existing_id_set:
+                    # The dependency names a persisted unfinished task, which the
+                    # current derived-task format cannot express: local batch IDs
+                    # are disjoint from persisted task IDs. Stop publication with
+                    # a precise representation blocker rather than silently
+                    # duplicating the existing work.
+                    errors.append(_error(
+                        "task.derived_existing_prerequisite_unrepresentable",
+                        f"Derived task {local_id!r} depends on existing unfinished "
+                        f"task {dep}, but the derived-task format can only express "
+                        "dependencies on local batch IDs. Represent this prerequisite "
+                        "by a supported persisted-ID reference or account for it "
+                        "without duplicating existing work.",
+                        local_id,
+                    ))
+                else:
+                    errors.append(_error(
+                        "task.derived_unknown_dependency",
+                        f"Derived task {local_id!r} references unknown local dependency: {dep}",
+                        local_id,
+                    ))
     errors.extend(_derived_cycle_errors(tuple(item[0] for item in parsed), by_local_id))
     if errors:
         return (), tuple(errors)

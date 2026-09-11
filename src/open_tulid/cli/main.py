@@ -1443,6 +1443,16 @@ def _render_prompt_preview(
             ),))
             raise typer.Exit(1)
         render_kwargs["review_evidence"] = evidence
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    preview_repo = None
+    try:
+        preview_cfg = _project_config(config, project)
+        preview_repo = getattr(preview_cfg, "repo_root", None)
+    except (AttributeError, TypeError, KeyError):
+        preview_repo = None
+    render_kwargs["repository_facts"] = (
+        capture_repository_snapshot(preview_repo) if preview_repo is not None else None
+    )
     rendered = render_execution_prompt(
         workflow=workflow,
         adapter=adapter,
@@ -1493,6 +1503,19 @@ def lint_prompt(
         job_id=PREVIEW_JOB_ID,
     )
     if rendered.compiled_prompt is None:
+        if rendered.accepted and rendered.context_files:
+            from open_tulid.runtime.planning_inputs import lint_planning_inputs
+            issues = lint_planning_inputs(
+                rendered.text,
+                rendered.context_files,
+                source_task_body="",
+                job_id=PREVIEW_JOB_ID,
+            )
+            if issues:
+                _print_domain_errors(issues)
+                raise typer.Exit(1)
+            typer.echo(f"OK: planning packet of {len(rendered.text)} characters with {len(rendered.context_files)} frozen sources.")
+            return
         typer.echo("No structured prompt manifest is available for this legacy transition.")
         raise typer.Exit(1)
     issues = lint_compiled_prompt(

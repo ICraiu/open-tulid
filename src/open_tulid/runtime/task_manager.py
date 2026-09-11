@@ -360,16 +360,33 @@ class TaskManager:
                 ),))
         if frozen_contract is None:
             from .executor import render_execution_prompt
-            from .planning_inputs import freeze_planning_inputs
+            from .planning_inputs import (
+                freeze_planning_inputs,
+                frozen_repository_baseline_from_snapshot,
+            )
+            from .repository_facts import capture_repository_snapshot
+            # Freeze the resolved source baseline at admission so the planner's
+            # repository facts and the frozen baseline describe the SAME source
+            # that is actually supplied into the workspace at launch. A changed
+            # repository between admission and preparation is then a stale
+            # baseline, never a silently substituted packet.
+            repository_snapshot = (
+                capture_repository_snapshot(self.repo_root)
+                if self.repo_root is not None else None
+            )
             rendered = render_execution_prompt(
                 workflow=self.workflow, adapter=self.adapter, task=task,
                 transition=transition, worker_id=transition.worker,
                 job_id=job_id, completion_endpoint="", project_root=self.project_root,
+                repository_facts=repository_snapshot,
             )
             if not rendered.accepted:
                 return CommandResult(accepted=False, errors=rendered.errors)
             planning_metadata = {"planning_inputs": freeze_planning_inputs(
                 task, transition, rendered.text, rendered.context_files,
+                repository_baseline=frozen_repository_baseline_from_snapshot(
+                    repository_snapshot,
+                ),
             )}
         workspace = command.workspace_root / job_id
         output_path = workspace / "output"
