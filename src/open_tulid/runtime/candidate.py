@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from open_tulid.domain import DomainError
+from open_tulid.runtime.pathops import (
+    copy_regular_nofollow,
+    regular_file_id,
+)
 from open_tulid.runtime.repository_facts import (
     BASELINE_MANIFEST_SCHEMA,
     FileManifestEntry,
@@ -272,11 +275,12 @@ def capture_deliverable_manifest(root: Path, selection: SourceSelection | None =
     entries: list[FileManifestEntry] = []
     for path in iter_deliverable_files(root, selection):
         relative = path.relative_to(root).as_posix()
+        sha256, size, mode = _nofollow_file_id(root, relative)
         entries.append(FileManifestEntry(
             path=relative,
-            sha256=_file_sha256(path),
-            size=path.stat().st_size,
-            mode=path.stat().st_mode & 0o777,
+            sha256=sha256,
+            size=size,
+            mode=mode,
         ))
     ordered = tuple(sorted(entries, key=lambda entry: entry.path))
     payload = {
@@ -306,13 +310,26 @@ def iter_deliverable_files(root: Path, selection: SourceSelection | None = None)
 def _copy_deliverables(source: Path, target: Path, selection: SourceSelection | None = None) -> None:
     # Copy only the deliverable surface; symlinks and unsupported entries raise
     # through the iterator so they fail closed before external bytes are read.
+    #
+    # R3: each copied file is re-opened with O_NOFOLLOW from a O_NOFOLLOW-walked
+    # parent directory fd. A checked regular file (or its parent directory)
+    # swapped to a link pointing outside the source between the scan and the copy
+    # is rejected instead of dereferenced, so external sentinel bytes are never
+    # read into the sealed snapshot.
     if selection is None:
         selection = discover_source_selection(source)
     for path in iter_deliverable_files(source, selection):
-        relative = path.relative_to(source)
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination, follow_symlinks=True)
+        relative = path.relative_to(source).as_posix()
+        copy_regular_nofollow(
+            source_root=source,
+            source_relative=relative,
+            target_root=target,
+            target_relative=relative,
+        )
+
+
+def _nofollow_file_id(root: Path, relative: str) -> tuple[str, int, int]:
+    return regular_file_id(root, relative)
 
 
 def _file_sha256(path: Path) -> str:

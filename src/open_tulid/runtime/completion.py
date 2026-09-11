@@ -18,6 +18,12 @@ from open_tulid.domain import DomainError, EventActor, EventType, ExecutionJobSt
 from open_tulid.runtime.events import JsonlEventStore, build_event, new_ulid, utc_now
 from open_tulid.runtime.execution_contracts import load_job_execution_contract
 from .planning_inputs import load_planning_inputs
+from open_tulid.runtime.pathops import (
+    SourcePathError,
+    copy_regular_nofollow,
+    rmdir_if_empty_nofollow,
+    unlink_regular_nofollow,
+)
 from open_tulid.runtime.jobs import FileExecutionJobStore
 from open_tulid.runtime.transactions import FileTransactionRuntime
 from open_tulid.runtime.events import TransactionJournalStore
@@ -1021,34 +1027,32 @@ class CompletionService:
             return _EffectApplyResult(True)
         if effect_type == "delete_changed_file":
             target_path = Path(str(effect.get("target_path", "")))
-            try:
-                if target_path.exists():
-                    if not target_path.is_file():
-                        return _EffectApplyResult(False, "changed file delete conflict", (_error(
-                            "changed_file.delete_conflict",
-                            f"Cannot delete changed file {target_path}: target is not a file.",
-                            str(target_path),
-                        ),))
-                    target_path.unlink()
-            except OSError as exc:
-                return _EffectApplyResult(False, f"changed file delete failed: {exc}", (_error(
-                    "changed_file.delete_failed",
-                    f"Cannot delete changed file: {exc}",
-                    str(target_path),
-                ),))
+            delete_result = _delete_changed_nofollow(
+                target_path=target_path,
+                repo_root=self.repo_root,
+            )
+            if not delete_result.accepted:
+                return _EffectApplyResult(
+                    False,
+                    delete_result.error.message if delete_result.error is not None else "changed file delete conflict",
+                    tuple(delete_result.errors),
+                )
             return _EffectApplyResult(True)
         if effect_type == "promote_changed_file":
             source_path = Path(str(effect.get("source_path", "")))
             target_path = Path(str(effect.get("target_path", "")))
-            try:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_path, target_path)
-            except OSError as exc:
-                return _EffectApplyResult(False, f"changed file promotion failed: {exc}", (_error(
-                    "changed_file.promotion_failed",
-                    f"Cannot promote changed file: {exc}",
-                    str(target_path),
-                ),))
+            promote_result = _promote_changed_nofollow(
+                source_path=source_path,
+                target_path=target_path,
+                repo_root=self.repo_root,
+                after_mode=effect.get("expected_after_mode"),
+            )
+            if not promote_result.accepted:
+                return _EffectApplyResult(
+                    False,
+                    promote_result.error.message if promote_result.error is not None else "changed file promotion failed",
+                    tuple(promote_result.errors),
+                )
             return _EffectApplyResult(True)
         if effect_type == "commit_repo_changes":
             if self.repo_root is None:
@@ -1379,7 +1383,20 @@ def _candidate_change_plan(
                 "expected_after_mode": change.after_mode,
                 "target_existed": target.exists(),
             })
-    return tuple(planned)
+    # R3: a file/directory transition (or any delete that makes a path writable
+    # again) must run before the promote that replaces it. Emitting every delete
+    # before every promote guarantees the deletes that free a parent path run
+    # first, and an empty leftover directory can be removed/created without
+    # racing a promotion of the same-or-ancestor path.
+    deletes = sorted(
+        (item for item in planned if item.get("type") == "delete_changed_file"),
+        key=lambda item: str(item.get("target_path", "")),
+    )
+    promotes = sorted(
+        (item for item in planned if item.get("type") != "delete_changed_file"),
+        key=lambda item: str(item.get("target_path", "")),
+    )
+    return tuple(deletes + promotes)
 
 
 def _validate_integrated_source(
@@ -1431,7 +1448,12 @@ def _validate_integrated_source(
         ):
             continue
         if change.kind == KIND_DELETE:
-            if target.exists():
+            # The deleted FILE must be gone. In a file -> directory transition the
+            # path legitimately becomes a directory hosting the candidate's added
+            # children; the full-surface manifest check above already guarantees
+            # that directory holds exactly the intended children. A lingering
+            # regular file (or a checked-out symlink) is a missed delete.
+            if target.exists() and (target.is_file() or target.is_symlink()):
                 errors.append(_error(
                     "transaction.integrated_delete_missed",
                     f"Deleted change {change.path!r} still exists in the integrated repository.",
@@ -1474,6 +1496,148 @@ def _same_file_content(left: Path, right: Path) -> bool:
                 and left.stat().st_mode & 0o777 == right.stat().st_mode & 0o777)
     except OSError:
         return False
+
+
+@dataclass(frozen=True)
+class _ChangedPathApplyResult:
+    accepted: bool
+    error: DomainError | None = None
+    errors: tuple[DomainError, ...] = ()
+
+    @classmethod
+    def ok(cls) -> "_ChangedPathApplyResult":
+        return cls(accepted=True)
+
+    @classmethod
+    def fail(cls, code: str, message: str, location: str | None = None) -> "_ChangedPathApplyResult":
+        error = _error(code, message, location)
+        return cls(accepted=False, error=error, errors=(error,))
+
+
+def _strip_relative(abs_path: Path, relative: str) -> Path:
+    """Derive the root a relative path was resolved against.
+
+    ``abs_path`` was built as ``root / relative``; strip the trailing relative
+    parts to recover ``root`` without re-resolving (used only to name an admitted
+    root for the ``dir_fd``/``O_NOFOLLOW`` walk).
+    """
+    result = abs_path
+    for _ in Path(relative).parts:
+        result = result.parent
+    return result
+
+
+def _target_relative(target_path: Path, repo_root: Path | None) -> str | None:
+    """Lexical target path relative to the admitted root (never re-resolved).
+
+    ``Path.relative_to`` compares path components without touching the
+    filesystem, so a target path that is lexically inside ``repo_root`` stays
+    inside even if the root is swapped to a link: containment is then enforced by
+    the ``O_NOFOLLOW`` directory-fd opens in ``pathops``.
+    """
+    if repo_root is None:
+        return None
+    try:
+        return str(target_path.relative_to(Path(repo_root)))
+    except ValueError:
+        return None
+
+
+def _delete_changed_nofollow(
+    *,
+    target_path: Path,
+    repo_root: Path | None,
+) -> _ChangedPathApplyResult:
+    """Containment-safe deletion of a changed file under the admitted repo root.
+
+    Uses ``O_NOFOLLOW`` directory-fd traversal: a parent directory (or the file
+    itself) swapped to a link pointing outside the admitted root is rejected
+    rather than dereferenced, so no external write/delete and no success event
+    can follow an attacker/worker-swapped link.
+
+    When no admitted ``repo_root`` is configured (the sealed-candidate effects
+    exercised directly by recovery tests), the operation is scoped to the file's
+    immediate parent directory, still with ``O_NOFOLLOW`` at every open so a
+    swapped parent or file is rejected rather than followed.
+    """
+    if repo_root is not None and (relative := _target_relative(target_path, repo_root)) is not None:
+        target_root = repo_root
+    else:
+        relative = target_path.name
+        target_root = _strip_relative(target_path, relative).resolve()
+    try:
+        unlink_regular_nofollow(target_root, relative)
+    except SourcePathError as exc:
+        return _ChangedPathApplyResult.fail(
+            "changed_file.delete_conflict",
+            str(exc),
+            str(target_path),
+        )
+    except OSError as exc:
+        return _ChangedPathApplyResult.fail(
+            "changed_file.delete_failed",
+            f"Cannot delete changed file: {exc}",
+            str(target_path),
+        )
+    return _ChangedPathApplyResult.ok()
+
+
+def _promote_changed_nofollow(
+    *,
+    source_path: Path,
+    target_path: Path,
+    repo_root: Path | None,
+    after_mode: object = None,
+) -> _ChangedPathApplyResult:
+    """Containment-safe promotion of a changed file into the admitted repo root.
+
+    Handles a file/directory transition: when the target is currently an empty
+    directory (leftover after child deletes) it is removed first; a non-empty
+    directory is a conflict and is never removed recursively. Every parent
+    directory and the final source/target file are opened with ``O_NOFOLLOW``, so
+    a swapped parent link or file link unwrites/undeletes external bytes instead
+    of dereferencing them.
+
+    When no admitted ``repo_root`` is configured, the promotion is scoped to the
+    file's immediate parent directory (the legacy single-file transport used by
+    recovery tests), still ``O_NOFOLLOW`` at every open.
+    """
+    if repo_root is not None and (relative := _target_relative(target_path, repo_root)) is not None:
+        target_root = repo_root
+        target_relative = relative
+        source_relative = relative
+        source_root = _strip_relative(source_path, source_relative).resolve()
+    else:
+        target_relative = target_path.name
+        target_root = _strip_relative(target_path, target_relative).resolve()
+        source_relative = source_path.name
+        source_root = _strip_relative(source_path, source_relative).resolve()
+    mode_value = int(after_mode) if after_mode is not None else None
+    try:
+        # Directory -> file: remove an empty leftover directory first. A
+        # non-empty directory blocks (an unrelated live file is preserved; the
+        # directory is never removed recursively just to make promotion succeed).
+        rmdir_if_empty_nofollow(target_root, target_relative)
+        copy_regular_nofollow(
+            source_root=source_root,
+            source_relative=source_relative,
+            target_root=target_root,
+            target_relative=target_relative,
+            mode=mode_value,
+        )
+    except SourcePathError as exc:
+        return _ChangedPathApplyResult.fail(
+            "changed_file.promotion_failed",
+            str(exc),
+            str(target_path),
+        )
+    except OSError as exc:
+        return _ChangedPathApplyResult.fail(
+            "changed_file.promotion_failed",
+            f"Cannot promote changed file: {exc}",
+            str(target_path),
+        )
+    return _ChangedPathApplyResult.ok()
 
 
 def _file_sha256(path: Path) -> str:
@@ -2112,6 +2276,18 @@ def _recovery_has_conflict(service: CompletionService, record) -> bool:
                 continue
             expected_before = effect.get("expected_before_sha256")
             if target.exists():
+                if target.is_symlink():
+                    # A swapped link is never an admissible promote target.
+                    return True
+                if target.is_dir():
+                    # directory -> file transition: an empty leftover directory
+                    # is the expected intermediate state recovery must complete;
+                    # a non-empty directory holds an unrelated live file -> conflict.
+                    try:
+                        next(target.iterdir())
+                    except StopIteration:
+                        continue
+                    return True
                 if not target.is_file() or not isinstance(expected_before, str):
                     return True
                 if _file_sha256(target) != expected_before:

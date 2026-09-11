@@ -13,6 +13,7 @@ from open_tulid.runtime.execution_contracts import (
     execution_contract_to_dict,
     load_job_execution_contract,
 )
+from open_tulid.runtime.pathops import copy_regular_nofollow
 from open_tulid.runtime.repository_facts import (
     SourceSelection,
     baseline_manifest_to_dict,
@@ -161,10 +162,16 @@ def _copy_repo(source: Path, target: Path, selection: SourceSelection | None = N
     if selection is None:
         selection = discover_source_selection(source)
     for path in iter_deliverable_files(source, selection):
-        relative = path.relative_to(source)
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination, follow_symlinks=True)
+        relative = path.relative_to(source).as_posix()
+        # R3: copy with O_NOFOLLOW from a source root directory fd so a parent
+        # directory (or the file itself) swapped to a link between the scan and
+        # the copy is rejected rather than dereferenced outside the source root.
+        copy_regular_nofollow(
+            source_root=source,
+            source_relative=relative,
+            target_root=target,
+            target_relative=relative,
+        )
 
 
 def _write_context(
