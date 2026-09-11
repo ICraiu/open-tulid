@@ -109,6 +109,54 @@ def test_recovery_restores_job_acceptance_across_commit_crash(tmp_path, already_
     assert not recover_completion_transactions(service=service, event_store=events, journal_store=journals)
 
 
+@pytest.mark.parametrize("change", [
+    {"body": "User replacement"}, {"dependencies": ("99",)},
+    {"title": "Different task"}, {"parent_id": "99"},
+    {"current_state": "Done"}, {"metadata": {"owner": "user"}}, {},
+])
+def test_recovery_checks_existing_child_identity_before_any_effect(tmp_path, change):
+    from dataclasses import replace
+    from open_tulid.runtime.completion import _task_to_dict
+
+    expected = Task(id="2", title="Child", path="tasks/2.md", current_state="Todo",
+                    parent_id=TASK_ID, body="Required behavior")
+    persisted = replace(expected, path="tasks/2-child.md",
+                        body="# Child\n\nRequired behavior\n")
+    persisted = replace(persisted, **change)
+
+    class ChildAdapter(FakeAdapter):
+        def read_task(self, task_id):
+            if task_id == "2":
+                return ReadTaskResult(task=persisted)
+            return super().read_task(task_id)
+
+        def create_task(self, task):
+            pytest.fail("An existing child must never be recreated")
+
+    adapter = ChildAdapter(_task())
+    store = _job_store(tmp_path)
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "journals")
+    source = tmp_path / "sealed.txt"
+    source.write_text("artifact")
+    target = tmp_path / "delivered.txt"
+    journals.prepare(journal_id="child-crash", project_id="Agent", task_id=TASK_ID,
+        transition_id="code", effects=(
+            {"type": "promote_changed_file", "source_path": str(source),
+             "target_path": str(target)},
+            {"type": "create_task", "task": _task_to_dict(expected)},
+            {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+        ), events=())
+    service = CompletionService(workflow=_workflow(), adapter=adapter, job_store=store,
+                                event_store=events, journal_store=journals)
+    recovered = recover_completion_transactions(service=service, event_store=events,
+                                                journal_store=journals)
+    assert recovered == (() if change else ("child-crash",))
+    assert target.exists() is (not bool(change))
+    assert adapter.moved_to == (None if change else "CodeReview")
+    assert journals.load("child-crash").status.value == ("prepared" if change else "committed")
+
+
 @dataclass
 class FakeAdapter:
     task: Task

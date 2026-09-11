@@ -1992,7 +1992,8 @@ def _recovery_effect_applied(
         if not isinstance(payload, Mapping):
             return False
         loaded = service.adapter.read_task(str(payload.get("id", "")))
-        return loaded.accepted and loaded.task is not None
+        return (loaded.accepted and loaded.task is not None
+                and _created_task_matches(loaded.task, payload))
     if kind in ("promote_artifact", "promote_changed_file"):
         source = Path(str(effect.get("source_path", "")))
         target = Path(str(effect.get("target_path", "")))
@@ -2007,6 +2008,29 @@ def _recovery_effect_applied(
     return False
 
 
+def _created_task_matches(task: Task, payload: Mapping[str, object]) -> bool:
+    """Compare persisted task content while allowing adapter presentation changes."""
+    try:
+        expected = _task_from_mapping(payload)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    def identity(value: Task) -> Mapping[str, object]:
+        data = dict(_task_to_dict(value))
+        # Adapters select the note filename and render the title as an H1.
+        data.pop("path")
+        lines = value.body.strip().splitlines()
+        if lines and lines[0].strip().startswith("# "):
+            lines = lines[1:]
+        data["body"] = "\n".join(lines).strip()
+        data["title"] = value.title.strip()
+        reserved = {"id", "type", "state", "dependencies", "artifact_links", "parent_id"}
+        data["metadata"] = {key: item for key, item in value.metadata.items() if key not in reserved}
+        return data
+
+    return identity(task) == identity(expected)
+
+
 def _recovery_has_conflict(service: CompletionService, record) -> bool:
     """Detect an intervening user change that blocks rollback/roll-forward.
 
@@ -2018,6 +2042,15 @@ def _recovery_has_conflict(service: CompletionService, record) -> bool:
     resolution.
     """
     for effect in record.effects:
+        if effect.get("type") == "create_task":
+            payload = effect.get("task")
+            if not isinstance(payload, Mapping):
+                return True
+            loaded = service.adapter.read_task(str(payload.get("id", "")))
+            if loaded.task is not None and not _created_task_matches(loaded.task, payload):
+                return True
+            if loaded.errors and any(error.code != "task.not_found" for error in loaded.errors):
+                return True
         if effect.get("type") in {"promote_changed_file", "promote_artifact"}:
             source = Path(str(effect.get("source_path", "")))
             target = Path(str(effect.get("target_path", "")))
