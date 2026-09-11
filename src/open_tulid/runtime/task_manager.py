@@ -249,6 +249,20 @@ class TaskManager:
                 f"Transition {transition.id!r} has no worker.",
                 transition.id,
             ),))
+        from .scheduler import _dependency_error
+        from .context import resolve_source_content_identities
+        dependency_error = _dependency_error(
+            task, snapshot, self.workflow,
+            job_store=self.history_job_store or self.job_store,
+            project_id=command.project_id, repo_root=self.repo_root,
+            journal_store=TransactionJournalStore(self.project_root / "events" / "journals") if self.project_root else None,
+            source_identities_for=(lambda dependency, edge: resolve_source_content_identities(
+                project_root=self.project_root, task=dependency, transition=edge,
+                parent_tasks=load_parent_tasks(self.adapter, dependency),
+            )) if self.project_root else None,
+        )
+        if dependency_error is not None:
+            return CommandResult(accepted=False, errors=(dependency_error,))
         frozen_contract = None
         compiled_prompt = None
         planning_metadata = {}

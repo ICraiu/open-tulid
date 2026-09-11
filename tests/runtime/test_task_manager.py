@@ -416,6 +416,25 @@ def test_create_execution_job_uses_transition_worker_and_workspace(tmp_path: Pat
     assert result.effects[0]["type"] == "create_execution_job"
 
 
+def test_direct_job_creation_checks_dependency_acceptance(tmp_path):
+    from open_tulid.runtime.jobs import FileExecutionJobStore
+    task = replace(_snapshot().tasks[TASK_ID], dependencies=("dependency",))
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for state, expected in (("Todo", "task.dependency_unmet"), ("CodeReview", "task.dependency_not_accepted")):
+        dependency = replace(task, id="dependency", dependencies=(), current_state=state)
+        snapshot = replace(_snapshot(task), tasks={task.id: task, dependency.id: dependency})
+        manager = TaskManager(workflow=_workflow(), adapter=FakeAdapter(snapshot), job_store=store,
+                              history_job_store=store, project_root=tmp_path, repo_root=repo)
+        result = manager.create_execution_job(CreateExecutionJob(
+            project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path / "workspaces",
+        ))
+        assert not result.accepted
+        assert result.errors[0].code == expected
+        assert not store.list().jobs
+
+
 def test_planning_job_preserves_task_instructions_and_sources_after_vault_edits(tmp_path):
     from open_tulid.runtime.executor import _frozen_prompt_packet
     from open_tulid.runtime.planning_inputs import load_planning_inputs
