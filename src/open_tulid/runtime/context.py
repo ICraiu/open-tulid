@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -62,7 +62,7 @@ class LinkedContextResolver:
         docs: list[ContextDocument] = []
         errors: list[DomainError] = []
         seen: set[Path] = set()
-        seen_hashes: set[str] = set()
+        path_hashes: dict[Path, str] = {}
         references: dict[str, list[str]] = {}
         total_bytes = 0
         canonical_answer_links = _canonical_question_round_answer_links(task)
@@ -78,6 +78,19 @@ class LinkedContextResolver:
             _clean_ref(link)
             for link in (*ancestor_answer_links, *canonical_answer_links)
         }
+
+        def remember_reference(digest, ref, required):
+            refs = references.setdefault(digest, [])
+            if ref not in refs:
+                refs.append(ref)
+            for index, document in enumerate(docs):
+                if document.sha256 == digest:
+                    docs[index] = replace(document,
+                        required=document.required or required,
+                        is_canonical_question_round_answers=document.is_canonical_question_round_answers or _clean_ref(ref) in canonical_answer_refs,
+                        is_current_question_round_answers=document.is_current_question_round_answers or _clean_ref(ref) == _clean_ref(canonical_answer_link or ""))
+                    return True
+            return False
 
         # Answer records are intentionally first and chronological.  A review of a
         # derived QuestionRound must see the complete explicit-answer history, not
@@ -126,14 +139,8 @@ class LinkedContextResolver:
                 continue
             path = candidates[0]
             if path in seen:
+                remember_reference(path_hashes[path], ref, required)
                 continue
-            if len(docs) >= self.max_documents:
-                errors.append(DomainError(
-                    "context.document_limit",
-                    f"Linked context exceeds document limit of {self.max_documents}.",
-                    ref,
-                ))
-                break
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as exc:
@@ -144,10 +151,17 @@ class LinkedContextResolver:
                 ))
                 continue
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            references.setdefault(content_hash, []).append(ref)
-            if content_hash in seen_hashes:
+            path_hashes[path] = content_hash
+            if remember_reference(content_hash, ref, required):
                 seen.add(path)
                 continue
+            if len(docs) >= self.max_documents:
+                errors.append(DomainError(
+                    "context.document_limit",
+                    f"Linked context exceeds document limit of {self.max_documents}.",
+                    ref,
+                ))
+                break
             content_size = len(content.encode("utf-8"))
             if total_bytes + content_size > self.max_bytes:
                 errors.append(DomainError(
@@ -157,7 +171,6 @@ class LinkedContextResolver:
                 ))
                 break
             seen.add(path)
-            seen_hashes.add(content_hash)
             total_bytes += content_size
             docs.append(ContextDocument(
                 ref=ref,
@@ -359,7 +372,8 @@ def resolve_source_content_identities(
     for document in result.packet.documents:
         if not document.required:
             continue
-        identities.add((document.ref or document.path.as_posix(), document.sha256))
+        for ref in result.packet.references.get(document.sha256, (document.ref or document.path.as_posix(),)):
+            identities.add((ref, document.sha256))
     return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 

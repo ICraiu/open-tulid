@@ -95,6 +95,24 @@ def test_linked_context_retains_provenance_for_deduplicated_content(tmp_path: Pa
     assert set(result.packet.references[content_hash]) == {"a", "b"}
 
 
+def test_optional_alias_cannot_demote_required_parent_source(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/spec.md").write_text("Binding parent decision.")
+    task = _task(body="See [[spec]].")
+    parent = _task(artifact_links=("docs/spec.md",))
+    result = LinkedContextResolver(tmp_path, max_documents=1).build_context_packet(task, parent_tasks=(parent,))
+    assert result.accepted, result.errors
+    assert len(result.packet.documents) == 1
+    source = result.packet.documents[0]
+    assert source.required
+    assert set(result.packet.references[source.sha256]) == {"spec", "docs/spec.md"}
+    transition = TransitionDefinition(id="Plan", task_type=task.task_type, from_state=task.current_state,
+        to_state="Done", worker="planner", requires=RequirementDefinition(), transaction=None)
+    identities = resolve_source_content_identities(project_root=tmp_path, task=task,
+        transition=transition, parent_tasks=(parent,))
+    assert set(identities) == {("spec", source.sha256), ("docs/spec.md", source.sha256)}
+
+
 def test_linked_context_marks_required_artifact_documents(tmp_path: Path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "spec.md").write_text("Spec body.\n", encoding="utf-8")
