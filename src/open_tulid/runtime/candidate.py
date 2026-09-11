@@ -31,19 +31,18 @@ from open_tulid.runtime.repository_facts import (
     BASELINE_MANIFEST_SCHEMA,
     FileManifestEntry,
     BaselineManifest,
+    SourceSelection,
     canonical_sha256,
-    EXCLUDED_DIRECTORY_NAMES,
-    _repository_files,
+    discover_source_selection,
+    iter_deliverable_files,
+    source_selection_sha256,
+    refresh_workspace_selection,
+    source_selection_to_dict,
+    source_selection_from_dict,
 )
 
 
 CANDIDATE_SCHEMA = "tulid.candidate/v1"
-
-# Explicit snapshot rules: Tulid's own internal workspace files and known
-# ephemeral dependency/cache directories are never deliverables (plan 5A).
-# Intentional source under a name like `build`/`output`/`dist` is deliberately
-# NOT excluded by name, so a tracking of versioned source there is retained.
-CANDIDATE_EXCLUDED_DIRECTORY_NAMES = EXCLUDED_DIRECTORY_NAMES
 
 # Change kinds modeled on the plan's change entry vocabulary. Renames are
 # represented safely as delete+add; rename detection is explanatory and never
@@ -73,6 +72,11 @@ class Candidate:
     changes: tuple[CandidateChange, ...]
     submitted_changed_files: tuple[str, ...] = ()
     submitted_discrepancy: str | None = None
+    # The source-selection rule inputs the candidate was sealed under (R2). The
+    # candidate identity binds these rule inputs; verification and delivery use
+    # the identical selection so a rule can never differ across transport.
+    source_selection: SourceSelection | None = None
+    source_selection_sha256: str | None = None
     sha256: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -95,6 +99,12 @@ class Candidate:
             ],
             "submitted_changed_files": list(self.submitted_changed_files),
             "submitted_discrepancy": self.submitted_discrepancy,
+            "source_selection": (
+                source_selection_to_dict(self.source_selection)
+                if self.source_selection is not None
+                else None
+            ),
+            "source_selection_sha256": self.source_selection_sha256,
             "sha256": self.sha256,
         }
 
@@ -127,6 +137,7 @@ def capture_candidate(
     candidate_id: str,
     baseline: BaselineManifest | None,
     submitted_changed_files: tuple[str, ...] = (),
+    selection: SourceSelection | None = None,
 ) -> CaptureCandidateResult:
     """Seal a stable snapshot of ``workspace`` into ``storage_root``.
 
@@ -134,6 +145,10 @@ def capture_candidate(
     copying a live directory is atomic. If the workspace changes while the copy
     runs, or the stored copy does not match the workspace, the candidate is
     rejected with a retriable error and the original workspace is preserved.
+
+    ``selection`` applies the frozen source-selection rule. When omitted it is
+    discovered from the live workspace, which for a worker workspace (no
+    ``.git``) selects the documented non-Git rule.
     """
     storage_root = Path(storage_root)
     if not candidate_id or candidate_id in {".", ".."} or Path(candidate_id).name != candidate_id:
@@ -141,8 +156,16 @@ def capture_candidate(
             "candidate.invalid_identity", "Candidate identity must be a single path component.",
         ),))
     storage = storage_root / candidate_id
+    if selection is None:
+        selection = discover_source_selection(workspace)
+    else:
+        # The frozen tracked source identity travels; Git ignore decision layers
+        # are re-read from the tree so a ``.gitignore`` edit inside this candidate
+        # is applied and bound to its identity (row 5).
+        selection = refresh_workspace_selection(selection, workspace)
+    selection_sha256 = source_selection_sha256(selection)
     try:
-        pre = capture_deliverable_manifest(workspace)
+        pre = capture_deliverable_manifest(workspace, selection)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(
             "candidate.capture_failed",
@@ -153,7 +176,7 @@ def capture_candidate(
         storage_root.mkdir(parents=True, exist_ok=True)
         # Exclusive creation preserves sealed evidence, including during races.
         storage.mkdir(exist_ok=False)
-        _copy_deliverables(workspace, storage)
+        _copy_deliverables(workspace, storage, selection)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(
             "candidate.capture_failed",
@@ -161,8 +184,8 @@ def capture_candidate(
             location=str(storage),
         ),))
     try:
-        post = capture_deliverable_manifest(workspace)
-        stored = capture_deliverable_manifest(storage)
+        post = capture_deliverable_manifest(workspace, selection)
+        stored = capture_deliverable_manifest(storage, selection)
     except OSError as exc:
         return CaptureCandidateResult(errors=(_candidate_error(
             "candidate.capture_failed",
@@ -202,6 +225,8 @@ def capture_candidate(
         changes=changes,
         submitted_changed_files=submitted,
         submitted_discrepancy=discrepancy,
+        source_selection=selection,
+        source_selection_sha256=selection_sha256,
     )
     sealed = Candidate(
         schema=candidate.schema,
@@ -212,6 +237,8 @@ def capture_candidate(
         changes=candidate.changes,
         submitted_changed_files=candidate.submitted_changed_files,
         submitted_discrepancy=candidate.submitted_discrepancy,
+        source_selection=candidate.source_selection,
+        source_selection_sha256=candidate.source_selection_sha256,
         sha256=canonical_sha256(_candidate_body(candidate)),
     )
     try:
@@ -222,7 +249,7 @@ def capture_candidate(
             "Cannot persist the sealed candidate record.",
             location=str(storage_root),
         ),))
-    if post.sha256 != capture_deliverable_manifest(workspace).sha256:
+    if post.sha256 != capture_deliverable_manifest(workspace, selection).sha256:
         # The workspace mutated after the sealed snapshot was confirmed but
         # before the record was written; do not accept a now-stale seal.
         return CaptureCandidateResult(errors=(_candidate_error(
@@ -240,10 +267,10 @@ def capture_candidate(
     ))
 
 
-def capture_deliverable_manifest(root: Path) -> BaselineManifest:
+def capture_deliverable_manifest(root: Path, selection: SourceSelection | None = None) -> BaselineManifest:
     """Hash the authoritative deliverable surface used by capture and verification."""
     entries: list[FileManifestEntry] = []
-    for path in iter_deliverable_files(root):
+    for path in iter_deliverable_files(root, selection):
         relative = path.relative_to(root).as_posix()
         entries.append(FileManifestEntry(
             path=relative,
@@ -266,27 +293,26 @@ def capture_deliverable_manifest(root: Path) -> BaselineManifest:
     )
 
 
-def iter_deliverable_files(root: Path):
-    """Walk source deterministically, excluding only declared ephemeral directories."""
-    yield from _repository_files(root)
+def iter_deliverable_files(root: Path, selection: SourceSelection | None = None):
+    """Walk source deterministically using the one source-selection rule.
+
+    Delegates to the repository_facts walk so baseline, workspace, seal, verifier,
+    and target all consume the identical selection.
+    """
+    from open_tulid.runtime.repository_facts import iter_deliverable_files as _walk
+    yield from _walk(root, selection)
 
 
-def _copy_deliverables(source: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    for child in source.iterdir():
-        if child.name in CANDIDATE_EXCLUDED_DIRECTORY_NAMES:
-            continue
-        destination = target / child.name
-        if child.is_dir() and not child.is_symlink():
-            shutil.copytree(
-                child,
-                destination,
-                dirs_exist_ok=True,
-                symlinks=True,
-                ignore=shutil.ignore_patterns(*CANDIDATE_EXCLUDED_DIRECTORY_NAMES),
-            )
-        else:
-            shutil.copy2(child, destination, follow_symlinks=True)
+def _copy_deliverables(source: Path, target: Path, selection: SourceSelection | None = None) -> None:
+    # Copy only the deliverable surface; symlinks and unsupported entries raise
+    # through the iterator so they fail closed before external bytes are read.
+    if selection is None:
+        selection = discover_source_selection(source)
+    for path in iter_deliverable_files(source, selection):
+        relative = path.relative_to(source)
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination, follow_symlinks=True)
 
 
 def _file_sha256(path: Path) -> str:
@@ -360,6 +386,7 @@ def _candidate_body(candidate: Candidate) -> dict[str, object]:
         ],
         "submitted_changed_files": list(candidate.submitted_changed_files),
         "submitted_discrepancy": candidate.submitted_discrepancy,
+        "source_selection_sha256": candidate.source_selection_sha256,
     }
 
 

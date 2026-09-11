@@ -642,7 +642,8 @@ class DeterministicVerifier:
             )
         baseline_manifest = contract.baseline_manifest
         baseline_sha = baseline_manifest.sha256
-        pre_manifest = _workspace_deliverable_manifest(workspace)
+        selection = _effective_selection_for(contract, workspace)
+        pre_manifest = _workspace_deliverable_manifest(workspace, selection)
         pre_sha = pre_manifest.sha256
         pre_lockfile = _capture_lockfile_identity(workspace)
         checks, check_errors = _run_contract_checks(workspace, contract, executor)
@@ -651,7 +652,7 @@ class DeterministicVerifier:
         # cache/build outputs excluded by snapshot rules are not tracked source.
         # Plan 4A: never repeat the baseline digest as the candidate/post digest
         # unless the actual source tree is unchanged by verification.
-        post_manifest = _workspace_deliverable_manifest(workspace)
+        post_manifest = _workspace_deliverable_manifest(workspace, selection)
         post_sha = post_manifest.sha256
         post_lockfile = _capture_lockfile_identity(workspace)
         # Coverage regression guard (plan 4E): record baseline-to-candidate
@@ -943,19 +944,33 @@ def _capture_lockfile_identity(workspace: Path):
         return None
 
 
-def _workspace_deliverable_manifest(workspace: Path) -> BaselineManifest:
-    """Real deliverable manifest of the workspace (used for digest recomputation)."""
+def _workspace_deliverable_manifest(workspace: Path, selection=None) -> BaselineManifest:
+    """Real deliverable manifest of the workspace (used for digest recomputation).
+
+    ``selection`` applies the frozen source-selection rule so the verification
+    copy's tracked-under-cache files are not pruned and untracked caches stay
+    excluded, exactly as at baseline/candidate/delivery.
+    """
     from .candidate import capture_deliverable_manifest
-    return capture_deliverable_manifest(workspace)
+    return capture_deliverable_manifest(workspace, selection)
 
 
-def _workspace_manifest_sha256(workspace: Path) -> str:
+def _workspace_manifest_sha256(workspace: Path, selection=None) -> str:
     """Real post-verification source digest of the workspace (or baseline-less "").
 
     Used to stop a report from blindly repeating the baseline digest as the
     candidate/post digest when the source tree actually changed.
     """
-    return _workspace_deliverable_manifest(workspace).sha256
+    return _workspace_deliverable_manifest(workspace, selection).sha256
+
+
+def _effective_selection_for(contract: ExecutionContract, workspace: Path):
+    facts = getattr(contract, "repository_facts", None)
+    base = getattr(facts, "source_selection", None) if facts is not None else None
+    if base is None:
+        return None
+    from .repository_facts import refresh_workspace_selection
+    return refresh_workspace_selection(base, workspace)
 
 
 def _verification_incomplete_message(report: "VerificationReport") -> str:

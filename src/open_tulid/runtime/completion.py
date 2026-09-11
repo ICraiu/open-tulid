@@ -39,6 +39,7 @@ from .candidate import (
     CandidateChange,
     capture_candidate,
     capture_deliverable_manifest,
+    source_selection_from_dict,
 )
 from .verification_runtime import (
     ContainerCommandExecutor, VerificationEnvironment, environment_identity_of,
@@ -266,6 +267,11 @@ class CompletionService:
             baseline=frozen.contract.baseline_manifest if frozen.contract is not None else None,
             submission_id=submission_id,
             submission=submission,
+            selection=(
+                frozen.contract.repository_facts.source_selection
+                if frozen.contract is not None
+                else None
+            ),
         )
         if not captured.accepted:
             return self._reject_candidate_capture(
@@ -778,6 +784,7 @@ class CompletionService:
         baseline,
         submission_id: str,
         submission: CompletionSubmission,
+        selection=None,
     ):
         storage_root = self.candidate_root
         if storage_root is None:
@@ -793,6 +800,7 @@ class CompletionService:
             candidate_id=candidate_id,
             baseline=baseline,
             submitted_changed_files=submission.changed_files,
+            selection=selection,
         )
         if not result.accepted or result.captured is None:
             return result
@@ -1390,16 +1398,20 @@ def _validate_integrated_source(
     # Validate the complete source, including unchanged files. Verifying only
     # the delta could bless an unrelated edit made during acceptance/recovery.
     try:
-        def surface(root):
+        def surface(root, selection=None):
             return {
                 entry.path: (entry.sha256, entry.mode)
-                for entry in capture_deliverable_manifest(root).entries
+                for entry in capture_deliverable_manifest(root, selection).entries
                 if (entry.path not in artifact_paths if artifact_paths is not None else
                     output_relative is None or not (
                         entry.path == output_relative or entry.path.startswith(output_relative + "/")
                     ))
             }
-        if surface(Path(candidate.storage_path)) != surface(repository_root):
+        # The sealed candidate applies its own frozen selection (tracked source
+        # under cache names is retained); the live target re-discovers the same
+        # Git/non-Git rule. Both selection surfaces must agree for transport.
+        candidate_selection = getattr(candidate, "source_selection", None)
+        if surface(Path(candidate.storage_path), candidate_selection) != surface(repository_root):
             errors.append(_error("transaction.integrated_manifest_mismatch",
                 "Integrated source differs from the complete verified candidate.", str(repository_root)))
     except OSError as exc:
@@ -1909,8 +1921,15 @@ def recover_completion_transactions(
             try:
                 payload = dict(raw_candidate)
                 payload["changes"] = tuple(CandidateChange(**dict(change)) for change in payload["changes"])
+                raw_selection = payload.get("source_selection")
+                if isinstance(raw_selection, Mapping):
+                    payload["source_selection"] = source_selection_from_dict(raw_selection)
+                elif raw_selection is not None:
+                    continue
                 candidate = Candidate(**payload)
-                if capture_deliverable_manifest(Path(candidate.storage_path)).sha256 != candidate.manifest_sha256:
+                if capture_deliverable_manifest(
+                    Path(candidate.storage_path), candidate.source_selection
+                ).sha256 != candidate.manifest_sha256:
                     continue
             except (OSError, TypeError, ValueError, KeyError):
                 continue

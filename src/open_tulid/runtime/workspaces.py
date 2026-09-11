@@ -14,11 +14,12 @@ from open_tulid.runtime.execution_contracts import (
     load_job_execution_contract,
 )
 from open_tulid.runtime.repository_facts import (
-    EXCLUDED_DIRECTORY_NAMES,
+    SourceSelection,
     baseline_manifest_to_dict,
     capture_repository_snapshot,
+    discover_source_selection,
+    iter_deliverable_files,
     repository_facts_to_dict,
-    _repository_files,
 )
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
 from .planning_inputs import load_planning_inputs
@@ -76,9 +77,17 @@ class WorkspacePreparer:
                         message=f"Repository root does not exist: {self.repo_root}",
                         location=str(self.repo_root),
                     ))
-                _copy_repo(self.repo_root, workspace)
+                selection = (
+                    frozen.contract.repository_facts.source_selection
+                    if frozen.contract is not None
+                    else discover_source_selection(self.repo_root)
+                )
+                _copy_repo(self.repo_root, workspace, selection)
             if frozen.contract is not None and not preserve_workspace:
-                copied = capture_repository_snapshot(workspace)
+                copied = capture_repository_snapshot(
+                    workspace,
+                    selection=frozen.contract.repository_facts.source_selection,
+                )
                 if not copied.accepted or copied.snapshot is None:
                     return WorkspacePrepareResult(error=(
                         copied.errors[0]
@@ -144,22 +153,18 @@ def cleanup_job_workspaces(jobs: tuple[ExecutionJob, ...]) -> WorkspaceCleanupRe
     return WorkspaceCleanupResult(removed=tuple(removed), errors=tuple(errors))
 
 
-def _copy_repo(source: Path, target: Path) -> None:
-    # Reject unsupported links before copytree can dereference external bytes.
-    tuple(_repository_files(source))
-    for child in source.iterdir():
-        if child.name in EXCLUDED_DIRECTORY_NAMES:
-            continue
-        destination = target / child.name
-        if child.is_dir():
-            shutil.copytree(
-                child,
-                destination,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(*EXCLUDED_DIRECTORY_NAMES),
-            )
-        else:
-            shutil.copy2(child, destination)
+def _copy_repo(source: Path, target: Path, selection: SourceSelection | None = None) -> None:
+    # Apply the one source-selection rule: tracked regular files are retained
+    # even under cache-like names while untracked caches and Git-ignored material
+    # are excluded. Symlinks and unsupported entries raise through the iterator
+    # so they fail closed before copytree could dereference external bytes.
+    if selection is None:
+        selection = discover_source_selection(source)
+    for path in iter_deliverable_files(source, selection):
+        relative = path.relative_to(source)
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination, follow_symlinks=True)
 
 
 def _write_context(

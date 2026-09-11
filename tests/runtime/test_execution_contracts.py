@@ -38,7 +38,7 @@ from open_tulid.runtime.prompts import (
     lint_compiled_prompt,
 )
 from open_tulid.runtime.task_contracts import task_source_intent_sha256
-from open_tulid.runtime.repository_facts import canonical_sha256
+from open_tulid.runtime.repository_facts import canonical_sha256, source_selection_to_dict
 from open_tulid.runtime.workspaces import WorkspacePreparer
 from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
 
@@ -224,7 +224,90 @@ def test_job_contract_round_trips_and_detects_tampering(tmp_path):
     assert tampered.errors[0].code == "execution_contract.hash_mismatch"
 
 
-def test_job_contract_loader_accepts_supported_prompt_compiler_v1(tmp_path):
+def test_git_repository_facts_freeze_source_selection_and_legacy_default(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(("git", "-C", str(repo), "init", "-q"), check=False)
+    subprocess.run(("git", "-C", str(repo), "config", "user.email", "t@e.com"), check=False)
+    subprocess.run(("git", "-C", str(repo), "config", "user.name", "t"), check=False)
+    node_modules = repo / "node_modules" / "project-owned"
+    node_modules.mkdir(parents=True)
+    (node_modules / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repo), "add", "."), check=False)
+    subprocess.run(("git", "-C", str(repo), "commit", "-qm", "init"), check=False)
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    task = _task_and_contract(project_root)
+    compiled = compile_task_execution_contract(
+        project_root=project_root,
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is True, compiled.errors
+    assert compiled.contract is not None
+    facts = compiled.contract.repository_facts
+    assert facts.git_repository is True
+    assert facts.source_selection is not None
+    assert facts.source_selection.mode == "git"
+    assert "node_modules/project-owned/index.js" in facts.source_selection.tracked_paths
+
+    # Round-trip through the frozen execution contract preserves the rule inputs.
+    payload = execution_contract_to_dict(compiled.contract)
+    job = ExecutionJob(
+        job_id="job-git", project_id="Agent", task_id=task.id,
+        transition_id="ImplementTask", worker_id="qwen",
+        workspace_path=str(tmp_path / "ws"),
+        metadata={"execution_contract": payload, "execution_contract_sha256": compiled.contract.sha256},
+    )
+    loaded = load_job_execution_contract(job, required=True)
+    assert loaded.accepted is True and loaded.contract is not None
+    loaded_selection = loaded.contract.repository_facts.source_selection
+    assert loaded_selection is not None
+    assert loaded_selection.mode == "git"
+    assert source_selection_to_dict(loaded_selection)["tracked_paths"] == [
+        "node_modules/project-owned/index.js",
+    ]
+
+    # A legacy serialized payload without the frozen field preserves its
+    # historical interpretation: it loads with no source_selection rule, so old
+    # contracts keep their old name-based behavior instead of an upgrade.
+    for legacy_job in _payload_without_source_selection(task, tmp_path):
+        loaded = load_job_execution_contract(legacy_job, required=True)
+        assert loaded.accepted is True and loaded.contract is not None
+        assert loaded.contract.repository_facts.source_selection is None
+
+
+def _payload_without_source_selection(task, tmp_path):
+    """Two modern git/non-git contracts stripped of the frozen source_selection
+    field, re-hashed exactly like a historical record that predates R2."""
+    repo = tmp_path / "legacy"
+    repo.mkdir()
+    (repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    compiled = compile_task_execution_contract(
+        project_root=tmp_path / "project",
+        repo_root=repo,
+        task=task,
+        transition=_transition(),
+    )
+    assert compiled.accepted is True and compiled.contract is not None
+    payload = execution_contract_to_dict(compiled.contract)
+    payload["repository"]["facts"].pop("source_selection", None)
+    payload.pop("sha256")
+    expected = canonical_sha256(payload)
+    payload["sha256"] = expected
+    yield ExecutionJob(
+        job_id="job-legacy", project_id="Agent", task_id=task.id,
+        transition_id="ImplementTask", worker_id="qwen",
+        workspace_path=str(tmp_path / "ws"),
+        metadata={"execution_contract": payload, "execution_contract_sha256": expected},
+    )
+
+
+def test_compile_rejects_conflicting_task_and_transition_commands(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     task = _task_and_contract(project_root)

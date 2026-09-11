@@ -329,6 +329,250 @@ def test_capture_candidate_seals_snapshot_and_populates_delta(tmp_path: Path):
     assert tuple(change.path for change in candidate.changes) == ("a.txt",)
 
 
+def test_r2_transports_tracked_cache_file_omitted_new_and_deletion_with_modes(tmp_path: Path):
+    """R2 completion evidence: one end-to-end transport across baseline → workspace
+    → seal → target. A tracked cache-named file, an omitted non-ignored new file,
+    and a deletion all reach the target, and the target manifest equals the sealed
+    candidate manifest including modes."""
+    import shutil
+    import subprocess
+
+    from open_tulid.runtime.candidate import capture_deliverable_manifest
+    from open_tulid.runtime.repository_facts import discover_source_selection
+    from open_tulid.runtime.workspaces import _copy_repo
+    from open_tulid.runtime.completion import _candidate_change_plan, _validate_integrated_source
+
+    def git(root, *args):
+        subprocess.run(("git", "-C", str(root), *args), check=False, capture_output=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@e.com")
+    git(repo, "config", "user.name", "t")
+
+    owned = repo / "node_modules" / "project-owned"
+    owned.mkdir(parents=True)
+    tracked = owned / "index.js"
+    tracked.write_text("module.exports = 1\n", encoding="utf-8")
+    tracked.chmod(0o755)
+    (repo / "app.py").write_text("print('app')\n", encoding="utf-8")
+    (repo / "old.py").write_text("print('delete me')\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("*.log\n.env\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "init")
+    # An untracked dependency beside the tracked cache file must never ship.
+    (owned / "dep.js").write_text("vendor noise\n", encoding="utf-8")
+
+    selection = discover_source_selection(repo)
+    baseline = _baseline_from_repo(repo)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _copy_repo(repo, workspace, selection)
+
+    # Worker: edit the tracked cache-named file (including a mode change), add an
+    # omitted non-ignored new file, delete a tracked file.
+    (workspace / "node_modules" / "project-owned" / "index.js").write_text(
+        "module.exports = 2\n", encoding="utf-8")
+    (workspace / "node_modules" / "project-owned" / "index.js").chmod(0o640)
+    (workspace / "omitted_new.py").write_text("print('forgotten in prose')\n", encoding="utf-8")
+    (workspace / "old.py").unlink()
+    (workspace / "node_modules" / "project-owned" / "dep.js").write_text(
+        "vendor noise\n", encoding="utf-8")
+
+    captured = capture_candidate(
+        workspace=workspace,
+        storage_root=tmp_path / "seals",
+        candidate_id="r2-transport",
+        baseline=baseline,
+        selection=selection,
+        submitted_changed_files=(),
+    )
+    assert captured.accepted is True, captured.errors
+    candidate = captured.captured.candidate
+    by_path = {change.path: change for change in candidate.changes}
+    assert by_path["node_modules/project-owned/index.js"].kind == "edit"
+    assert by_path["omitted_new.py"].kind == "add"
+    assert by_path["old.py"].kind == "delete"
+    # Unknown/untracked cache content beside the tracked file never enters the delta.
+    assert "node_modules/project-owned/dep.js" not in by_path
+
+    # Target: a fresh managed repo seeded with the baseline, then the authoritative
+    # candidate change set is applied exactly.
+    target = tmp_path / "target"
+    target.mkdir()
+    git(target, "init", "-q")
+    git(target, "config", "user.email", "t@e.com")
+    git(target, "config", "user.name", "t")
+    _copy_repo(repo, target, selection)
+    git(target, "add", ".")
+    git(target, "commit", "-qm", "baseline")
+    plan = _candidate_change_plan(
+        repo_root=target,
+        candidate_storage=captured.captured.storage_path,
+        changes=candidate.changes,
+    )
+    for effect in plan:
+        if effect["type"] == "promote_changed_file":
+            shutil.copy2(effect["source_path"], effect["target_path"])
+        elif effect["type"] == "delete_changed_file":
+            Path(effect["target_path"]).unlink()
+
+    # Integrated source equals the complete verified candidate.
+    assert _validate_integrated_source(repo_root=target, candidate=candidate) == ()
+    # Target and candidate manifests match, including modes.
+    target_manifest = {e.path: (e.sha256, e.mode) for e in
+                       capture_deliverable_manifest(target).entries}
+    candidate_manifest = {e.path: (e.sha256, e.mode) for e in
+                          capture_deliverable_manifest(
+                              captured.captured.storage_path, candidate.source_selection).entries}
+    assert candidate_manifest == target_manifest
+    # The delivered tracked cache-named file carries the edited bytes AND its mode.
+    assert (target / "node_modules" / "project-owned" / "index.js").read_text() == "module.exports = 2\n"
+    assert (target / "node_modules" / "project-owned" / "index.js").stat().st_mode & 0o777 == 0o640
+
+
+def test_r2_modifying_tracked_cache_file_during_verification_is_rejected(tmp_path: Path):
+    """R2 completion evidence: mutating a TRACKED file under a cache directory
+    during verification is rejected as source mutation."""
+    import subprocess
+
+    from open_tulid.domain import RequirementDefinition, Task, TransitionDefinition
+    from open_tulid.runtime.execution_contracts import compile_standard_execution_contract
+    from open_tulid.runtime.verification_runtime import HostCommandExecutor
+    from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
+
+    def git(root, *args):
+        subprocess.run(("git", "-C", str(root), *args), check=False, capture_output=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@e.com")
+    git(repo, "config", "user.name", "t")
+    owned = repo / "node_modules" / "project-owned"
+    owned.mkdir(parents=True)
+    (owned / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
+    (repo / "check_verify.py").write_text(
+        # "dependency install": leaves a NEW untracked cache file AND rewrites a
+        # tracked file under that cache directory.
+        "from pathlib import Path\n"
+        "Path('node_modules/dep.js').write_text('vendor')\n"
+        "Path('node_modules/project-owned/index.js').write_text('module.exports = 2\\n')\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "init")
+
+    tracker = tmp_path / "tracker"
+    tracker.mkdir()
+    (tracker / "contract.yaml").write_text(
+        "schema: tulid.contract/v1\n"
+        "runtime:\n  container_user: \"1000:1000\"\n"
+        "commands:\n"
+        "  - name: checks\n    argv: [python, check_verify.py]\n    working_directory: .\n", encoding="utf-8"
+    )
+    transition = TransitionDefinition(
+        id="ImplementTask", task_type="ImplementationTask", from_state="Todo",
+        to_state="Review", worker="qwen", requires=RequirementDefinition(), transaction=None,
+    )
+    task = Task(id="task", title="Task", path="tasks/task.md", current_state="Todo",
+                task_type="ImplementationTask")
+    compiled = compile_standard_execution_contract(project_root=tracker, repo_root=repo,
+                                                   task=task, transition=transition)
+    assert compiled.accepted, compiled.errors
+
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(),
+        execution_contract=compiled.contract,
+    )
+    # Untracked cache addition is allowed (post tree would equal pre tree once the
+    # untracked cache file is excluded), but the tracked file under the cache
+    # directory mutated => source mutation => rejected.
+    assert not result.accepted
+    assert any(error.code == "verification.source_mutation" for error in result.errors)
+    assert result.report.source_mutated is True
+
+
+def _baseline_from_repo(repo: Path):
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    snapshot = capture_repository_snapshot(repo)
+    assert snapshot.accepted is True
+    assert snapshot.snapshot is not None
+    return snapshot.snapshot.baseline
+
+
+def test_r2_untracked_cache_changes_during_verification_are_allowed(tmp_path: Path):
+    """R2 row 7 positive side: dependency installation that only adds untracked
+    cache content must not be rejected as source mutation."""
+    import subprocess
+
+    from open_tulid.domain import RequirementDefinition, Task, TransitionDefinition
+    from open_tulid.runtime.execution_contracts import compile_standard_execution_contract
+    from open_tulid.runtime.verification_runtime import HostCommandExecutor
+    from open_tulid.runtime.verifier import CompletionSubmission, DeterministicVerifier
+
+    def git(root, *args):
+        subprocess.run(("git", "-C", str(root), *args), check=False, capture_output=True)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@e.com")
+    git(repo, "config", "user.name", "t")
+    (repo / "app.py").write_text("print('app')\n", encoding="utf-8")
+    (repo / "check_verify.py").write_text(
+        # "npm install" writes ONLY new untracked cache files.
+        "from pathlib import Path\n"
+        "Path('node_modules').mkdir(parents=True, exist_ok=True)\n"
+        "Path('node_modules/a.js').write_text('vendor')\n"
+        "Path('node_modules/.cache').write_text('cache')\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "init")
+
+    tracker = tmp_path / "tracker"
+    tracker.mkdir()
+    (tracker / "contract.yaml").write_text(
+        "schema: tulid.contract/v1\n"
+        "runtime:\n  container_user: \"1000:1000\"\n"
+        "commands:\n"
+        "  - name: checks\n    argv: [python, check_verify.py]\n    working_directory: .\n", encoding="utf-8"
+    )
+    transition = TransitionDefinition(
+        id="ImplementTask", task_type="ImplementationTask", from_state="Todo",
+        to_state="Review", worker="qwen", requires=RequirementDefinition(), transaction=None,
+    )
+    task = Task(id="task", title="Task", path="tasks/task.md", current_state="Todo",
+                task_type="ImplementationTask")
+    compiled = compile_standard_execution_contract(project_root=tracker, repo_root=repo,
+                                                   task=task, transition=transition)
+    assert compiled.accepted, compiled.errors
+
+    result = DeterministicVerifier(executor=HostCommandExecutor()).verify(
+        workspace=repo,
+        transition=transition,
+        submission=CompletionSubmission(),
+        execution_contract=compiled.contract,
+    )
+    # The untracked cache content is excluded by the source-selection rule, so the
+    # deliverable tree is unchanged and verification is NOT a source mutation.
+    assert result.accepted is True, result.errors
+    assert result.report.source_mutated is False
+
+
+def _baseline_from_repo(repo: Path):
+    from open_tulid.runtime.repository_facts import capture_repository_snapshot
+    snapshot = capture_repository_snapshot(repo)
+    assert snapshot.accepted is True
+    assert snapshot.snapshot is not None
+    return snapshot.snapshot.baseline
+
+
 def test_capture_candidate_later_workspace_edit_yields_distinct_seal(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

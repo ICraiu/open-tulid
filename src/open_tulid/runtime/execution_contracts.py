@@ -25,10 +25,12 @@ from open_tulid.domain import (
 from .repository_facts import (
     BaselineManifest,
     RepositoryFacts,
+    SourceSelection,
     baseline_manifest_to_dict,
     canonical_sha256,
     capture_repository_snapshot,
     repository_facts_to_dict,
+    source_selection_from_dict,
 )
 from .prompt_versions import (
     PROMPT_COMPILER_VERSION,
@@ -1192,6 +1194,12 @@ def _repository_facts_from_dict(raw: object) -> RepositoryFacts:
     dirty = payload.get("dirty")
     if dirty is not None and not isinstance(dirty, bool):
         raise ValueError("repository dirty must be a boolean or null")
+    raw_selection = payload.get("source_selection")
+    selection = None
+    if raw_selection is not None:
+        if not isinstance(raw_selection, Mapping):
+            raise ValueError("repository source_selection must be an object or null")
+        selection = source_selection_from_dict(raw_selection)
     return RepositoryFacts(
         schema=_required_string(payload, "schema"),
         repository_available=bool(payload.get("repository_available", False)),
@@ -1204,6 +1212,7 @@ def _repository_facts_from_dict(raw: object) -> RepositoryFacts:
         file_count=int(payload.get("file_count", 0)),
         total_bytes=int(payload.get("total_bytes", 0)),
         sha256=_required_string(payload, "sha256"),
+        source_selection=selection,
     )
 
 
