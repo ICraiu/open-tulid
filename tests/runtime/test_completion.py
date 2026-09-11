@@ -750,7 +750,7 @@ def test_completion_commits_promoted_repo_changes_with_task_title(tmp_path: Path
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
-        (("git", "rev-parse", "--short", "HEAD"), repo),
+        (("git", "rev-parse", "--verify", "HEAD"), repo),
     ]
 
 
@@ -790,7 +790,7 @@ def test_completion_skips_commit_when_changed_files_match_repo_root(tmp_path: Pa
     )
 
     assert result.accepted is True
-    assert calls == [(("git", "rev-parse", "--short", "HEAD"), repo)]
+    assert calls == [(("git", "rev-parse", "--verify", "HEAD"), repo)]
     loaded = store.get("01J00000000000000000000JOB")
     assert loaded.job is not None
     assert loaded.job.metadata["promoted_files"] == []
@@ -843,7 +843,7 @@ def test_completion_treats_git_nothing_to_commit_as_success(tmp_path: Path):
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
-        (("git", "rev-parse", "--short", "HEAD"), repo),
+        (("git", "rev-parse", "--verify", "HEAD"), repo),
     ]
 
 
@@ -891,7 +891,7 @@ def test_completion_skips_explicit_ignored_changed_files_for_commit(tmp_path: Pa
         (("git", "check-ignore", "-q", "--", "src/main.ts"), repo),
         (("git", "add", "--", "src/main.ts"), repo),
         (("git", "commit", "-m", "01J00000000000000000000001: Implement thing", "--", "src/main.ts"), repo),
-        (("git", "rev-parse", "--short", "HEAD"), repo),
+        (("git", "rev-parse", "--verify", "HEAD"), repo),
     ]
 
 
@@ -1764,7 +1764,7 @@ def _git_init(tmp_path: Path, files: dict[str, str]) -> str:
     subprocess.run(("git", "-C", str(repo), "add", "--all"), check=True, capture_output=True)
     subprocess.run(("git", "-C", str(repo), "commit", "-qm", "base"), check=True, capture_output=True)
     return subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
@@ -1796,7 +1796,11 @@ def test_recover_completion_transactions_rolls_forward_delivery_after_commit(tmp
         check=True, capture_output=True,
     )
     before_head = subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    intended_tree = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD^{tree}"),
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
@@ -1839,6 +1843,8 @@ def test_recover_completion_transactions_rolls_forward_delivery_after_commit(tmp
                 "message": f"{TASK_ID}: Implement thing",
                 "paths": ("src/main.ts", "old.txt"),
                 "expected_outcome": "committed",
+                "repository_base_commit": base,
+                "intended_tree": intended_tree,
             },
         },
     )
@@ -1866,7 +1872,7 @@ def test_recover_completion_transactions_rolls_forward_delivery_after_commit(tmp
 
     # The already-created transaction commit must be reused, not duplicated.
     after_head = subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert after_head == before_head
@@ -2007,6 +2013,301 @@ def test_recover_completion_transactions_blocks_on_intervening_delete_change(tmp
     assert journals.load("01J00000000000000000000JDC").status.value == "prepared"
     assert adapter.moved_to is None
     assert (repo / "old.txt").read_text(encoding="utf-8") == "user replacement\n"
+
+
+_COMMIT_RECOVERY_JOB = "01J00000000000000000000JOB"
+_COMMIT_RECOVERY_JOURNAL = "01J00000000000000000000JRE"
+
+
+def _commit_recovery_fixture(tmp_path: Path):
+    """A real-git commit-bearing prepared journal plus a pending job.
+
+    The baseline contains ``src/main.ts = 1`` and the candidate changes it to
+    ``42``. Returns the repository, workspace, store, event/journal stores, the
+    full base and intended-tree identities, and the job id. Recovery of this
+    record settles to exactly one acceptance only when the underlying repository
+    holds the intended commit with the intended tree.
+    """
+    from open_tulid.runtime.completion import _intended_commit_tree
+    from open_tulid.runtime.attempts import task_semantic_revision
+
+    base = _git_init(tmp_path, {"src/main.ts": "export const answer = 1;\n"})
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "candidate"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+
+    effects = (
+        {
+            "type": "promote_changed_file",
+            "source_path": str(workspace / "src" / "main.ts"),
+            "target_path": str(repo / "src" / "main.ts"),
+            "expected_after_sha256": _repo_sha256(workspace / "src" / "main.ts"),
+            "expected_before_sha256": _repo_sha256(repo / "src" / "main.ts"),
+            "expected_before_mode": 0o644,
+            "expected_after_mode": 0o644,
+        },
+        {
+            "type": "commit_repo_changes",
+            "message": f"{TASK_ID}: Implement thing",
+            "paths": ("src/main.ts",),
+        },
+        {"type": "move_task", "task_id": TASK_ID, "to_state": "CodeReview"},
+    )
+    intended_tree = _intended_commit_tree(repo_root=repo, base=base, effects=effects)
+    assert intended_tree
+    store = _job_store(tmp_path)
+    store.update_status(_COMMIT_RECOVERY_JOB, ExecutionJobStatus.COMPLETION_SUBMITTED)
+    events = JsonlEventStore(tmp_path / "events")
+    journals = TransactionJournalStore(tmp_path / "events" / "journals")
+    candidate_id = "candidate-1"
+    candidate_manifest_sha256 = "a" * 64
+    prepared = journals.prepare(
+        journal_id=_COMMIT_RECOVERY_JOURNAL,
+        project_id="Agent",
+        task_id=TASK_ID,
+        transition_id="code",
+        effects=effects,
+        events=(),
+        context={
+            "job_id": _COMMIT_RECOVERY_JOB,
+            "expected_previous_state": "Todo",
+            "expected_to_state": "CodeReview",
+            "repository_base_commit": base,
+            "task_revision": task_semantic_revision(_task()),
+            "candidate_id": candidate_id,
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "verification_accepted": True,
+            "verification_report": {
+                "checks": [{"status": "passed"}],
+                "candidate_id": candidate_id,
+                "candidate_manifest_sha256": candidate_manifest_sha256,
+                "source_mutated": False,
+                "not_run_checks": False,
+            },
+            "commit": {
+                "message": f"{TASK_ID}: Implement thing",
+                "paths": ("src/main.ts",),
+                "expected_outcome": "committed",
+                "repository_base_commit": base,
+                "intended_tree": intended_tree,
+            },
+            "acceptance_metadata": {
+                "acceptance_transaction_id": _COMMIT_RECOVERY_JOURNAL,
+                "completed_submission_id": "submission",
+                "task_revision": "revision-1",
+            },
+        },
+    )
+    assert prepared.accepted is True
+    return repo, workspace, store, events, journals, base, intended_tree
+
+
+def _commit_repo(repo: Path, main_ts: str, message: str) -> str:
+    (repo / "src" / "main.ts").write_text(main_ts, encoding="utf-8")
+    subprocess.run(("git", "-C", str(repo), "add", "--", "src/main.ts"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "commit", "-qm", message), check=True, capture_output=True)
+    return subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_recovery_rejects_same_message_wrong_tree(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash after commit: an unrelated commit with the expected message and parent
+    # but the WRONG tree (content 43 instead of 42) sits at HEAD.
+    _commit_repo(repo, "export const answer = 43;\n", f"{TASK_ID}: Implement thing")
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+    assert store.get(_COMMIT_RECOVERY_JOB).job.status == ExecutionJobStatus.COMPLETION_SUBMITTED
+    assert journals.load(_COMMIT_RECOVERY_JOURNAL).status.value == "prepared"
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 43;\n"
+    assert adapter.moved_to is None
+
+
+def test_recovery_blocks_when_live_files_match_candidate_but_head_wrong(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # HEAD commits DIFFERENT bytes, then the live working tree is edited to look
+    # exactly like the candidate. Recovery must not infer success from the
+    # working tree; the committed bytes differ, so it must block.
+    _commit_repo(repo, "export const answer = 43;\n", f"{TASK_ID}: Implement thing")
+    (repo / "src" / "main.ts").write_text("export const answer = 42;\n", encoding="utf-8")
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+    assert store.get(_COMMIT_RECOVERY_JOB).job.status == ExecutionJobStatus.COMPLETION_SUBMITTED
+    # The work that made the file look like the candidate is preserved, never
+    # overwritten by recovery.
+    assert (repo / "src" / "main.ts").read_text(encoding="utf-8") == "export const answer = 42;\n"
+    assert adapter.moved_to is None
+
+
+def test_recovery_does_not_infer_success_from_partial_identity(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash after a correct commit, then corrupt the persisted intended tree with
+    # an unresolvable/ambiguous object name. A partial identity must never be
+    # accepted as proof that the commit is the intended one.
+    _commit_repo(repo, "export const answer = 42;\n", f"{TASK_ID}: Implement thing")
+    from dataclasses import replace
+    loaded = journals.load(_COMMIT_RECOVERY_JOURNAL)
+    context = dict(loaded.context)
+    commit_ctx = dict(context["commit"])
+    commit_ctx["intended_tree"] = "0000000000000000000000000000000000000000"
+    context["commit"] = commit_ctx
+    journals.write(replace(loaded, context=context))
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+    assert store.get(_COMMIT_RECOVERY_JOB).job.status == ExecutionJobStatus.COMPLETION_SUBMITTED
+    assert journals.load(_COMMIT_RECOVERY_JOURNAL).status.value == "prepared"
+
+
+def test_recovery_restores_original_commit_identity_across_crash(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash after the Git commit but before the journal commit: the correct
+    # intended commit is already at HEAD.
+    intended_head = _commit_repo(repo, "export const answer = 42;\n", f"{TASK_ID}: Implement thing")
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == (_COMMIT_RECOVERY_JOURNAL,)
+    job = store.get(_COMMIT_RECOVERY_JOB).job
+    assert str(getattr(job.status, "value", job.status)) == "accepted"
+    assert job.metadata["acceptance_repository_commit"] == intended_head
+    assert job.metadata["acceptance_transaction_id"] == _COMMIT_RECOVERY_JOURNAL
+    assert job.metadata["task_revision"] == "revision-1"
+    # Exactly one transaction commit was reused; repeated recovery is idempotent.
+    commits = subprocess.run(
+        ("git", "-C", str(repo), "rev-list", "--count", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert commits == "2"
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+
+
+def test_recovery_restores_commit_after_journal_commit_before_status(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash after the journal commit but before the job status update: effects are
+    # already applied and the journal is committed; only the accepted status is
+    # missing. Recovery must restore the original commit identity and one
+    # acceptance without duplicating any effect.
+    base_wf = _workflow()
+    intended_head = _commit_repo(repo, "export const answer = 42;\n", f"{TASK_ID}: Implement thing")
+    adapter.move_task(TASK_ID, "CodeReview")
+    journals.commit(journals.load(_COMMIT_RECOVERY_JOURNAL))
+
+    service = CompletionService(
+        workflow=base_wf, adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == (_COMMIT_RECOVERY_JOURNAL,)
+    job = store.get(_COMMIT_RECOVERY_JOB).job
+    assert str(getattr(job.status, "value", job.status)) == "accepted"
+    assert job.metadata["acceptance_repository_commit"] == intended_head
+    commits = subprocess.run(
+        ("git", "-C", str(repo), "rev-list", "--count", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert commits == "2"
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+
+
+def test_recovery_preserves_unrelated_head_advance(tmp_path: Path):
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash window: the intended commit lands, then HEAD advances with unrelated
+    # work. Recovery must preserve that work and never bind the job to the tip.
+    _commit_repo(repo, "export const answer = 42;\n", f"{TASK_ID}: Implement thing")
+    (repo / "unrelated.txt").write_text("keep me\n", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repo), "add", "unrelated.txt"), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repo), "commit", "-qm", "unrelated work"), check=True, capture_output=True)
+    tip = subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == ()
+    assert store.get(_COMMIT_RECOVERY_JOB).job.status == ExecutionJobStatus.COMPLETION_SUBMITTED
+    assert (repo / "unrelated.txt").read_text(encoding="utf-8") == "keep me\n"
+    # The recovery conflict leaves the tip untouched; it never re-binds.
+    assert subprocess.run(
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == tip
+
+
+def test_recovered_original_commit_consumed_by_accepted_dependency(tmp_path: Path):
+    from open_tulid.runtime.acceptance import accepted_task_evidence
+
+    repo, workspace, store, events, journals, _base, _intended = _commit_recovery_fixture(tmp_path)
+    adapter = FakeAdapter(_task())
+    # Crash after the Git commit but before the journal commit: recovery restores
+    # the ORIGINAL accepted commit identity, never whichever tip is present.
+    intended_head = _commit_repo(repo, "export const answer = 42;\n", f"{TASK_ID}: Implement thing")
+    service = CompletionService(
+        workflow=_workflow(), adapter=adapter, job_store=store,
+        event_store=events, journal_store=journals, repo_root=repo,
+    )
+    assert recover_completion_transactions(service=service, event_store=events, journal_store=journals) == (_COMMIT_RECOVERY_JOURNAL,)
+    job = store.get(_COMMIT_RECOVERY_JOB).job
+    assert job.metadata["acceptance_repository_commit"] == intended_head
+
+    # A review code-task transition: a dependent can only be admitted when it
+    # consumes the recovered commit as part of the repository's current history.
+    base_wf = _workflow()
+    workflow = WorkflowDefinition(
+        schema_version=base_wf.schema_version,
+        states=base_wf.states,
+        task_types=base_wf.task_types,
+        artifact_types=base_wf.artifact_types,
+        validation_types=base_wf.validation_types,
+        operation_types=base_wf.operation_types,
+        workers=base_wf.workers,
+        transitions=MappingProxyType({
+            "code": TransitionDefinition(
+                id="code", task_type="task", from_state="Todo", to_state="CodeReview",
+                worker="codex",
+                requires=RequirementDefinition(artifacts=("result.md",)),
+                transaction=None, review=True,
+            ),
+        }),
+    )
+    store.update_status(_COMMIT_RECOVERY_JOB, ExecutionJobStatus.ACCEPTED, metadata={
+        **dict(job.metadata),
+        "review_result": {"behavior": "API", "evidence": "api.test", "remaining_blockers": []},
+    }).accepted is True
+    admitted = store.get(_COMMIT_RECOVERY_JOB).job
+    assert accepted_task_evidence(
+        admitted,
+        task=_task(),
+        workflow=workflow,
+        journals=journals,
+        target_state="CodeReview",
+        repo_root=repo,
+        source_identities=(),
+    ) is True
 
 
 def test_compensation_blocks_when_promoted_target_changed(tmp_path: Path):
@@ -2605,7 +2906,7 @@ commands:
     subprocess.run(("git", "-C", str(repo), "add", "README.md"), check=True)
     subprocess.run(("git", "-C", str(repo), "commit", "-m", "init"), check=True, capture_output=True)
     before = subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
         capture_output=True, text=True,
     ).stdout.strip()
     workflow = _workflow()
@@ -2648,7 +2949,7 @@ commands:
 
     assert result.accepted is True
     after = subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "--short", "HEAD"),
+        ("git", "-C", str(repo), "rev-parse", "--verify", "HEAD"),
         capture_output=True, text=True,
     ).stdout.strip()
     assert before != after

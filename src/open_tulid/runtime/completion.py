@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 from io import StringIO
 
 from ruamel.yaml import YAML
@@ -935,10 +937,26 @@ class CompletionService:
                 base_commit = snapshot.snapshot.facts.base_commit
             context["repository_base_commit"] = base_commit
         if commit_effect is not None:
+            # R4: persist the intended repository/tree identity (and the base it
+            # derives from) before the commit effect so recovery can verify the
+            # actual committed content, not merely a transaction-shaped tip with
+            # a matching subject. When the intended tree cannot be proven the
+            # record simply lacks tree proof and recovery treats it unresolved.
+            intended_tree = (
+                _intended_commit_tree(
+                    repo_root=self.repo_root,
+                    base=base_commit,
+                    effects=effects,
+                )
+                if base_commit is not None
+                else None
+            )
             context["commit"] = {
                 "message": str(commit_effect.get("message", "")),
                 "paths": tuple(str(path) for path in commit_effect.get("paths", ())),
                 "expected_outcome": "committed",
+                "repository_base_commit": str(base_commit) if base_commit is not None else None,
+                "intended_tree": intended_tree,
             }
 
         if self.journal_store is None:
@@ -2149,6 +2167,28 @@ def recover_completion_transactions(
     return tuple(recovered)
 
 
+def _recovered_commit_identity(service: CompletionService, record) -> str | None:
+    """The original accepted commit identity, proven, or None.
+
+    For a commit-bearing record this is the head only when it is the exact
+    intended transaction commit (tree, parent, and subject all match). It never
+    binds the job to an unrelated tip that may have advanced during the crash
+    window. When proof is unavailable the record stays unresolved.
+    """
+    commit_effect = next(
+        (effect for effect in record.effects if effect.get("type") == "commit_repo_changes"),
+        None,
+    )
+    if commit_effect is None:
+        return None
+    if service.repo_root is None:
+        return None
+    if not _transaction_commit_exists(service, record, commit_effect):
+        return None
+    runner = service.repo_command_runner or _run_repo_command
+    return _git_rev(runner, service.repo_root, "HEAD")
+
+
 def _settle_recovered_acceptance(service: CompletionService, record) -> bool:
     """Close the journal-commit/job-update crash window using saved evidence."""
     job_id = record.context.get("job_id")
@@ -2163,12 +2203,20 @@ def _settle_recovered_acceptance(service: CompletionService, record) -> bool:
     if loaded.job.task_id != record.task_id or loaded.job.transition_id != record.transition_id:
         return False
     restored = dict(metadata)
-    if record.context.get("commit"):
-        restored["acceptance_repository_commit"] = _accepted_commit_sha(
-            repo_root=service.repo_root, runner=service.repo_command_runner,
-        )
+    has_commit_effect = any(effect.get("type") == "commit_repo_changes" for effect in record.effects)
+    if has_commit_effect:
+        commit_identity = _recovered_commit_identity(service, record)
+        if commit_identity is None:
+            # The original accepted commit cannot be proven (missing proof, wrong
+            # tree, or an advanced unrelated tip). Never bind to whichever tip is
+            # present; the journal remains unresolved for explicit handling.
+            return False
+        restored["acceptance_repository_commit"] = commit_identity
     elif record.context.get("repository_base_commit"):
+        # No-op delivery records the original accepted source identity.
         restored["acceptance_repository_commit"] = record.context["repository_base_commit"]
+    # Otherwise there is no repository identity to restore (non-Git/plain
+    # acceptance); acceptance is restored from the saved acceptance metadata.
     return service.job_store.update_status(
         job_id, ExecutionJobStatus.ACCEPTED, metadata=restored,
     ).accepted
@@ -2328,40 +2376,157 @@ def _transaction_commit_exists(
 ) -> bool:
     """Locate and verify the already-created transaction commit.
 
-    Returns True only when the branch tip is the exact intended commit (matching
-    message and parent), so recovery neither creates a duplicate commit nor
-    resets branch history blindly. A different tip is an unresolved conflict.
+    Returns True only when the branch tip's full object identities match the
+    intended parent, tree, and subject. A matching subject alone is never
+    sufficient: the committed tree must equal the intended tree persisted before
+    the commit effect. A different tip is an unresolved conflict, and a record
+    without an unambiguous intended tree cannot prove success (R4).
     """
     if service.repo_root is None:
         return False
     runner = service.repo_command_runner or _run_repo_command
+    commit_ctx = record.context.get("commit")
+    if not isinstance(commit_ctx, Mapping):
+        # No committed-tree identity was persisted (historical/unresolved).
+        return False
+    intended_tree = commit_ctx.get("intended_tree")
+    if not isinstance(intended_tree, str):
+        return False
     message = str(effect.get("message", ""))
-    base = str(record.context.get("repository_base_commit", ""))
+    base_ref = commit_ctx.get("repository_base_commit") or record.context.get("repository_base_commit")
     head = _git_rev(runner, service.repo_root, "HEAD")
     if not head:
         return False
-    if base and head == base:
+    if base_ref:
+        base = _git_rev(runner, service.repo_root, str(base_ref))
+        if not base:
+            # Missing/unambiguous-object lookup must not infer success.
+            return False
+        if head == base:
+            return False
+        parent = _git_parent(runner, service.repo_root, head)
+        if not parent or parent != base:
+            return False
+    tree = _git_tree(runner, service.repo_root, head)
+    if tree != intended_tree:
         return False
-    parent = _git_parent(runner, service.repo_root, head)
-    if base and parent and parent != base:
+    if message and _git_show(runner, service.repo_root, head) != message:
         return False
-    subject = _git_show(runner, service.repo_root, head)
-    return subject == message
+    return True
 
 
 def _git_rev(runner, repo_root: Path, ref: str) -> str | None:
-    result = runner(("git", "rev-parse", "--short", ref), repo_root)
+    """Resolve a reference to an unambiguous full object id.
+
+    ``rev-parse --verify`` rejects an ambiguous short name, a missing object, or
+    an unreadable lookup, so success is never inferred from a partial identity.
+    """
+    result = runner(("git", "rev-parse", "--verify", ref), repo_root)
     if result.returncode != 0:
         return None
-    return (result.stdout or "").strip()
+    value = (result.stdout or "").strip()
+    return value or None
 
 
 def _git_parent(runner, repo_root: Path, commit: str) -> str | None:
-    result = runner(("git", "rev-parse", "--short", f"{commit}^"), repo_root)
+    result = runner(("git", "rev-parse", "--verify", f"{commit}^"), repo_root)
     if result.returncode != 0:
         return None
-    parent = (result.stdout or "").strip()
-    return parent or None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _git_tree(runner, repo_root: Path, commit: str) -> str | None:
+    result = runner(("git", "rev-parse", "--verify", f"{commit}^{{tree}}"), repo_root)
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _git_tree_mode(mode: object) -> str:
+    """Git cacheinfo mode for a regular file from a POSIX mode.
+
+    Executable bits select ``100755``; everything else is ``100644``.
+    """
+    if mode is None:
+        return "100644"
+    value = int(mode)
+    return "100755" if (value & 0o111) else "100644"
+
+
+def _intended_commit_tree(
+    *,
+    repo_root: Path | None,
+    base: str | None,
+    effects: Sequence[Mapping[str, object]],
+) -> str | None:
+    """Compute the git tree identity the transaction commit must have.
+
+    Returns None (not provable) when the repository or any candidate blob cannot
+    be read, so acceptance never rests on a partial identity. Uses a private
+    temporary index so the worker's own index/working tree is never mutated: the
+    baseline tree is populated, candidate blob content is injected with
+    ``--cacheinfo``, deletions are removed, and ``write-tree`` yields the tree.
+    """
+    if repo_root is None:
+        return None
+    repo_root = repo_root.resolve()
+    changes = [
+        effect for effect in effects
+        if effect.get("type") in ("promote_changed_file", "delete_changed_file")
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        index = Path(td) / "index"
+        index.write_bytes(b"")
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(index)
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ("git", *args),
+                cwd=str(repo_root),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        if base and git("read-tree", base).returncode != 0:
+            return None
+        for change in changes:
+            kind = change.get("type")
+            if kind == "promote_changed_file":
+                source = Path(str(change.get("source_path", "")))
+                target = Path(str(change.get("target_path", "")))
+                try:
+                    relative = str(target.relative_to(repo_root))
+                except ValueError:
+                    continue
+                hashed = git("hash-object", "-w", str(source))
+                if hashed.returncode != 0 or not (hashed.stdout or "").strip():
+                    return None
+                blob = hashed.stdout.strip()
+                git_mode = _git_tree_mode(change.get("expected_after_mode"))
+                if (
+                    git(
+                        "update-index", "--cacheinfo",
+                        f"{git_mode},{blob},{relative}",
+                    ).returncode
+                    != 0
+                ):
+                    return None
+            elif kind == "delete_changed_file":
+                target = Path(str(change.get("target_path", "")))
+                try:
+                    relative = str(target.relative_to(repo_root))
+                except ValueError:
+                    continue
+                git("update-index", "--force-remove", relative)
+        tree = git("write-tree")
+        if tree.returncode != 0 or not (tree.stdout or "").strip():
+            return None
+        return tree.stdout.strip()
 
 
 def _git_show(runner, repo_root: Path, commit: str) -> str | None:
