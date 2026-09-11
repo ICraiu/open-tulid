@@ -612,7 +612,7 @@ def _event(
 
 
 def _validate_parent_lineage(adapter: StorageAdapter, task: Task) -> list[DomainError]:
-    """Detect a parent cycle before a job is admitted.
+    """Require a complete, acyclic parent lineage before a job is admitted.
 
     ``load_parent_tasks`` bounds the walk defensively, but a genuine cycle must
     be surfaced as a blocking diagnostic rather than silently truncated context.
@@ -632,7 +632,12 @@ def _validate_parent_lineage(adapter: StorageAdapter, task: Task) -> list[Domain
         seen.add(current_id)
         loaded = adapter.read_task(current_id)
         if not loaded.accepted or loaded.task is None:
-            break
+            return [_error(
+                "task.parent_unavailable",
+                f"Task {task.id!r} requires parent {current_id!r}, which could not be read; "
+                "restore the parent context before creating the job.",
+                current_id,
+            ), *loaded.errors]
         current_id = loaded.task.parent_id
     return []
 

@@ -571,3 +571,20 @@ def test_parent_lineage_accepts_non_cyclic_lineage_end_at_ancestor():
     ))
 
     assert _validate_parent_lineage(adapter, child) == []
+
+
+def test_missing_ancestor_blocks_job_admission_without_truncating_context(tmp_path):
+    from open_tulid.runtime.jobs import FileExecutionJobStore
+
+    child = replace(_snapshot().tasks[TASK_ID], parent_id="parent")
+    parent = replace(child, id="parent", parent_id="missing-grandparent")
+    snapshot = replace(_snapshot(child), tasks={child.id: child, parent.id: parent})
+    store = FileExecutionJobStore(tmp_path / "jobs")
+    manager = TaskManager(workflow=_workflow(), adapter=FakeAdapter(snapshot), job_store=store)
+    result = manager.create_execution_job(CreateExecutionJob(
+        project_id="Agent", task_id=TASK_ID, transition_id="code", workspace_root=tmp_path,
+    ))
+    assert not result.accepted
+    assert result.errors[0].code == "task.parent_unavailable"
+    assert result.errors[0].location == "missing-grandparent"
+    assert not store.list().jobs
